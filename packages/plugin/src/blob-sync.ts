@@ -299,14 +299,22 @@ export class BlobSync {
     // Written to disk before a byte is fetched, and deliberately awaited: if
     // this device dies opening the file, the record of having tried is what
     // teaches it not to try again. See device-state.ts.
-    const large = device !== null && entry.size >= LEARNING_FLOOR_BYTES;
-    if (large) await device!.beginAttempt(sharedFolderId, relativePath, entry.size);
+    //
+    // A narrowed store rather than a boolean: `learner` is null for exactly the
+    // cases `large` was false for, and carries the non-nullness with it, so the
+    // calls below need no `!`. TypeScript does narrow `device` through a
+    // `const` boolean built from a type guard, which is why those assertions
+    // were flagged as doing nothing — but that inference quietly stops the day
+    // either becomes a `let`, and an assertion that is load-bearing only by
+    // accident is worse than none.
+    const learner = device !== null && entry.size >= LEARNING_FLOOR_BYTES ? device : null;
+    if (learner) await learner.beginAttempt(sharedFolderId, relativePath, entry.size);
 
     let plaintext: Uint8Array;
     try {
       const ciphertext = await this.get(sharedFolderId, entry.blobId, state.abort.signal);
       if (!ciphertext) {
-        if (large) await device!.endAttempt();
+        if (learner) await learner.endAttempt();
         return false;
       }
 
@@ -333,16 +341,16 @@ export class BlobSync {
       });
       // We are still running, so this was not a kill. Clearing it stops the
       // next launch mistaking an ordinary failure for a crash.
-      if (large) await device!.endAttempt();
+      if (learner) await learner.endAttempt();
       return false;
     }
 
-    if (large) {
-      await device!.endAttempt();
+    if (learner) {
+      await learner.endAttempt();
       // Survived it, so the ceiling can come up. Consent alone must not do this
       // — agreeing to a file that then kills the app is not evidence the device
       // can manage it, and the crash record would be undone by the raise.
-      await device!.recordSuccess(entry.size);
+      await learner.recordSuccess(entry.size);
     }
 
     if (!this.folders.has(sharedFolderId)) return false; // unmapped mid-download

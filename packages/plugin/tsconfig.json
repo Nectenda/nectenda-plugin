@@ -10,9 +10,20 @@
     "declaration": false,
     "declarationMap": false,
     "sourceMap": false,
+    // `lib` sits above `target` on purpose; this is not a mistake to tidy down.
+    // `target` decides which syntax tsc emits, which is nothing here (noEmit) —
+    // esbuild does the real transpile and downlevels syntax to es2018. `lib`
+    // decides which APIs exist, and this plugin has been calling
+    // Object.fromEntries, Intl.RelativeTimeFormat and Array.prototype.at all
+    // along. Under ES2018 those resolved to TypeScript's `error` type, which
+    // Obsidian's type-aware scan reported as 13 "unsafe call of an `error`
+    // typed value" warnings. `pnpm typecheck` stayed green the whole time,
+    // because @types/node carries a lib reference that widened the set behind
+    // it — so the local gate could not see what the published one did.
+    // minAppVersion 1.13.7 is far past Chromium 92, the newest of the three.
     "lib": [
       "DOM",
-      "ES2018"
+      "ES2022"
     ]
   },
   "include": [

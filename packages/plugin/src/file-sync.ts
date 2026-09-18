@@ -153,11 +153,15 @@ export class FileSync {
       // Initial sync once provider is connected
       const onSync = () => {
         this.provider.off(`synced:${docName}`, onSync);
-        this.initialSync(conn);
+        void this.initialSync(conn).catch((err: unknown) => {
+          log.warn('Initial folder sync failed', { sharedFolderId: conn.sharedFolderId, error: String(err) });
+        });
       };
 
       if (this.provider.isSynced(docName)) {
-        this.initialSync(conn);
+        void this.initialSync(conn).catch((err: unknown) => {
+          log.warn('Initial folder sync failed', { sharedFolderId: conn.sharedFolderId, error: String(err) });
+        });
       } else {
         this.provider.on(`synced:${docName}`, onSync);
       }
@@ -178,7 +182,9 @@ export class FileSync {
       this.plugin.docIndex.refSync(sharedFolderId, META_DOC_SUFFIX) ??
       `${sharedFolderId}/${META_DOC_SUFFIX}`;
     this.provider.unsubscribe(docName);
-    conn.idbProvider.destroy();
+    void conn.idbProvider.destroy().catch((err: unknown) => {
+      log.warn('IndexedDB teardown failed', { error: String(err) });
+    });
     conn.ydoc.destroy();
     this.connections.delete(sharedFolderId);
   }
@@ -546,7 +552,10 @@ export class FileSync {
         continue;
       }
       if (!this.vault.exists(localFilePath)) {
-        this.createLocalFileWithContent(conn.sharedFolderId, conn.localPath, relPath, localFilePath);
+        void this.createLocalFileWithContent(conn.sharedFolderId, conn.localPath, relPath, localFilePath)
+          .catch((err: unknown) => {
+            log.warn('Could not create a file the listing named', { error: String(err) });
+          });
       }
     }
 

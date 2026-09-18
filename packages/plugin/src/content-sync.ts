@@ -365,15 +365,31 @@ export class ContentSync {
       // So: fill the document from disk, and only then call it confirmed. A
       // document is "confirmed empty" only once we have looked at the file and
       // found nothing there.
-      const onFirstSync = async () => {
+      // Split so the listener itself is synchronous. `on` and `off` match by
+      // function identity, so the thing registered has to be the same object
+      // that is later removed — wrapping at either call site would hand them
+      // two different wrappers and the listener would never come off.
+      // Two things are deliberate here. The listener registered with `on` must
+      // be the same object later passed to `off`, which match by identity, so
+      // the sync wrapper is what both see and the async work sits behind it.
+      // And the `off` stays *inside* the async body: an async function turns a
+      // synchronous throw into a rejected promise where a plain one lets it
+      // escape to whoever called the listener, and this used to be one async
+      // function throughout. Keeping the boundary where it was keeps that.
+      const runFirstSync = async (): Promise<void> => {
         this.provider.off(`synced:${docName}`, onFirstSync);
         await this.seedIfEmpty(state);
         state.hasSyncedOnce = true;
         if (!state.editorActive) this.scheduleDiskWrite(state);
       };
+      const onFirstSync = (): void => {
+        void runFirstSync().catch((err: unknown) => {
+          log.warn('First sync failed to seed', { docName, error: String(err) });
+        });
+      };
 
       if (this.provider.isSynced(docName)) {
-        void onFirstSync();
+        onFirstSync();
       } else {
         this.provider.on(`synced:${docName}`, onFirstSync);
       }
@@ -496,7 +512,9 @@ export class ContentSync {
     this.folderFiles.get(sharedFolderId)?.delete(state.docName);
     if (state.writeTimer) window.clearTimeout(state.writeTimer);
     if (state.observer) state.ytext.unobserve(state.observer);
-    state.idbProvider.destroy();
+    void state.idbProvider.destroy().catch((err: unknown) => {
+      log.warn('IndexedDB teardown failed', { error: String(err) });
+    });
     state.ydoc.destroy();
     // The folder's own path, not the file's: `connectFile` takes the folder and
     // the path within it, and deriving one back out of the other would break on
@@ -533,7 +551,9 @@ export class ContentSync {
     if (state.writeTimer) window.clearTimeout(state.writeTimer);
     if (state.observer) state.ytext.unobserve(state.observer);
     this.provider.unsubscribe(docName);
-    state.idbProvider.destroy();
+    void state.idbProvider.destroy().catch((err: unknown) => {
+      log.warn('IndexedDB teardown failed', { error: String(err) });
+    });
     state.ydoc.destroy();
 
     this.fileDocs.delete(docName);
@@ -766,7 +786,9 @@ export class ContentSync {
     if (state.writeTimer) window.clearTimeout(state.writeTimer);
     state.writeTimer = window.setTimeout(() => {
       state.writeTimer = null;
-      this.writeToDisk(state);
+      void this.writeToDisk(state).catch((err: unknown) => {
+        log.warn('Deferred disk write failed', { error: String(err) });
+      });
     }, WRITE_DEBOUNCE);
   }
 

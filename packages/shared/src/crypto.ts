@@ -497,7 +497,12 @@ export async function deriveDocId(
   relativePath: string,
   bytes: number = DOC_ID_BYTES,
 ): Promise<string> {
-  const mac = await crypto.subtle.sign('HMAC', nameKey, enc.encode(relativePath) as BufferSource);
+  // No `as BufferSource` here, unlike the calls that pass `fromBase64(...)`:
+  // TextEncoder.encode returns Uint8Array<ArrayBuffer>, which subtle.sign
+  // accepts as-is, while fromBase64 yields Uint8Array<ArrayBufferLike>, which
+  // genuinely is not assignable. The casts elsewhere in this file are not the
+  // same cast and should stay.
+  const mac = await crypto.subtle.sign('HMAC', nameKey, enc.encode(relativePath));
   // Truncated to 16 bytes by default. A full 32-byte id makes every document
   // name about 101 bytes, on every push and every fan-out — nearly four times
   // the 28-byte AES-GCM overhead this design works to avoid. A collision within

@@ -360,7 +360,10 @@ export class VaultWatcher {
     const resolved = this.resolveFile(path);
     if (!resolved) return;
 
-    this.contentSync.onLocalModify(resolved.sharedFolderId, resolved.relativePath);
+    void this.contentSync.onLocalModify(resolved.sharedFolderId, resolved.relativePath)
+      .catch((err: unknown) => {
+        log.warn('Local modification did not reach the document', { error: String(err) });
+      });
   }
 
   /**

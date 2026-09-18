@@ -990,9 +990,13 @@ class FolderMembersModal extends Modal {
             }
             // The owner is a member already, so the roster minus the members
             // leaves them out without needing to know their own id here.
-            new FolderMemberPickerModal(this.app, pickerCandidates(users, members, null), async (c) => {
-              await this.post(c.id, c.label.split(' — ')[0], role);
-              await this.render();
+            new FolderMemberPickerModal(this.app, pickerCandidates(users, members, null), (c) => {
+              void (async () => {
+                await this.post(c.id, c.label.split(' — ')[0], role);
+                await this.render();
+              })().catch((err: unknown) => {
+                log.warn('Could not add the member', { error: String(err) });
+              });
             }).open();
           }),
       );
@@ -1267,7 +1271,7 @@ export class PasswordPromptModal extends Modal {
       )
       .addButton((btn) => {
         btn.setButtonText('Unlock').setCta().onClick(() => void this.attempt());
-        this.setDisabled = (v) => btn.setDisabled(v);
+        this.setDisabled = (v) => { btn.setDisabled(v); };
       });
   }
 
@@ -1863,16 +1867,21 @@ export default class NectendaPlugin extends Plugin {
    * the real runtime is an assumption.
    */
   private installProbe(): void {
-    const env = (globalThis as unknown as { process?: { env?: Record<string, string> } }).process?.env;
+    // `window`, not `globalThis`. They are the same object in the renderer, and
+    // window is what the consumer already uses: the streaming e2e reaches this
+    // as `w.nectendaProbe` from inside `browser.execute`. Obsidian's guidelines
+    // ask for window so a popout gets its own; here it also just names the
+    // thing the caller holds.
+    const env = (window as unknown as { process?: { env?: Record<string, string> } }).process?.env;
     if (!env?.NECTENDA_PROBE) return;
-    (globalThis as unknown as Record<string, unknown>).nectendaProbe = async (
+    (window as unknown as Record<string, unknown>).nectendaProbe = async (
       path: string,
       size: number,
     ) => {
       const { sealBlobStream, generateBlobKey, newBlobId } = await import('@nectenda/shared');
       const vault = new ObsidianVaultAdapter(this.app.vault);
       const mem = (): { external: number; rss: number } | undefined =>
-        (globalThis as unknown as {
+        (window as unknown as {
           process?: { memoryUsage?(): { external: number; rss: number } };
         }).process?.memoryUsage?.();
       const mb = (n?: number): number | null => (n === undefined ? null : Math.round(n / 1048576));
@@ -1945,7 +1954,7 @@ export default class NectendaPlugin extends Plugin {
     // token ever travels through a deep link, and a sign-in never completes
     // through one — that is what the browser poll is for.
     this.registerObsidianProtocolHandler('nectenda', (params) => {
-      void this.handleDeepLink(params as Record<string, string>);
+      void this.handleDeepLink(params);
     });
 
     this.statusBarItem = this.addStatusBarItem();
@@ -5647,7 +5656,7 @@ export class NectendaSettingTab extends PluginSettingTab {
     if (pending.length === 0) return;
 
     containerEl.createEl('h4', { text: `Waiting for space (${pending.length})` });
-    const waiting = document.createDocumentFragment();
+    const waiting = createFragment();
     waiting.appendText('These will upload on their own once there is room. Your notes are syncing '
       + 'normally in the meantime.');
     for (const key of pending) {
@@ -5799,8 +5808,11 @@ export class NectendaSettingTab extends PluginSettingTab {
       )
       .addButton((btn) =>
         btn.setButtonText('Share Folder').setCta().onClick(() => {
-          new FolderPickerModal(this.app, async (folder) => {
-            await this.shareFolder(folder.path, folder.name, server, foldersContainer);
+          new FolderPickerModal(this.app, (folder) => {
+            void this.shareFolder(folder.path, folder.name, server, foldersContainer)
+              .catch((err: unknown) => {
+                log.warn('Could not share the folder', { error: String(err) });
+              });
           }).open();
         })
       );
@@ -6077,8 +6089,11 @@ export class NectendaSettingTab extends PluginSettingTab {
             )
             .addButton((btn) =>
               btn.setButtonText('Choose Folder').onClick(() => {
-                new FolderPickerModal(this.app, async (localFolder) => {
-                  await this.mapFolder(folder, localFolder.path, container);
+                new FolderPickerModal(this.app, (localFolder) => {
+                  void this.mapFolder(folder, localFolder.path, container)
+                    .catch((err: unknown) => {
+                      log.warn('Could not map the folder', { error: String(err) });
+                    });
                 }).open();
               })
             );
@@ -6675,7 +6690,9 @@ export class NectendaSettingTab extends PluginSettingTab {
       );
 
     const adminContent = containerEl.createDiv('nectenda-surface nectenda-admin-content');
-    this.loadAdminData(adminContent);
+    void this.loadAdminData(adminContent).catch((err: unknown) => {
+      log.warn('Could not load the admin section', { error: String(err) });
+    });
   }
 
   private async loadAdminData(container: HTMLElement): Promise<void> {
@@ -6705,8 +6722,10 @@ export class NectendaSettingTab extends PluginSettingTab {
               .setDesc(`Created ${new Date(invite.createdAt * 1000).toLocaleDateString()}`)
               .addButton((btn) =>
                 btn.setButtonText('Copy').onClick(() => {
-                  navigator.clipboard.writeText(invite.token);
-                  new Notice('Invite token copied to clipboard');
+                  void navigator.clipboard.writeText(invite.token).then(
+                    () => new Notice('Invite token copied to clipboard'),
+                    () => new Notice('Could not copy the invite token'),
+                  );
                 })
               );
           }

@@ -280,7 +280,7 @@ export class EditorBridge {
     const file = view.file;
 
     // Install yCollab once provider has synced this doc
-    const installCollab = async () => {
+    const runInstallCollab = async (): Promise<void> => {
       if (this.currentFile !== filePath) return;
 
       // No awareness yet means the document has no subscription yet:
@@ -420,6 +420,19 @@ export class EditorBridge {
       // must keep reconciling disk against the CRDT, or edits made before the
       // document syncs — offline, most obviously — are lost.
       this.contentSync.setEditorBound(docName, true);
+    };
+
+    // A synchronous wrapper around it, for two reasons. `awaitSubscription`
+    // takes `retry: () => void` and handing it an async function is the
+    // misuse the linter names; and the two call sites below are statements,
+    // where an unhandled rejection would reach nobody. Deliberately not
+    // awaited anywhere — attaching the editor binding is fire-and-forget by
+    // design, and making its callers wait would change when the editor
+    // becomes usable.
+    const installCollab = (): void => {
+      void runInstallCollab().catch((err: unknown) => {
+        log.warn('Could not attach collaborative editing', { docName, error: String(err) });
+      });
     };
 
     // Bind now when the document is synced — or when nothing is connected.
