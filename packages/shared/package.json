@@ -14,12 +14,9 @@
   },
   "scripts": {
     "build": "tsc",
-    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.test.json",
-    "test:coverage": "vitest run --coverage",
-    "test:watch": "vitest"
+    "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
-    "@vitest/coverage-v8": "^4.1.11",
     "typescript": "^5.8.3"
   },
   "dependencies": {

@@ -457,6 +457,15 @@ interface NectendaSettings {
    * Nectenda Cloud: identity is proved at the identity service (an emailed
    * code, a passkey or a provider), organisations may live on several sync
    * servers, and the passphrase is used for encryption only and never sent.
+   *
+   * **The default is `cloud`, and that is a decision rather than an accident.**
+   * It was `self-hosted` until 18 September 2026 — not chosen, just left alone
+   * when cloud was added beside it, back when self-hosted was the only thing
+   * there was. The consequence only became visible once the plugin shipped: a
+   * fresh install opened on a form asking for the address of a server the
+   * reader does not have and cannot currently buy. Whichever this is, it
+   * decides which sign-in screen a vault with no settings sees, so treat it as
+   * the first thing a new user is told about the product.
    */
   mode: 'self-hosted' | 'cloud';
   identityUrl: string;
@@ -604,8 +613,8 @@ interface NectendaSettings {
   secrets: Record<string, string>;
 }
 
-const DEFAULT_SETTINGS: NectendaSettings = {
-  mode: 'self-hosted',
+export const DEFAULT_SETTINGS: NectendaSettings = {
+  mode: 'cloud',
   identityUrl: DEFAULT_IDENTITY_URL,
   identity: null,
   identityAccessToken: '',
@@ -614,7 +623,13 @@ const DEFAULT_SETTINGS: NectendaSettings = {
   pendingInvites: [],
   recoveryKeyAcknowledgedAt: null,
   publishedVaultLabel: '',
-  serverUrl: `ws://localhost:${DEFAULT_PORT}`,
+  // Empty, not a localhost address. A cloud vault never sets this, so a
+  // default here is written into every cloud install's data.json and reads as
+  // configuration nobody chose. Empty also lets the self-hosted pane tell
+  // "never touched" from "deliberately set", which is what the pre-`mode`
+  // migration in loadSettings needed and could not get from this field.
+  // The pane still shows ws://localhost:1234 — as a placeholder.
+  serverUrl: '',
   username: '',
   token: '',
   userRole: 'editor',
@@ -3677,7 +3692,18 @@ export default class NectendaPlugin extends Plugin {
   }
 
   async loadSettings() {
-    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    const stored = await this.loadData() as Partial<NectendaSettings> | null;
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, stored);
+    // A vault configured before `mode` existed has no such key, and was
+    // self-hosted by definition — cloud did not exist yet. Without this it
+    // would inherit the new `cloud` default, and `isSignedIn()` reads
+    // `identity` in cloud mode, so a vault holding a perfectly good
+    // self-hosted token would announce itself signed out.
+    //
+    // Keyed on the stored token rather than on serverUrl: serverUrl carried a
+    // default for most of its life, so an old file cannot tell "set" from
+    // "never touched" through it. The token never had one.
+    if (stored && !('mode' in stored) && stored.token) this.settings.mode = 'self-hosted';
   }
 
   /**
@@ -6297,11 +6323,30 @@ export class NectendaSettingTab extends PluginSettingTab {
     }
   }
 
+  /**
+   * The self-hosted server address, or null once it has said so.
+   *
+   * `serverUrl` defaults to empty rather than to a localhost address, so for
+   * the first time it can genuinely be unset when one of these three runs.
+   * Without this the address reaches `apiBaseUrl('')` and the failure surfaces
+   * as "Login failed: Could not connect" — which names the wrong problem and
+   * sends the reader looking at their server.
+   */
+  private serverAddress(): string | null {
+    const url = this.plugin.settings.serverUrl.trim();
+    if (!url) {
+      new Notice('Enter the address of your server first');
+      return null;
+    }
+    return url;
+  }
+
   private async doLogin(username: string, password: string): Promise<void> {
     if (!username || !password) {
       new Notice('Username and password required');
       return;
     }
+    if (!this.serverAddress()) return;
 
     // Key derivation is deliberately slow (0.3-3s), so say so rather than
     // appearing to hang.
@@ -6352,6 +6397,7 @@ export class NectendaSettingTab extends PluginSettingTab {
       new Notice('All fields required for registration');
       return;
     }
+    if (!this.serverAddress()) return;
 
     // The server never sees the password, so it cannot enforce a length —
     // this check is the only one there is.
@@ -6390,6 +6436,7 @@ export class NectendaSettingTab extends PluginSettingTab {
     recoveryKey: string,
     newPassword: string,
   ): Promise<void> {
+    if (!this.serverAddress()) return;
     const notice = new Notice('Recovering your account...', 0);
     try {
       await this.applySession(
