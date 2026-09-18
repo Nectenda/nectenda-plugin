@@ -1,0 +1,10 @@
+{
+  "id": "nectenda",
+  "name": "Nectenda",
+  "version": "0.1.0",
+  "minAppVersion": "1.13.7",
+  "description": "Real-time collaborative editing, end-to-end encrypted. Live cursors, offline editing and shared folders, on a server that cannot read your notes.",
+  "author": "Nerchure Ltd",
+  "authorUrl": "https://nectenda.com",
+  "isDesktopOnly": false
+}

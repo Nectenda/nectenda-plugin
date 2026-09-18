@@ -1,0 +1,587 @@
+/*
+ * Remote presence: another person's caret, their name, and what they have
+ * selected.
+ *
+ * ## Every selector here is three classes deep, and has to be
+ *
+ * y-codemirror.next ships an `EditorView.baseTheme(...)`, and CodeMirror
+ * compiles a base theme to `.ͼN .cm-ySelectionInfo` — specificity (0,2,0).
+ * The rules that used to live here were bare classes at (0,1,0) and lost every
+ * contest silently. The consequences were invisible until somebody read the
+ * computed styles:
+ *
+ *   - `opacity: .9` on the name label lost to the base theme's `opacity: 0`
+ *     plus a `:hover` rule, so collaborator names were **hover-only** for the
+ *     entire life of the feature, despite CSS that plainly says otherwise.
+ *   - `border-left: 2px` lost to the base theme's 1px on *both* sides, so the
+ *     caret was a 1px line with a border either side rather than the 2px rule
+ *     described here.
+ *   - `top`, `font-size`, `font-weight` and `z-index` were all overridden too.
+ *
+ * `.markdown-source-view .cm-editor .cm-*` is (0,3,0) and wins outright, which
+ * does not depend on the order Obsidian happens to inject stylesheets in.
+ */
+
+/* The name, above the caret and always visible — that is the feature. */
+.markdown-source-view .cm-editor .cm-ySelectionInfo {
+  position: absolute;
+  bottom: 100%;
+  top: auto;
+  left: -1px;
+  margin-bottom: 2px;
+  padding: 1px 5px;
+  /* Interface font, not the editor's.
+   *
+   * With no font-family the label inherited whatever the reader writes in — a
+   * serif for anyone using one, at 11px, which sets the name in the same voice
+   * as the prose it is annotating. It is a piece of interface sitting on top of
+   * the text, so it should read as interface, and it should match the label on
+   * the site's own presence illustration. */
+  font-family: var(--font-interface);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.4;
+  border-radius: 2px;
+  white-space: nowrap;
+  pointer-events: none;
+  z-index: 102;
+  /* Beats the base theme's transition to opacity 0 on mouse-out. */
+  opacity: 1;
+  transition: none;
+}
+
+/*
+ * Label text.
+ *
+ * The old rule hard-coded `#fff`, which is right on the design system's
+ * light-theme seats (dark fills) and wrong on its dark-theme seats (light
+ * fills), where white on pale teal is close to unreadable. Obsidian tells us
+ * which theme is running, so each gets the ink that belongs to it.
+ */
+.theme-light .markdown-source-view .cm-editor .cm-ySelectionInfo { color: #ffffff; }
+.theme-dark .markdown-source-view .cm-editor .cm-ySelectionInfo { color: #14201b; }
+
+/*
+ * The caret: 2px, on the left only, and it eases in.
+ *
+ * It must never blink. A blinking caret in someone else's colour reads as your
+ * own, which is exactly the misreading this whole feature exists to prevent.
+ */
+.markdown-source-view .cm-editor .cm-ySelectionCaret {
+  position: relative;
+  border-left: 2px solid;
+  border-right: none;
+  border-color: inherit;
+  margin-left: -1px;
+  animation: nectenda-caret-in 240ms cubic-bezier(0.22, 0.7, 0.3, 1);
+}
+
+@keyframes nectenda-caret-in {
+  from { opacity: 0; transform: translateY(2px); }
+  to { opacity: 1; transform: none; }
+}
+
+/*
+ * The dot the library draws above the caret is redundant now that the name is
+ * always shown, and it collides with the label.
+ */
+.markdown-source-view .cm-editor .cm-ySelectionCaretDot { display: none; }
+
+/*
+ * Selections carry no `opacity` rule, and that absence is the fix.
+ *
+ * `.cm-ySelection` is a mark decoration that wraps the *text*, so `opacity`
+ * faded the glyphs along with the tint: a collaborator's selection rendered
+ * their words at 30%, and a multi-line one at 15% — close to invisible. The
+ * tint now comes entirely from the alpha in the `colorLight` the client
+ * broadcasts (see `userColor` in editor-bridge.ts), which paints the background
+ * and leaves the text on top of it fully opaque.
+ */
+
+/* Shared folder indicator in file explorer *//* Shared folder indicator in file explorer */
+.nectenda-shared > .nav-folder-title::after {
+  content: '';
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background-color: var(--interactive-accent);
+  margin-left: 6px;
+  vertical-align: middle;
+  opacity: 0.7;
+}
+
+/* Recovery key, shown once after registration */
+.nectenda-recovery-key {
+  user-select: all;
+  padding: 0.75em 1em;
+  margin: 1em 0;
+  font-family: var(--font-monospace);
+  font-size: 1.1em;
+  letter-spacing: 0.05em;
+  text-align: center;
+  background: var(--background-secondary);
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 4px;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+/*
+ * Storage full, which is not the same as offline.
+ *
+ * Deliberately a warning colour rather than the muted/disconnected treatment: a
+ * blocked attachment is something the user can act on by deleting a file, and
+ * dressing it as a connection fault sends them to check their network instead.
+ * Text is still syncing throughout.
+ */
+.nav-folder.nectenda-storage-full > .nav-folder-title::after {
+  content: " storage full";
+  color: var(--text-warning);
+  font-size: 0.8em;
+  opacity: 0.9;
+}
+
+/*
+ * Presence circles beside the note title.
+ *
+ * The design system's PresenceStack: initials, overlapped, each ringed in the
+ * page background so a stack reads as separate people rather than one blob.
+ * Colour comes from the person's own broadcast value — the same one their caret
+ * carries — so a circle and its caret can never disagree.
+ *
+ * Colour alone never identifies anybody here: every circle carries the full
+ * name in `title` and `aria-label`, and the status bar keeps a words version.
+ */
+.nectenda-presence {
+  display: inline-flex;
+  align-items: center;
+  margin-left: auto;
+  padding: 0 8px;
+  flex: none;
+}
+
+.nectenda-presence-dot {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  /* Interface, for the same reason as the cursor label: the note header sits in
+     the editor's font, and initials set in a reading serif look like content. */
+  font-family: var(--font-interface);
+  font-size: 9px;
+  font-weight: 600;
+  line-height: 1;
+  letter-spacing: 0.02em;
+  /* Ringed in the header's own background, which is what separates one circle
+     from the one it overlaps. */
+  border: 2px solid var(--background-primary);
+  cursor: default;
+  user-select: none;
+}
+
+/* Overlap, so a stack reads as a group rather than a row of buttons. */
+.nectenda-presence-dot + .nectenda-presence-dot { margin-left: -7px; }
+
+.theme-light .nectenda-presence-dot { color: #ffffff; }
+.theme-dark .nectenda-presence-dot { color: #14201b; }
+
+/* The overflow chip is not a person, so it does not take a person's colour. */
+.nectenda-presence-more {
+  background-color: var(--background-modifier-border);
+  color: var(--text-muted) !important;
+}
+
+/* The provider marks, wherever they are drawn. */
+.nectenda-provider-mark { flex: none; }
+
+/* BEGIN generated design tokens */
+/* Generated from the Nectenda design system. Do not edit by hand: these
+   values are produced from the system's tokens and checked on every
+   build. Values only — no font families, because the plugin ships no
+   fonts, so type follows whatever Obsidian is set to. */
+.nectenda-surface {
+  --nectenda-bg-page: #EEF0EA;
+  --nectenda-bg-surface: #F7F8F4;
+  --nectenda-bg-raised: #FFFFFF;
+  --nectenda-bg-subtle: #E6EDE9;
+  --nectenda-bg-brand-subtle: #F0E8D4;
+  --nectenda-bg-vine-subtle: #E0E8E2;
+  --nectenda-border-subtle: #E3E6DF;
+  --nectenda-border-default: #D6DAD1;
+  --nectenda-border-strong: #BDC6C1;
+  --nectenda-text-primary: #14201B;
+  --nectenda-text-secondary: #55625B;
+  --nectenda-text-brand: #7F6118;
+  --nectenda-text-vine: #2E6A4F;
+  --nectenda-action-primary: #B08A2E;
+  --nectenda-action-primary-hover: #B99235;
+  --nectenda-text-on-action: #14201B;
+  --nectenda-focus-ring: #B08A2E;
+  --nectenda-space-1: 4px;
+  --nectenda-space-2: 8px;
+  --nectenda-space-3: 12px;
+  --nectenda-space-4: 16px;
+  --nectenda-space-5: 20px;
+  --nectenda-space-6: 24px;
+  --nectenda-space-8: 32px;
+  --nectenda-space-10: 40px;
+  --nectenda-space-12: 48px;
+  --nectenda-space-16: 64px;
+  --nectenda-space-20: 80px;
+  --nectenda-space-24: 96px;
+  --nectenda-space-32: 128px;
+  --nectenda-radius-sm: 2px;
+  --nectenda-radius-md: 4px;
+  --nectenda-radius-lg: 6px;
+  --nectenda-radius-full: 999px;
+  --nectenda-cut: 10px;
+  --nectenda-cut-sm: 6px;
+  --nectenda-cut-caution: 10px;
+  --nectenda-border-width: 1px;
+  --nectenda-container-max: 1120px;
+  --nectenda-ease-standard: cubic-bezier(.22,.7,.3,1);
+  --nectenda-duration-fast: 160ms;
+  --nectenda-duration-base: 240ms;
+  --nectenda-duration-slow: 320ms;
+  --nectenda-shadow-sm: 0 1px 2px rgba(20,32,27,.06);
+  --nectenda-shadow-md: 0 4px 14px rgba(20,32,27,.10);
+  --nectenda-shadow-lg: 0 14px 36px rgba(20,32,27,.16);
+  --nectenda-shadow-focus: 0 0 0 3px rgba(176,138,46,.38);
+  --nectenda-icon-stroke: 1.5px;
+  --nectenda-icon-grid: 24px;
+}
+.theme-dark .nectenda-surface {
+  --nectenda-bg-page: #0E1714;
+  --nectenda-bg-surface: #152220;
+  --nectenda-bg-raised: #1C2B27;
+  --nectenda-bg-subtle: #1F2E29;
+  --nectenda-bg-brand-subtle: #2B2718;
+  --nectenda-bg-vine-subtle: #1B2E26;
+  --nectenda-border-subtle: #1F2E29;
+  --nectenda-border-default: #2A3B35;
+  --nectenda-border-strong: #3A4B44;
+  --nectenda-text-primary: #E4E9E2;
+  --nectenda-text-secondary: #93A199;
+  --nectenda-text-brand: #D9B65A;
+  --nectenda-text-vine: #6FB48E;
+  --nectenda-action-primary: #D9B65A;
+  --nectenda-action-primary-hover: #E9C26B;
+  --nectenda-text-on-action: #14201B;
+  --nectenda-focus-ring: #D9B65A;
+  --nectenda-presence-1: #63B2CC;
+  --nectenda-presence-2: #8E96E0;
+  --nectenda-presence-3: #B58FD6;
+  --nectenda-presence-4: #E28AA9;
+  --nectenda-presence-5: #E28A5E;
+  --nectenda-presence-6: #D9B65A;
+  --nectenda-text-on-presence: #14201B;
+  --nectenda-success-surface: #163527;
+  --nectenda-success-border: #22533D;
+  --nectenda-success-fg: #69C198;
+  --nectenda-success-solid: #69C198;
+  --nectenda-warning-surface: #2E4038;
+  --nectenda-warning-border: #506358;
+  --nectenda-warning-fg: #BDC6C1;
+  --nectenda-warning-solid: #A5AFAA;
+  --nectenda-danger-surface: #44241E;
+  --nectenda-danger-border: #683830;
+  --nectenda-danger-fg: #EF9383;
+  --nectenda-danger-solid: #EF9383;
+  --nectenda-info-surface: #1A2F46;
+  --nectenda-info-border: #2A4A6C;
+  --nectenda-info-fg: #78B4F6;
+  --nectenda-info-solid: #78B4F6;
+}
+/* END generated design tokens */
+
+/* ───────────────────────────────────────────────────────────────────────────
+   The sign-in screen and the brand header.
+
+   Values come from the generated token block above and nothing here is a
+   literal: a hex code in this file is how the settings tab would drift away
+   from the marketing site and the sign-in page, which is the drift this whole
+   arrangement exists to prevent.
+
+   No font families. The plugin deliberately ships no typefaces, so type is
+   whatever Obsidian is set to; colour, spacing, shape and the cut carry the
+   brand instead.
+   ───────────────────────────────────────────────────────────────────────── */
+
+/* One measure for the whole signed-out column. The settings pane is wider
+   than anything on this screen wants to be, so the card is held to the same
+   width the web page uses and centred in the pane; the brand sits in the same
+   column, flush with the card's left edge, the way the lockup does above the
+   card on accounts.nectenda.com. Signed in, the brand keeps the full width,
+   because the Setting rows below it do too. */
+.nectenda-surface { --nectenda-column: 420px; }
+
+.nectenda-brand {
+  display: flex;
+  align-items: center;
+  gap: var(--nectenda-space-3);
+  margin: 0 0 var(--nectenda-space-6);
+  color: var(--nectenda-text-primary);
+}
+/* Above the sign-in card it aligns with that card's edge, not with the
+   settings rows, so Obsidian's heading inset is taken back off. */
+.nectenda-brand.is-column { max-width: var(--nectenda-column); margin-inline: auto; padding-inline: 0; }
+.nectenda-mark, .nectenda-wordmark { display: block; flex: none; }
+
+.nectenda-signin {
+  max-width: var(--nectenda-column);
+  margin-inline: auto;
+  color: var(--nectenda-text-primary);
+}
+
+/* Borders define surfaces in this system; shadow is only for things that
+   float, and this floats over nothing. No radius either — the small radii
+   belong to controls, and a rounded card argues with the mark. */
+.nectenda-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--nectenda-space-6);
+  padding: var(--nectenda-space-6);
+  background: var(--nectenda-bg-raised);
+  border: var(--nectenda-border-width) solid var(--nectenda-border-default);
+}
+
+.nectenda-stack-6 { display: flex; flex-direction: column; gap: 6px; }
+.nectenda-stack-10 { display: flex; flex-direction: column; gap: 10px; }
+
+.nectenda-surface h2.nectenda-heading {
+  margin: 0;
+  /* Obsidian gives an h2 in the settings pane a 16px side padding, which set
+     this heading in from the sentence directly beneath it. */
+  padding: 0;
+  font-size: 1.5em;
+  font-weight: 500;
+  line-height: 1.12;
+  letter-spacing: -0.018em;
+  color: var(--nectenda-text-primary);
+}
+.nectenda-sub, .nectenda-caption { margin: 0; color: var(--nectenda-text-secondary); }
+.nectenda-sub { font-size: var(--font-ui-small); line-height: 1.5; }
+.nectenda-caption { font-size: var(--font-ui-smaller); line-height: 1.45; }
+
+.nectenda-label {
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller);
+  letter-spacing: 0.13em;
+  text-transform: uppercase;
+  color: var(--nectenda-text-secondary);
+}
+
+/* Obsidian dresses every <button> itself, through selectors that carry a class
+   as well as the element — `.theme-dark button` and friends. A rule here named
+   only by class therefore loses the background and the text colour while
+   winning the border, which is exactly the half-styled grey slab this screen
+   rendered as at first. Every button rule below names the element and the
+   surface, so it outranks the application rather than depending on which
+   stylesheet the browser read last. The heading is the same story: Obsidian
+   sizes h2 inside the settings pane.
+
+   The cut: the system's signature, a 45° chamfer on the bottom-right of a
+   primary surface. One per screen — here it is the single filled button, and
+   never more than one of those is on screen at a time. */
+.nectenda-cut {
+  clip-path: polygon(0 0, 100% 0, 100% calc(100% - var(--nectenda-cut-sm)),
+                     calc(100% - var(--nectenda-cut-sm)) 100%, 0 100%);
+}
+
+.nectenda-signin button { cursor: pointer; font-family: inherit; }
+
+.nectenda-surface button.nectenda-primary {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  width: 100%;
+  min-height: 44px;
+  padding: 12px 16px;
+  border: var(--nectenda-border-width) solid transparent;
+  border-radius: 0;
+  background: var(--nectenda-action-primary);
+  color: var(--nectenda-text-on-action);
+  font-weight: 600;
+  box-shadow: none;
+  transition: background var(--nectenda-duration-fast) var(--nectenda-ease-standard);
+}
+/* It lightens on hover. Darkening a gold fill drops the label below the
+   contrast the token was chosen for. */
+.nectenda-surface button.nectenda-primary:hover { background: var(--nectenda-action-primary-hover); }
+
+.nectenda-surface button.nectenda-secondary {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  white-space: nowrap;
+  min-height: 40px;
+  padding: 9px 14px;
+  background: transparent;
+  border: var(--nectenda-border-width) solid var(--nectenda-border-strong);
+  border-radius: var(--nectenda-radius-md);
+  color: var(--nectenda-text-primary);
+  font-weight: 600;
+  box-shadow: none;
+  transition: border-color var(--nectenda-duration-fast) var(--nectenda-ease-standard);
+}
+.nectenda-surface button.nectenda-secondary:hover { border-color: var(--nectenda-action-primary); }
+.nectenda-wide { width: 100%; }
+
+.nectenda-group {
+  display: flex;
+  flex-direction: column;
+  gap: var(--nectenda-space-4);
+  padding-top: var(--nectenda-space-5);
+  border-top: var(--nectenda-border-width) solid var(--nectenda-border-subtle);
+}
+
+.nectenda-field { display: flex; flex-direction: column; gap: var(--nectenda-space-2); }
+.nectenda-field label { font-size: var(--font-ui-small); font-weight: 500; color: var(--nectenda-text-primary); }
+.nectenda-field-row { display: flex; gap: var(--nectenda-space-2); }
+
+.nectenda-signin input {
+  flex: 1;
+  min-width: 0;
+  min-height: 40px;
+  padding: 10px 12px;
+  background: var(--nectenda-bg-surface);
+  border: var(--nectenda-border-width) solid var(--nectenda-border-default);
+  border-radius: var(--nectenda-radius-md);
+  color: var(--nectenda-text-primary);
+  font-family: inherit;
+}
+.nectenda-signin input:focus {
+  border-color: var(--nectenda-action-primary);
+  box-shadow: var(--nectenda-shadow-focus);
+  outline: none;
+}
+.nectenda-code-field { padding-top: var(--nectenda-space-2); }
+.nectenda-code-input { font-family: var(--font-monospace); letter-spacing: 0.35em; text-align: center; }
+
+.nectenda-providers { display: flex; flex-direction: column; gap: var(--nectenda-space-2); }
+.nectenda-surface button.nectenda-provider {
+  display: flex;
+  align-items: center;
+  /* A row, not a label: the mark leads and the words follow it, as on the
+     sign-in page. Obsidian centres a button's contents by default. */
+  justify-content: flex-start;
+  gap: var(--nectenda-space-3);
+  width: 100%;
+  min-height: 40px;
+  padding: 10px 14px;
+  background: transparent;
+  border: var(--nectenda-border-width) solid var(--nectenda-border-default);
+  border-radius: var(--nectenda-radius-md);
+  color: var(--nectenda-text-primary);
+  text-align: left;
+  box-shadow: none;
+  transition: border-color var(--nectenda-duration-fast) var(--nectenda-ease-standard);
+}
+.nectenda-surface button.nectenda-provider:hover { border-color: var(--nectenda-border-strong); }
+.nectenda-surface button.nectenda-provider svg { flex: none; }
+
+.nectenda-foot {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--nectenda-space-4);
+  padding-top: var(--nectenda-space-4);
+  border-top: var(--nectenda-border-width) solid var(--nectenda-border-subtle);
+}
+.nectenda-surface button.nectenda-bare {
+  padding: 0;
+  background: none;
+  border: 0;
+  box-shadow: none;
+  color: var(--nectenda-text-secondary);
+  font-size: var(--font-ui-small);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.nectenda-surface button.nectenda-bare:hover { background: none; color: var(--nectenda-text-primary); }
+
+.nectenda-register summary, .nectenda-advanced summary {
+  cursor: pointer;
+  color: var(--nectenda-text-secondary);
+  font-size: var(--font-ui-small);
+}
+.nectenda-register[open] { gap: var(--nectenda-space-3); }
+.nectenda-register > *:not(summary) { margin-top: var(--nectenda-space-3); }
+.nectenda-advanced { margin-top: var(--nectenda-space-6); max-width: var(--nectenda-column); margin-inline: auto; }
+
+/* A list of rows as one box.
+
+   Obsidian has styled `.setting-group > .setting-items` since 1.11 and does
+   all of it: the card, the squared and un-gapped rows, the rounded first and
+   last, and the divider as a pseudo-element inset from both edges by the
+   container's own padding. `rowGroup()` emits that markup, so there is
+   nothing to paint here.
+
+   Two things core assumes that this pane does not. Both come from the same
+   fact: in the application's own tabs every row lives in a group, and here
+   they do not.
+
+   The width — a `.setting-group` is capped at 700px and centred, so on a wide
+   window a grouped list would sit narrower than the loose row above it.
+
+   The gap beneath — core leaves none, because the next thing is always
+   another group with its own top margin. Here the next thing can be a loose
+   row, which has no top margin either, and the two boxes met with no space
+   between them. This is the same gap a row leaves under itself. */
+.nectenda-rows {
+  max-width: none;
+  margin-bottom: var(--size-4-2);
+}
+
+/* The signed-in sections keep Obsidian's own Setting rows; these three
+   containers were created in code and had no rules at all, and the usage bar
+   was drawn with inline styles. */
+.nectenda-account { margin-top: var(--nectenda-space-6); }
+.nectenda-usage-bar {
+  height: 6px;
+  margin: var(--nectenda-space-2) 0;
+  background: var(--nectenda-bg-subtle);
+  border-radius: var(--nectenda-radius-sm);
+  overflow: hidden;
+}
+.nectenda-usage-fill {
+  height: 100%;
+  background: var(--nectenda-action-primary);
+  transition: width var(--nectenda-duration-base) var(--nectenda-ease-standard);
+}
+.nectenda-usage-fill.is-warning { background: var(--nectenda-warning-solid); }
+.nectenda-usage-fill.is-full { background: var(--nectenda-danger-solid); }
+.nectenda-folders { margin-top: var(--nectenda-space-2); }
+/* Two more that were created in code and had no rules at all. */
+.nectenda-admin-content { margin-top: var(--nectenda-space-2); }
+.nectenda-skipped-attachment { margin: var(--nectenda-space-2) 0; }
+
+@media (prefers-reduced-motion: reduce) {
+  .nectenda-signin *, .nectenda-usage-fill { transition: none !important; }
+}
+
+/* A settings row that hosts one of our own sections (Obsidian 1.13 render
+   rows). A row is a padded flex box; the section inside draws its own rows,
+   headings and cards, so the host must be a plain block with no inset of
+   its own, or every card sits off its column and every heading is doubly
+   indented. */
+.setting-group .setting-items > .setting-item.nectenda-host {
+  display: block;
+  padding: 0;
+  border-top: 0;
+}
+/* A top-level section draws its own headings and boxes. Obsidian wraps
+   loose rows in a box of their own, which would put ours inside a second
+   one; that wrapper goes, and so do the rules it draws between the rows,
+   since a section is divided from the next by its heading. */
+.setting-group:has(> .setting-items > .nectenda-plain) > .setting-items {
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+}
+.setting-group .setting-items > .setting-item.nectenda-plain::before {
+  content: none;
+}
