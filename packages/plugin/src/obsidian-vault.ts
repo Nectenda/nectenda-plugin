@@ -1,5 +1,5 @@
 import { log } from './logger';
-import { TFile, TFolder, type Vault } from 'obsidian';
+import { TFile, TFolder, normalizePath, type Vault } from 'obsidian';
 import type { VaultAdapter } from './vault-adapter';
 
 /**
@@ -40,8 +40,25 @@ export class ObsidianVaultAdapter implements VaultAdapter {
     this.vault = vault;
   }
 
+  /**
+   * Every path entering the real vault, tidied the way Obsidian expects.
+   *
+   * `normalizePath` settles separators, leading and trailing slashes and
+   * unicode form — the things that make two spellings of the same path fail to
+   * match. Applied here, at the one boundary, rather than at each of the
+   * fifteen call sites above it.
+   *
+   * It is **not** a containment check and must not be mistaken for one: it does
+   * not resolve `..`, so a path can come out of it tidy and still point outside
+   * the folder it claimed to be in. That question is answered before a path
+   * gets this far, in `vault-path.ts`.
+   */
+  private n(path: string): string {
+    return normalizePath(path);
+  }
+
   listMarkdown(folderPath: string): string[] {
-    const folder = this.vault.getAbstractFileByPath(folderPath);
+    const folder = this.vault.getAbstractFileByPath(this.n(folderPath));
     if (!(folder instanceof TFolder)) return [];
 
     const out: string[] = [];
@@ -56,34 +73,46 @@ export class ObsidianVaultAdapter implements VaultAdapter {
   }
 
   exists(path: string): boolean {
-    return this.vault.getAbstractFileByPath(path) !== null;
+    return this.vault.getAbstractFileByPath(this.n(path)) !== null;
   }
 
   isFile(path: string): boolean {
-    return this.vault.getAbstractFileByPath(path) instanceof TFile;
+    return this.vault.getAbstractFileByPath(this.n(path)) instanceof TFile;
   }
 
   isFolder(path: string): boolean {
-    return this.vault.getAbstractFileByPath(path) instanceof TFolder;
+    return this.vault.getAbstractFileByPath(this.n(path)) instanceof TFolder;
   }
 
   async read(path: string): Promise<string> {
-    const file = this.vault.getAbstractFileByPath(path);
+    const file = this.vault.getAbstractFileByPath(this.n(path));
     if (!(file instanceof TFile)) throw new VaultPathError('Not a file', path);
     return this.vault.read(file);
   }
 
+  /**
+   * Replace a file's contents.
+   *
+   * `process` rather than `modify`, which is what this used before. The two
+   * differ in exactly the way that matters here: `process` reads and writes
+   * under one lock, so a concurrent writer — another plugin, or another of our
+   * own paths — cannot land between our read and our write and lose an edit.
+   * `modify` has no such guarantee, and this is the call every incoming remote
+   * change goes through. The content we write is computed upstream, so the
+   * callback ignores what it is handed; the atomicity is the point, not the
+   * merge.
+   */
   async write(path: string, content: string): Promise<void> {
-    const file = this.vault.getAbstractFileByPath(path);
+    const file = this.vault.getAbstractFileByPath(this.n(path));
     if (file instanceof TFile) {
-      await this.vault.modify(file, content);
+      await this.vault.process(file, () => content);
       return;
     }
     await this.create(path, content);
   }
 
   async create(path: string, content: string): Promise<void> {
-    await this.vault.create(path, content);
+    await this.vault.create(this.n(path), content);
   }
 
   /**
@@ -111,7 +140,7 @@ export class ObsidianVaultAdapter implements VaultAdapter {
   }
 
   async trash(path: string): Promise<void> {
-    const file = this.vault.getAbstractFileByPath(path);
+    const file = this.vault.getAbstractFileByPath(this.n(path));
     if (!file) return;
     // `false` is the vault's own .trash. The system trash was tried and proved
     // useless: a file removed that way was not recoverable from it at all.
@@ -127,7 +156,7 @@ export class ObsidianVaultAdapter implements VaultAdapter {
    * does see them, and would start syncing the plugin's own configuration.
    */
   listFiles(folderPath: string): string[] {
-    const folder = this.vault.getAbstractFileByPath(folderPath);
+    const folder = this.vault.getAbstractFileByPath(this.n(folderPath));
     if (!(folder instanceof TFolder)) return [];
 
     const out: string[] = [];
@@ -142,7 +171,7 @@ export class ObsidianVaultAdapter implements VaultAdapter {
   }
 
   async readBinary(path: string): Promise<Uint8Array> {
-    const file = this.vault.getAbstractFileByPath(path);
+    const file = this.vault.getAbstractFileByPath(this.n(path));
     if (!(file instanceof TFile)) throw new VaultPathError('No such file', path);
     return new Uint8Array(await this.vault.readBinary(file));
   }
@@ -184,7 +213,7 @@ export class ObsidianVaultAdapter implements VaultAdapter {
   }
 
   async writeBinary(path: string, data: Uint8Array): Promise<void> {
-    const file = this.vault.getAbstractFileByPath(path);
+    const file = this.vault.getAbstractFileByPath(this.n(path));
     if (!(file instanceof TFile)) throw new VaultPathError('No such file', path);
     // `data.buffer` would hand over the whole backing store when the view is a
     // subarray, which silently writes more than was asked for.
@@ -192,11 +221,11 @@ export class ObsidianVaultAdapter implements VaultAdapter {
   }
 
   async createBinary(path: string, data: Uint8Array): Promise<void> {
-    await this.vault.createBinary(path, toArrayBuffer(data));
+    await this.vault.createBinary(this.n(path), toArrayBuffer(data));
   }
 
   stat(path: string): { size: number; mtime: number } | null {
-    const file = this.vault.getAbstractFileByPath(path);
+    const file = this.vault.getAbstractFileByPath(this.n(path));
     if (!(file instanceof TFile)) return null;
     return { size: file.stat.size, mtime: file.stat.mtime };
   }

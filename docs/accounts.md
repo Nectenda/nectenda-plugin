@@ -70,9 +70,9 @@ the edit across restarts. Seeding is for a fresh database, not a reset.
 |---|---|---|---|---|---|
 | `self-hosted` (default) | unlimited | unlimited | unlimited | yes | 100MB |
 | `free` | none | 3 | 2 | **no** — text sync only | — |
-| `personal` | 10 GB | 5 | 3 | yes | 100MB |
-| `team` | 5 GB per seat | 10 | 4 | yes | 100MB |
-| `small-business` | 20 GB per seat | 25 | 6 | yes | 100MB |
+| `personal` | 10 GB | 6 | 3 | yes | 100MB |
+| `team` | 20 GB + 5 GB per seat | up to 10 | 4 | yes | 100MB |
+| `small-business` | 100 GB + 20 GB per seat | up to 25 | 6 | yes | 100MB |
 
 The default is unrestricted because self-hosting is this project's default
 posture. A hosted deployment sets `DEFAULT_PLAN_ID` rather than this being a
@@ -80,7 +80,15 @@ code change.
 
 **Per-seat storage** is `quota_bytes + quota_per_user_bytes × seats`, computed
 before the "0 means unlimited" rule is applied, so a plan with no base and a
-per-seat allowance is a finite quota rather than an unlimited one. Attachments
+per-seat allowance is a finite quota rather than an unlimited one.
+
+**`seats` there is `max_users_override ?? max_users`**, which is how "buy the
+seats you want" works: buying seats sets the override to the number bought, and
+the quota follows it. A base on a per-seat plan is therefore per *organisation*,
+not per seat — three Team seats resolve to 20 + 15 = 35 GB, not 15. Repriced
+18 September 2026.
+
+Attachments
 being switched off is an explicit flag, `attachments_enabled`, not a zero quota:
 uploads on such a plan are refused with a distinct code and text sync is
 unaffected.

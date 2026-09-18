@@ -22,6 +22,7 @@ import { IDENTITY_KEY_PREFIX, createDeviceStore, createSecretStore, SECRET_IDS, 
 import { describeDevice, describeInstall, getOrCreateInstallId, openVaultLabel, platformName, sealVaultLabel, type DeviceDescription } from './device';
 import { ErrorReports, isOurs } from './error-report';
 import { shouldWarnAboutStorage } from './blob-policy';
+import { joinWithin } from './vault-path';
 import {
   FolderCryptoRegistry,
   createFolderKeys,
@@ -51,7 +52,7 @@ import {
 import { getOrCreateDeviceId } from './device';
 import { DEFAULT_MAX_BLOB_BYTES } from '@nectenda/shared';
 import { VaultWatcher } from './vault-watcher';
-import { log, setLogSink } from './logger';
+import { log, setLogSink, setVerboseLogging } from './logger';
 import { initials, type Person } from './presence';
 import { serverFetch } from './client-version.js';
 
@@ -2950,7 +2951,10 @@ export default class NectendaPlugin extends Plugin {
   async deleteAttachment(sharedFolderId: string, relativePath: string): Promise<boolean> {
     const mapping = this.settings.folderMappings.find((m) => m.sharedFolderId === sharedFolderId);
     if (!mapping) return false;
-    const full = `${mapping.localPath}/${relativePath}`;
+    // The name came from the folder's listing, so it came from whoever created
+    // the attachment. Refused rather than trusted — see vault-path.ts.
+    const full = joinWithin(mapping.localPath, relativePath);
+    if (!full) return false;
     try {
       const file = this.app.vault.getAbstractFileByPath(full);
       if (file) {
@@ -3269,6 +3273,11 @@ export default class NectendaPlugin extends Plugin {
    * than none, since ordering is usually the thing being diagnosed.
    */
   applyDiagnosticLogSetting(): void {
+    // The same switch governs the console. Obsidian asks that a plugin's
+    // console output be errors only by default, and somebody turning
+    // diagnostics on is asking to see the rest.
+    setVerboseLogging(this.settings.diagnosticLog);
+
     if (!this.settings.diagnosticLog) {
       setLogSink(null);
       return;
@@ -4094,6 +4103,13 @@ export class NectendaSettingTab extends PluginSettingTab {
    * Built as elements rather than `Setting` rows because a Setting is a
    * label-on-the-left, control-on-the-right list item, and this is a page.
    * The signed-in sections stay Setting rows, where that shape is right.
+   *
+   * That is also why the heading here is an `h2` rather than `setHeading()`,
+   * which Obsidian's guidelines otherwise ask for. `setHeading()` makes a
+   * Setting row, and a row is the thing this screen is deliberately not. Every
+   * heading that *is* a row uses it — see the Invitations, Signed-in vaults and
+   * Passkeys sections. Worth knowing if a review flags the tag: it is a
+   * considered exception, not an oversight.
    */
   private signInShell(containerEl: HTMLElement, heading: string, sub: string): HTMLElement {
     const root = containerEl.createDiv('nectenda-surface nectenda-signin');
@@ -5057,6 +5073,7 @@ export class NectendaSettingTab extends PluginSettingTab {
               ? `${data.account.planId} — ${data.seatsUsed} user(s), no seat limit`
               : `${data.account.planId} — ${data.seatsUsed} of ${limits.maxUsers} users`,
           );
+        this.displayBilling(into, server, data.account.id);
       }
     });
 
@@ -5162,6 +5179,78 @@ export class NectendaSettingTab extends PluginSettingTab {
    * refusal is repeated verbatim rather than the client second-guessing rules
    * it cannot enforce. Nobody is offered a button to remove themselves.
    */
+  /**
+   * Buying and cancelling, from inside the product.
+   *
+   * Cancelling has to be possible here rather than only on a web page: it is
+   * what our merchant of record requires, and it is the difference between
+   * leaving a subscription and asking permission to leave one.
+   *
+   * Both buttons do the same thing — ask the identity service for a URL and
+   * open it in the system browser, exactly as signing in already does. The
+   * plugin never sees a card and never renders a payment form; there is no
+   * webview here and no third-party script, which is the same boundary the
+   * rest of the product keeps.
+   *
+   * Drawn only in cloud mode. A self-hosted server sells nothing, has no
+   * merchant of record, and would answer these routes with a 404.
+   */
+  private displayBilling(
+    into: HTMLElement,
+    server: ReturnType<NectendaPlugin['servers']>[number],
+    accountId: string,
+  ): void {
+    if (this.plugin.settings.mode !== 'cloud' || !this.plugin.settings.identity) return;
+
+    const open = async (what: 'checkout' | 'portal'): Promise<void> => {
+      const client = this.plugin.identityClient();
+      const token = this.plugin.settings.identityAccessToken;
+      try {
+        const { url } =
+          what === 'portal'
+            ? await client.billingPortal(token, accountId)
+            : await client.checkout(token, { accountId, planId: 'personal', term: 'month', seats: 1 });
+        // The system browser, never a webview. A payment page rendered inside
+        // Obsidian would be indistinguishable from one a malicious plugin drew.
+        window.open(url);
+      } catch (err) {
+        // Deliberately specific. "Something went wrong" on a payment screen is
+        // the point at which somebody stops trusting the product.
+        const message =
+          err instanceof IdentityError && err.status === 403
+            ? 'Only the owner of an organisation can change its plan.'
+            : err instanceof IdentityError && err.status === 404
+              ? 'This organisation has no subscription to manage yet.'
+              : err instanceof IdentityError && err.status === 503
+                ? 'This server is not selling subscriptions.'
+                : err instanceof Error
+                  ? err.message
+                  : 'That could not be opened.';
+        new Notice(message, 8000);
+      }
+    };
+
+    new Setting(into)
+      .setName('Subscription')
+      .setDesc(
+        server.role === 'owner'
+          ? 'Change plan, update your payment method, see invoices, or cancel. Opens in your browser.'
+          : 'Only the owner of this organisation can change its plan.',
+      )
+      .addButton((b) =>
+        b
+          .setButtonText('Change plan')
+          .setDisabled(server.role !== 'owner')
+          .onClick(() => void open('checkout')),
+      )
+      .addButton((b) =>
+        b
+          .setButtonText('Manage subscription')
+          .setDisabled(server.role !== 'owner')
+          .onClick(() => void open('portal')),
+      );
+  }
+
   private displayMembers(
     section: HTMLElement,
     server: ReturnType<NectendaPlugin['servers']>[number],

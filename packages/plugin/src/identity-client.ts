@@ -61,6 +61,23 @@ export interface DeviceReport {
   max: number;
 }
 
+/** One organisation's subscription, as the billing summary reports it. */
+export interface BillingOrganisation {
+  accountId: string;
+  name: string;
+  role: string;
+  planId: string;
+  seats: number | null;
+  term: 'month' | 'year' | null;
+  renewsAt: number | null;
+  /** Set while a payment has failed and the window is still open. */
+  graceUntil: number | null;
+  /** Set when a cancellation is scheduled: when the plan actually ends. */
+  endingAt: number | null;
+  /** Only the owner of a paying organisation is offered the portal. */
+  canManage: boolean;
+}
+
 export interface MeResponse {
   user: { id: string; email: string; displayName: string; emailVerifiedAt: number | null; createdAt: number };
   memberships: Membership[];
@@ -167,6 +184,42 @@ export class IdentityClient {
 
   declineInvite(accessToken: string, inviteId: string): Promise<{ ok: true }> {
     return this.json(`/api/me/invites/${inviteId}/decline`, { method: 'POST', body: {}, token: accessToken }, 'That invitation could not be declined');
+  }
+
+  /**
+   * Start a checkout, and get the URL to open in the system browser.
+   *
+   * Buying happens here rather than on a web page because an account cannot be
+   * created for somebody remotely — the keys that encrypt a vault are derived
+   * on this device from a passphrase that never reaches the server. The last
+   * step is always the customer's, so the first one may as well be too.
+   *
+   * Owner-only, enforced by the service: the person billed is the person who
+   * can commit the card.
+   */
+  checkout(
+    accessToken: string,
+    req: { accountId: string; planId: string; term: 'month' | 'year'; seats: number },
+  ): Promise<{ orderId: string; url: string }> {
+    return this.json('/api/billing/checkout', { method: 'POST', body: req, token: accessToken }, 'Checkout could not be started');
+  }
+
+  /**
+   * A link into the payment provider's own billing portal — card, invoices,
+   * cancellation.
+   *
+   * Minted on demand rather than stored, because these are short-lived by
+   * design and a stale one would read as a bug. Reaching it from inside the
+   * plugin is also what makes cancelling possible without leaving the product,
+   * which our merchant of record requires of us.
+   */
+  billingPortal(accessToken: string, accountId: string): Promise<{ url: string }> {
+    return this.json(`/api/billing/portal/${encodeURIComponent(accountId)}`, { method: 'POST', body: {}, token: accessToken }, 'The billing portal could not be opened');
+  }
+
+  /** What each organisation is on, for how many seats, until when. Reads our own rows, so it answers when the provider is down. */
+  billingSummary(accessToken: string): Promise<{ provider: string | null; organisations: BillingOrganisation[] }> {
+    return this.json('/api/billing/summary', { token: accessToken }, 'Could not load your subscriptions');
   }
 
   /** Tell the identity service the shard confirmed the join, so the invitation stops showing. */

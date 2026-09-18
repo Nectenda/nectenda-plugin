@@ -37,9 +37,30 @@ function emit(level: string, args: unknown[]): void {
   sink(scrubSecrets(`${new Date().toISOString()} ${level} ${parts.join(' ')}`));
 }
 
+/**
+ * Whether routine console output is wanted.
+ *
+ * Obsidian's plugin guidelines ask that the developer console show only errors
+ * by default, and this plugin was printing an `[Nectenda]` line at `info` for
+ * every sync, sign-in and folder event — in the console of a person who had not
+ * asked to see any of it, and alongside every other plugin doing the same.
+ *
+ * Tied to the diagnostic-log setting, which already exists and already defaults
+ * to off, rather than to a new one: somebody turning diagnostics on wants to
+ * see what is happening, and that is the same wish. Warnings and errors ignore
+ * this — they are the exception the guideline makes — and the file sink is
+ * untouched, because what reaches the file is governed by whether a sink was
+ * installed at all.
+ */
+let verbose = false;
+
+export function setVerboseLogging(on: boolean): void {
+  verbose = on;
+}
+
 export const log = {
-  debug(...args: unknown[]) { console.debug(PREFIX, ...args); emit('DEBUG', args); },
-  info(...args: unknown[]) { console.log(PREFIX, ...args); emit('INFO ', args); },
+  debug(...args: unknown[]) { if (verbose) console.debug(PREFIX, ...args); emit('DEBUG', args); },
+  info(...args: unknown[]) { if (verbose) console.log(PREFIX, ...args); emit('INFO ', args); },
   warn(...args: unknown[]) { console.warn(PREFIX, ...args); emit('WARN ', args); },
   error(...args: unknown[]) { console.error(PREFIX, ...args); emit('ERROR', args); },
 };

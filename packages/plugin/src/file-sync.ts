@@ -6,6 +6,7 @@ import { META_DOC_SUFFIX } from '@nectenda/shared';
 import type { FileEntry, BlobEntry } from '@nectenda/shared';
 import { BLOBS_MAP_KEY, LISTING_MAP_KEY, LISTING_VERSION } from '@nectenda/shared';
 import { kindOf } from './blob-policy';
+import { joinWithin } from './vault-path';
 import type NectendaPlugin from './main';
 import type { SyncProvider } from './provider-router';
 import type { VaultAdapter } from './vault-adapter';
@@ -212,8 +213,15 @@ export class FileSync {
     if (deleted.length === 1 && added.length === 1) {
       const oldRelPath = deleted[0];
       const newRelPath = added[0];
-      const oldLocalPath = `${conn.localPath}/${oldRelPath}`;
-      const newLocalPath = `${conn.localPath}/${newRelPath}`;
+      const oldLocalPath = joinWithin(conn.localPath, oldRelPath);
+      const newLocalPath = joinWithin(conn.localPath, newRelPath);
+      // Either end escaping makes this not a rename we can honour. Falling
+      // through rather than returning leaves it to be handled as the separate
+      // delete and add it also is, each of which refuses on its own terms.
+      if (!oldLocalPath || !newLocalPath) {
+        log.warn('Refused a rename whose name leaves the folder', { folder: conn.sharedFolderId });
+        return;
+      }
 
       const oldExists = this.vault.isFile(oldLocalPath);
       if (oldExists) {
@@ -331,7 +339,15 @@ export class FileSync {
 
   private applyAdditions(conn: MetaConnection, added: string[]): void {
     for (const key of added) {
-      const localFilePath = `${conn.localPath}/${key}`;
+      const localFilePath = joinWithin(conn.localPath, key);
+      // A name from the listing belongs to whoever created the file, not to
+      // this vault. Refused rather than clamped, and said out loud: a file
+      // that does not appear because another member named it hostilely is
+      // exactly the kind of absence this project refuses to let pass quietly.
+      if (!localFilePath) {
+        log.warn('Refused a shared file whose name leaves the folder', { folder: conn.sharedFolderId });
+        continue;
+      }
       log.debug('Meta listed a file', { key, existsLocally: this.vault.exists(localFilePath) });
       if (!this.vault.exists(localFilePath)) {
         this.sequence(conn.sharedFolderId, key, () =>
@@ -381,7 +397,14 @@ export class FileSync {
     folderLocalPath: string,
     relativePath: string,
   ): Promise<void> {
-    const localFilePath = `${folderLocalPath}/${relativePath}`;
+    const localFilePath = joinWithin(folderLocalPath, relativePath);
+    // A delete naming a path outside the folder is refused like any other. It
+    // is the one direction where refusing costs nothing: the file it describes
+    // is not ours to remove.
+    if (!localFilePath) {
+      log.warn('Refused a deletion whose name leaves the folder', { folder: sharedFolderId });
+      return;
+    }
 
     if (this.vault.isFile(localFilePath)) {
       await this.preserveThenTrash(sharedFolderId, relativePath, localFilePath);
@@ -517,7 +540,11 @@ export class FileSync {
 
     // Create local files that exist in Y.Map but not locally
     for (const [relPath] of conn.ymap.entries()) {
-      const localFilePath = `${conn.localPath}/${relPath}`;
+      const localFilePath = joinWithin(conn.localPath, relPath);
+      if (!localFilePath) {
+        log.warn('Refused a shared file whose name leaves the folder', { folder: conn.sharedFolderId });
+        continue;
+      }
       if (!this.vault.exists(localFilePath)) {
         this.createLocalFileWithContent(conn.sharedFolderId, conn.localPath, relPath, localFilePath);
       }

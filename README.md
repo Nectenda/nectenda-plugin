@@ -31,10 +31,6 @@ Nectenda is a client for a sync server. It does nothing on its own: there is no
 offline-only or local-only mode, and with no account nothing syncs. Say so
 plainly before you install it.
 
-**You cannot sign yourself up.** Registering needs either an invitation issued
-by someone already on the server or that account's share key. There is no open
-registration on any server, ours or yours.
-
 There are two ways to run it, and they differ in what reaches us:
 
 **Hosted at [nectenda.com](https://nectenda.com).** We operate the server, so
@@ -49,10 +45,10 @@ display name you choose for a shared folder. Signing in talks to
 
 **A server you run.** The plugin talks to whatever address you give it, and a
 vault pointed at your own server sends us nothing at all — not the ciphertext
-and not the metadata above. Note that the server is not something you can obtain
-today: it is offered as a licensed image on Business and Enterprise plans, and
-that is not yet available. Said here because the plugin will happily connect to
-a self-hosted server and you should know which of the two you are in.
+and not the metadata above. **The server is not something you can obtain today**:
+it will be sold as a licensed image, and that is not yet available. Said here
+because the plugin will happily connect to a self-hosted server and you should
+know which of the two you are in.
 
 Both modes run the same encryption. The plugin talks to the server you point it
 at and to no third party.
@@ -82,17 +78,44 @@ so none are sent.
 
 ## Installing
 
-From the community plugin browser in Obsidian: **Settings → Community plugins →
-Browse**, search for Nectenda, install and enable it.
+**Not in Obsidian's community plugin browser yet.** Listing it starts an
+automated review of every future version, and we would rather take that step
+deliberately than as part of a first release. Two ways to install it meanwhile:
 
-To install a release by hand instead, take `main.js`, `manifest.json` and
-`styles.css` from the [latest release](../../releases/latest), put all three in
+**With [BRAT](https://github.com/TfTHacker/obsidian42-brat)**, which also keeps
+it updated: add `Nectenda/nectenda-plugin` as a beta plugin.
+
+**By hand**, from the [latest release](../../releases/latest): take
+`main.js`, `manifest.json` and `styles.css`, put all three in
 `<your vault>/.obsidian/plugins/nectenda/`, and enable the plugin under
 **Settings → Community plugins**.
 
-Then open **Settings → Nectenda**, give it a server address, and sign in with
-the account you were invited to. Share a folder from the plugin's pane and
-anyone else with access to it sees your edits as you type.
+Then open **Settings → Nectenda** and sign in. Signing in creates your own
+organisation on the free plan; share a folder from the plugin's pane and anyone
+you invite sees your edits as you type.
+
+## What it costs
+
+The plugin is free and always will be. The hosted service is what is paid for,
+and an organisation is the billable unit — a person can belong to several and
+takes one seat in each.
+
+| | Price | Seats | Devices per seat | Attachments |
+|---|---|---|---|---|
+| **Free** | — | 3 | 2 | none; text sync only |
+| **Personal** | $5/mo or $48/yr | 6 | 3 | 10 GB |
+| **Team** | $6 per seat/mo | up to 10 | 4 | 20 GB + 5 GB per seat |
+| **Small Business** | $18 per seat/mo | up to 25 | 6 | 100 GB + 20 GB per seat |
+
+Free is not a trial: it does not expire and it is not a reduced version of a paid
+plan. Text sync is never blocked on any plan, and nothing is deleted if you stop
+paying — an organisation that lapses returns to Free with everything it stored
+still downloadable.
+
+Plans are bought inside Obsidian rather than on a web page, because the keys that
+encrypt your vault are derived on your own device from a passphrase that never
+reaches us. An account cannot be created for you remotely; the last step is
+always yours. Full pricing at [nectenda.com/pricing](https://nectenda.com/pricing).
 
 ## Build
 
@@ -129,6 +152,21 @@ licence terms and this line, which also travels inside every built `main.js`:
 ```
 Required Notice: Copyright (c) 2026 Nerchure Ltd (https://nectenda.com)
 ```
+
+## Getting help, and reporting a vulnerability
+
+**Support:** `support@nectenda.com` — accounts, subscriptions and refunds.
+We reply within three business days.
+
+**Security:** if you have found a vulnerability, please write to
+`security@nectenda.com` rather than opening an issue, and give us a
+reasonable chance to fix it before disclosing. We will confirm receipt within
+three business days, tell you what we find, and credit you unless you would
+rather we did not.
+
+Every claim in [docs/security-model.md](docs/security-model.md) is meant to be
+checkable against this code. **If you can show one of them is wrong, that is the
+report we most want.**
 
 ---
 

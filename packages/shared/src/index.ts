@@ -485,7 +485,7 @@ export interface InviteTokenInfo {
 
 /** Something the account view should tell the user, computed server-side. */
 export interface AccountMessage {
-  kind: 'suspended' | 'migrating' | 'over-quota' | 'attachments-not-included' | 'notice' | 'device-not-enrolled';
+  kind: 'suspended' | 'migrating' | 'closed' | 'over-quota' | 'attachments-not-included' | 'notice' | 'device-not-enrolled';
   text: string;
 }
 
@@ -536,6 +536,21 @@ export const WS_CLOSE_SIGNED_OUT = 4005;
  * that has been available long enough for updates to have reached people.
  */
 export const WS_CLOSE_UPDATE_PLUGIN = 4007;
+
+/**
+ * The organisation has been closed by its owner.
+ *
+ * Distinct from 4004 because suspension is something *we* did and closure is
+ * something *they* did, and the plugin must not tell someone to contact support
+ * about a decision they made themselves. Retry is pointless until it is
+ * reopened, so this is the one application code the plugin should not back off
+ * and retry on its own.
+ *
+ * Nothing has been deleted. Attachments keep downloading for the retention
+ * window stated in the terms, and reopening restores everything untouched —
+ * which is why this is a close code rather than a deletion.
+ */
+export const WS_CLOSE_ACCOUNT_CLOSED = 4008;
 
 /**
  * Order two plugin versions, `-1`, `0` or `1`, as a person reads them:
