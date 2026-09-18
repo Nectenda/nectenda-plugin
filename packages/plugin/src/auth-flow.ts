@@ -101,7 +101,9 @@ export function validateSignInResult(value: unknown): SignInResult {
   const v = value as Record<string, unknown>;
   if (!v || typeof v !== 'object') throw new Error('The sign-in result was not an object');
   for (const k of ['accessToken', 'identityToken', 'refreshToken']) {
-    if (typeof v[k] !== 'string' || !(v[k] as string)) throw new Error(`The sign-in result has no ${k}`);
+    // No cast: the `typeof` on the left of the `||` has already narrowed this
+    // to a string by the time the emptiness check runs.
+    if (typeof v[k] !== 'string' || !v[k]) throw new Error(`The sign-in result has no ${k}`);
   }
   const user = v.user as Record<string, unknown> | undefined;
   if (!user || typeof user.id !== 'string' || typeof user.email !== 'string') {

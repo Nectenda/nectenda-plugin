@@ -6,6 +6,16 @@ import { MessageType, COMPACT_AFTER_UPDATES, WS_CLOSE_DEVICE_LIMIT, WS_CLOSE_ACC
 import { PLUGIN_VERSION } from './client-version.js';
 import { log } from './logger';
 
+/** A `window.setTimeout`/`setInterval` handle: a number.
+ *
+ * Spelled out rather than `ReturnType<typeof window.setTimeout>`, which looks
+ * tidier and is wrong here. `@types/node` is a devDependency, so the global is
+ * overloaded, and `ReturnType<>` resolves the *last* overload — Node's
+ * `Timeout` — while the call itself resolves the DOM one and returns a number.
+ * The two disagree and nothing says so until an assignment fails.
+ */
+type TimerHandle = number;
+
 /**
  * `device-limit`, `suspended` and `moving` are deliberately separate from
  * `disconnected`. Nothing is wrong with the network or the credentials, so
@@ -72,7 +82,7 @@ interface DocSubscription {
   seqStore: SeqStore | null;
   /** Resolves once any persisted sequence has been restored. */
   seqReady: Promise<void>;
-  seqSaveTimer: ReturnType<typeof setTimeout> | null;
+  seqSaveTimer: TimerHandle | null;
   /**
    * Sequence the server's current snapshot covers, 0 if it has none.
    *
@@ -172,7 +182,7 @@ export class MultiplexedProvider {
   private ws: WebSocket | null = null;
   private docs: Map<string, DocSubscription> = new Map();
   private status: ProviderStatus = 'disconnected';
-  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private reconnectTimer: TimerHandle | null = null;
   private reconnectDelay = 1000;
   private maxReconnectDelay = 30000;
   private shouldConnect = false;
@@ -225,7 +235,7 @@ export class MultiplexedProvider {
   disconnect(): void {
     this.shouldConnect = false;
     if (this.reconnectTimer) {
-      clearTimeout(this.reconnectTimer);
+      window.clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
     if (this.ws) {
@@ -845,7 +855,7 @@ export class MultiplexedProvider {
    */
   private scheduleSeqSave(sub: DocSubscription): void {
     if (!sub.seqStore || sub.seqSaveTimer) return;
-    sub.seqSaveTimer = setTimeout(() => {
+    sub.seqSaveTimer = window.setTimeout(() => {
       sub.seqSaveTimer = null;
       // Skipped while a decrypt gap is open: `lastSeq` deliberately stops
       // advancing there, and recording it would freeze this device at the hole
@@ -1067,7 +1077,7 @@ export class MultiplexedProvider {
       // Inside the restart window: one second, then every two, no doubling.
       const delay = this.restartAttempts++ === 0 ? 1000 : 2000;
       log.info('Reconnecting after a server restart in', { delay: `${delay}ms` });
-      this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = window.setTimeout(() => {
         this.reconnectTimer = null;
         this.doConnect();
       }, delay);
@@ -1080,7 +1090,7 @@ export class MultiplexedProvider {
       if (this.status === 'restarting') this.setStatus('disconnected');
     }
     log.info('Reconnecting in', { delay: `${this.reconnectDelay}ms` });
-    this.reconnectTimer = setTimeout(() => {
+    this.reconnectTimer = window.setTimeout(() => {
       this.reconnectTimer = null;
       this.doConnect();
     }, this.reconnectDelay);

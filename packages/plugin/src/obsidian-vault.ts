@@ -144,6 +144,12 @@ export class ObsidianVaultAdapter implements VaultAdapter {
     if (!file) return;
     // `false` is the vault's own .trash. The system trash was tried and proved
     // useless: a file removed that way was not recoverable from it at all.
+    //
+    // Which is also why the review's suggestion of `FileManager.trashFile()` is
+    // declined here: it follows the user's preference, and one of the available
+    // preferences is the system trash that was already shown not to work, while
+    // another is permanent deletion. This path runs for deletions arriving from
+    // other vaults, so it has to be the one that keeps the bytes.
     await this.vault.trash(file, false);
   }
 

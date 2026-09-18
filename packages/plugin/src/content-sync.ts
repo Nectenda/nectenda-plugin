@@ -8,6 +8,16 @@ import type { SyncProvider } from './provider-router';
 import { idbStoreName } from './idb-name';
 import { log } from './logger';
 
+/** A `window.setTimeout`/`setInterval` handle: a number.
+ *
+ * Spelled out rather than `ReturnType<typeof window.setTimeout>`, which looks
+ * tidier and is wrong here. `@types/node` is a devDependency, so the global is
+ * overloaded, and `ReturnType<>` resolves the *last* overload — Node's
+ * `Timeout` — while the call itself resolves the DOM one and returns a number.
+ * The two disagree and nothing says so until an assignment fails.
+ */
+type TimerHandle = number;
+
 const WRITE_DEBOUNCE = 500;
 /** Dot-prefixed so Obsidian hides it from the file explorer by default. */
 const BACKUP_FOLDER = '.nectenda-backups';
@@ -65,7 +75,7 @@ interface FileDocState {
   ytext: Y.Text;
   idbProvider: IndexeddbPersistence;
   editorActive: boolean;
-  writeTimer: ReturnType<typeof setTimeout> | null;
+  writeTimer: TimerHandle | null;
   /** Consecutive attempts that found no local file yet. See writeToDisk. */
   writeRetries: number;
   /**
@@ -189,7 +199,7 @@ export class ContentSync {
     }
 
     if (offset + BATCH_SIZE < files.length) {
-      setTimeout(() => {
+      window.setTimeout(() => {
         this.connectFilesBatched(sharedFolderId, localPath, files, offset + BATCH_SIZE);
       }, BATCH_DELAY);
     }
@@ -484,7 +494,7 @@ export class ContentSync {
   private abandonUnsubscribed(state: FileDocState, sharedFolderId: string, folderLocalPath: string): void {
     this.fileDocs.delete(state.docName);
     this.folderFiles.get(sharedFolderId)?.delete(state.docName);
-    if (state.writeTimer) clearTimeout(state.writeTimer);
+    if (state.writeTimer) window.clearTimeout(state.writeTimer);
     if (state.observer) state.ytext.unobserve(state.observer);
     state.idbProvider.destroy();
     state.ydoc.destroy();
@@ -520,7 +530,7 @@ export class ContentSync {
     const state = this.fileDocs.get(docName);
     if (!state) return;
 
-    if (state.writeTimer) clearTimeout(state.writeTimer);
+    if (state.writeTimer) window.clearTimeout(state.writeTimer);
     if (state.observer) state.ytext.unobserve(state.observer);
     this.provider.unsubscribe(docName);
     state.idbProvider.destroy();
@@ -602,7 +612,7 @@ export class ContentSync {
     if (!state) return;
     state.editorActive = bound;
     if (bound && state.writeTimer) {
-      clearTimeout(state.writeTimer);
+      window.clearTimeout(state.writeTimer);
       state.writeTimer = null;
     }
     if (!bound) this.scheduleDiskWrite(state);
@@ -753,8 +763,8 @@ export class ContentSync {
   }
 
   private scheduleDiskWrite(state: FileDocState): void {
-    if (state.writeTimer) clearTimeout(state.writeTimer);
-    state.writeTimer = setTimeout(() => {
+    if (state.writeTimer) window.clearTimeout(state.writeTimer);
+    state.writeTimer = window.setTimeout(() => {
       state.writeTimer = null;
       this.writeToDisk(state);
     }, WRITE_DEBOUNCE);
@@ -773,8 +783,8 @@ export class ContentSync {
       // touch that document again.
       if (state.writeRetries < MAX_WRITE_RETRIES) {
         state.writeRetries++;
-        if (state.writeTimer) clearTimeout(state.writeTimer);
-        state.writeTimer = setTimeout(() => {
+        if (state.writeTimer) window.clearTimeout(state.writeTimer);
+        state.writeTimer = window.setTimeout(() => {
           state.writeTimer = null;
           void this.writeToDisk(state);
         }, WRITE_RETRY_DELAY * state.writeRetries);

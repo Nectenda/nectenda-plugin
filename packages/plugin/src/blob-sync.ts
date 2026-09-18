@@ -10,6 +10,16 @@ import { LEARNING_FLOOR_BYTES } from './device-state';
 import { log } from './logger';
 import { serverFetch } from './client-version.js';
 
+/** A `window.setTimeout`/`setInterval` handle: a number.
+ *
+ * Spelled out rather than `ReturnType<typeof window.setTimeout>`, which looks
+ * tidier and is wrong here. `@types/node` is a devDependency, so the global is
+ * overloaded, and `ReturnType<>` resolves the *last* overload — Node's
+ * `Timeout` — while the call itself resolves the DOM one and returns a number.
+ * The two disagree and nothing says so until an assignment fails.
+ */
+type TimerHandle = number;
+
 /**
  * Attachments on disk, kept in step with the `blobs` map in the meta document.
  *
@@ -45,7 +55,7 @@ interface FolderState {
   lastSyncedHash: Map<string, string>;
   /** Cancels every transfer in flight when the folder goes away. */
   abort: AbortController;
-  debounce: Map<string, ReturnType<typeof setTimeout>>;
+  debounce: Map<string, TimerHandle>;
 }
 
 /** Local modifications settle before an upload. Image editors write repeatedly. */
@@ -80,7 +90,7 @@ export class BlobSync {
     // disappears. A download resolving into an unmapped folder is the named
     // recurring hazard in this codebase, not a hypothetical one.
     state.abort.abort();
-    for (const timer of state.debounce.values()) clearTimeout(timer);
+    for (const timer of state.debounce.values()) window.clearTimeout(timer);
     this.folders.delete(sharedFolderId);
   }
 
@@ -109,10 +119,10 @@ export class BlobSync {
     const state = this.folders.get(sharedFolderId);
     if (!state) return;
     const existing = state.debounce.get(relativePath);
-    if (existing) clearTimeout(existing);
+    if (existing) window.clearTimeout(existing);
     state.debounce.set(
       relativePath,
-      setTimeout(() => {
+      window.setTimeout(() => {
         state.debounce.delete(relativePath);
         void this.upload(sharedFolderId, relativePath);
       }, MODIFY_DEBOUNCE_MS),

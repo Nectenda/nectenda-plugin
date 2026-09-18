@@ -9,6 +9,16 @@ import { log } from './logger';
 import { seatFor, seatColour, type Person } from './presence';
 import { resolveMapping, type FolderMapping } from './folder-mapping';
 
+/** A `window.setTimeout`/`setInterval` handle: a number.
+ *
+ * Spelled out rather than `ReturnType<typeof window.setTimeout>`, which looks
+ * tidier and is wrong here. `@types/node` is a devDependency, so the global is
+ * overloaded, and `ReturnType<>` resolves the *last* overload — Node's
+ * `Timeout` — while the call itself resolves the DOM one and returns a number.
+ * The two disagree and nothing says so until an assignment fails.
+ */
+type TimerHandle = number;
+
 export { resolveMapping, type FolderMapping };
 
 
@@ -83,7 +93,7 @@ export class EditorBridge {
   private username: string;
   private collabExts: Extension[];
   /** A pending wait for a document's subscription, so it can be cancelled. */
-  private subscriptionWait: { event: string; cb: () => void; timer: ReturnType<typeof setInterval> } | null = null;
+  private subscriptionWait: { event: string; cb: () => void; timer: TimerHandle } | null = null;
   private currentFile: string | null = null;
   private currentDocName: string | null = null;
   private onPresenceChange: ((people: Person[]) => void) | null = null;
@@ -476,7 +486,7 @@ export class EditorBridge {
       settle();
       return;
     }
-    const timer = setInterval(() => {
+    const timer = window.setInterval(() => {
       attempts += 1;
       if (this.currentFile !== filePath || this.provider.getAwareness(docName)) {
         settle();
@@ -502,7 +512,7 @@ export class EditorBridge {
   private cancelSubscriptionWait(): void {
     if (!this.subscriptionWait) return;
     this.provider.off(this.subscriptionWait.event, this.subscriptionWait.cb);
-    clearInterval(this.subscriptionWait.timer);
+    window.clearInterval(this.subscriptionWait.timer);
     this.subscriptionWait = null;
   }
 

@@ -514,7 +514,7 @@ export class FileSync {
       // Cleared on the next tick, not immediately: Obsidian delivers the vault
       // 'create' event after the create resolves, so clearing here would let
       // the very event this exists to suppress through.
-      setTimeout(() => this.remoteCreates.delete(marker), 0);
+      window.setTimeout(() => this.remoteCreates.delete(marker), 0);
     }
   }
 

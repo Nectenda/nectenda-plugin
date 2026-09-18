@@ -246,6 +246,21 @@ export class IdentityClient {
     return this.json('/api/billing/summary', { token: accessToken }, 'Could not load your subscriptions');
   }
 
+  /**
+   * Tell the identity service an organisation was just created on a shard.
+   *
+   * Organisations reach it only through its once-a-minute manifest pull — the
+   * shard never pushes — so until that lands, the service does not know the
+   * organisation exists and refuses a checkout for it. This asks for the pull
+   * now rather than waiting out the interval.
+   *
+   * Best-effort: the interval gets there regardless, so a caller ignores the
+   * result rather than failing a creation over it.
+   */
+  organisationCreated(accessToken: string, shardId: string): Promise<{ ok: true }> {
+    return this.json('/api/me/organisations/created', { method: 'POST', body: { shardId }, token: accessToken }, 'Could not refresh your organisations');
+  }
+
   /** Tell the identity service the shard confirmed the join, so the invitation stops showing. */
   inviteJoined(accessToken: string, inviteId: string): Promise<{ ok: true }> {
     return this.json(`/api/me/invites/${inviteId}/joined`, { method: 'POST', body: {}, token: accessToken }, 'Could not confirm the invitation');

@@ -155,7 +155,7 @@ interface SafeStorage {
 }
 
 function safeStorage(): SafeStorage | null {
-  const s = (globalThis as { electron?: { remote?: { safeStorage?: SafeStorage } } })
+  const s = (window as unknown as { electron?: { remote?: { safeStorage?: SafeStorage } } })
     .electron?.remote?.safeStorage;
   return s && typeof s.encryptString === 'function' ? s : null;
 }
@@ -187,7 +187,7 @@ class DeviceStore implements SecretStore {
 
   get(id: string): string | null {
     try {
-      const cipher = globalThis.localStorage.getItem(id);
+      const cipher = window.localStorage.getItem(id);
       if (!cipher) return null;
       return this.safe.decryptString(Uint8Array.from(atob(cipher), (c) => c.charCodeAt(0)));
     } catch (err) {
@@ -199,7 +199,7 @@ class DeviceStore implements SecretStore {
   }
 
   set(id: string, value: string): void {
-    globalThis.localStorage.setItem(id, this.safe.encryptString(value).toString('base64'));
+    window.localStorage.setItem(id, this.safe.encryptString(value).toString('base64'));
   }
 
   delete(id: string): void {
@@ -207,7 +207,7 @@ class DeviceStore implements SecretStore {
     // refuses must not be able to abort signing out — the rest of that path
     // clears the tokens and folder keys, which matters more than this entry.
     try {
-      globalThis.localStorage.removeItem(id);
+      window.localStorage.removeItem(id);
     } catch (err) {
       log.warn('Could not drop the device-wide secret', { id, error: String(err) });
     }

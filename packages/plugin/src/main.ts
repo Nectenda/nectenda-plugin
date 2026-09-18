@@ -56,6 +56,16 @@ import { log, setLogSink, setVerboseLogging } from './logger';
 import { initials, type Person } from './presence';
 import { serverFetch } from './client-version.js';
 
+/** A `window.setTimeout`/`setInterval` handle: a number.
+ *
+ * Spelled out rather than `ReturnType<typeof window.setTimeout>`, which looks
+ * tidier and is wrong here. `@types/node` is a devDependency, so the global is
+ * overloaded, and `ReturnType<>` resolves the *last* overload — Node's
+ * `Timeout` — while the call itself resolves the DOM one and returns a number.
+ * The two disagree and nothing says so until an assignment fails.
+ */
+type TimerHandle = number;
+
 /** What `GET /api/account` answers with. */
 interface AccountResponse {
   account: { id: string; name: string; planId: string; status: 'active' | 'suspended' };
@@ -921,7 +931,7 @@ class FolderMembersModal extends Modal {
       setting.addButton((btn) =>
         btn
           .setButtonText('Remove')
-          .setWarning()
+          .setDestructive()
           .onClick(async () => {
             const res = await serverFetch(`${base}/folders/${this.folderId}/members/${member.userId}`, {
               method: 'DELETE',
@@ -1204,7 +1214,7 @@ export class PasswordPromptModal extends Modal {
   private error: HTMLElement | null = null;
   private setDisabled: ((v: boolean) => void) | null = null;
   private clearInput: (() => void) | null = null;
-  private countdown: ReturnType<typeof setInterval> | null = null;
+  private countdown: TimerHandle | null = null;
   /** Wall-clock deadline for the pause. Enter bypasses a disabled button. */
   private blockedUntil = 0;
 
@@ -1322,7 +1332,7 @@ export class PasswordPromptModal extends Modal {
     let left = Math.ceil(wait / 1000);
     const tick = (): void => this.show(`${outcome.message} Try again in ${left}s.`);
     tick();
-    this.countdown = setInterval(() => {
+    this.countdown = window.setInterval(() => {
       left -= 1;
       if (left > 0) {
         tick();
@@ -1337,7 +1347,7 @@ export class PasswordPromptModal extends Modal {
 
   private stopCountdown(): void {
     if (this.countdown === null) return;
-    clearInterval(this.countdown);
+    window.clearInterval(this.countdown);
     this.countdown = null;
   }
 
@@ -2234,7 +2244,7 @@ export default class NectendaPlugin extends Plugin {
       reconnect: () => this.provider?.get(id)?.provider.connect(),
       signOut: () => this.signOutCloud('This device was signed out from another device. Sign in again to continue syncing.', { skipLogout: true }),
       retryLater: () => {
-        setTimeout(() => void this.handleSignedOutConnection(id), 30_000);
+        window.setTimeout(() => void this.handleSignedOutConnection(id), 30_000);
       },
       stillCurrent: () => gen === this.sessionGeneration && !this.signingIn,
     });
@@ -2511,6 +2521,22 @@ export default class NectendaPlugin extends Plugin {
     this.settings.memberships = [...this.settings.memberships.filter((x) => x.id !== m.id), m];
     await this.saveSettings();
     this.reconcileConnections();
+
+    // Ask the identity service to pull this shard now.
+    //
+    // It learns about organisations only from its own once-a-minute manifest
+    // pull, so until that lands it does not know this one exists and refuses a
+    // checkout for it as unknown. Somebody who creates an organisation and
+    // immediately presses *Change plan* is inside that window by construction.
+    //
+    // Deliberately not awaited and deliberately swallowed, exactly as the
+    // invite path does it: the creation has already succeeded on the shard, the
+    // pull loop gets there regardless, and failing a creation over a hint would
+    // be the wrong trade entirely.
+    void this.identityClient()
+      .organisationCreated(this.settings.identityAccessToken, where.shardId)
+      .catch(() => undefined);
+
     // The settings pane lists organisations as pages, read only when told
     // the list changed: without this a join made from the pane itself never
     // appears until the pane is rebuilt for another reason.
@@ -3184,6 +3210,14 @@ export default class NectendaPlugin extends Plugin {
       if (file) {
         // To the vault trash, not gone: the user is freeing server space, and
         // may not have meant to destroy their only copy.
+        //
+        // Obsidian's review asks for `FileManager.trashFile()` here, to respect
+        // the user's deletion preference. Declined, deliberately. That
+        // preference describes what should happen when *they* delete something;
+        // this is sync removing a file on their behalf, and for anyone whose
+        // setting is "Permanently delete" honouring it would turn a remote
+        // action into the destruction of their only copy. The vault's own
+        // .trash is the answer that cannot lose anything.
         await this.app.vault.trash(file, false);
         return true;
       }
@@ -3276,7 +3310,7 @@ export default class NectendaPlugin extends Plugin {
     });
     // The send is fire-and-forget by design, so this waits rather than being
     // told. Long enough for a round trip, short enough not to look stuck.
-    await new Promise((r) => setTimeout(r, 2000));
+    await new Promise((r) => window.setTimeout(r, 2000));
     probe.stop();
     await navigator.clipboard?.writeText(sentinel).catch(() => undefined);
     new Notice(
@@ -4024,7 +4058,7 @@ export class NectendaSettingTab extends PluginSettingTab {
     const res = await serverFetch(input, init);
     if (res.status === 401 && this.plugin.isSignedIn()) {
       await this.plugin.handleSessionExpired();
-      this.display();
+      this.update();
     }
     return res;
   }
@@ -4044,8 +4078,8 @@ export class NectendaSettingTab extends PluginSettingTab {
    */
   private visible = false;
   private unsubscribe: (() => void) | null = null;
-  private pollTimer: ReturnType<typeof setInterval> | null = null;
-  private flushTimer: ReturnType<typeof setTimeout> | null = null;
+  private pollTimer: TimerHandle | null = null;
+  private flushTimer: TimerHandle | null = null;
   private pendingSections = new Set<PaneSection>();
   private generations = new SectionGenerations();
   private slots: Partial<Record<Exclude<PaneSection, 'account' | 'organisations' | 'sharedFolders'>, HTMLElement>> = {};
@@ -4210,7 +4244,7 @@ export class NectendaSettingTab extends PluginSettingTab {
     this.unsubscribe = null;
     this.stopPoll();
     if (this.flushTimer) {
-      clearTimeout(this.flushTimer);
+      window.clearTimeout(this.flushTimer);
       this.flushTimer = null;
     }
     this.pendingSections.clear();
@@ -4241,11 +4275,11 @@ export class NectendaSettingTab extends PluginSettingTab {
 
   private startPoll(): void {
     this.stopPoll();
-    this.pollTimer = setInterval(() => this.scheduleRefresh('poll'), PANE_POLL_MS);
+    this.pollTimer = window.setInterval(() => this.scheduleRefresh('poll'), PANE_POLL_MS);
   }
 
   private stopPoll(): void {
-    if (this.pollTimer) clearInterval(this.pollTimer);
+    if (this.pollTimer) window.clearInterval(this.pollTimer);
     this.pollTimer = null;
   }
 
@@ -4260,7 +4294,7 @@ export class NectendaSettingTab extends PluginSettingTab {
     if (reason === 'poll' || reason === 'structure') this.envelopeChecked.clear();
     for (const section of sectionsFor(reason)) this.pendingSections.add(section);
     if (this.flushTimer) return;
-    this.flushTimer = setTimeout(() => {
+    this.flushTimer = window.setTimeout(() => {
       this.flushTimer = null;
       const sections = [...this.pendingSections];
       this.pendingSections.clear();
@@ -4352,7 +4386,7 @@ export class NectendaSettingTab extends PluginSettingTab {
     link.onclick = async () => {
       this.plugin.settings.mode = to;
       await this.plugin.saveSettings();
-      this.display();
+      this.update();
     };
   }
 
@@ -4585,7 +4619,7 @@ export class NectendaSettingTab extends PluginSettingTab {
       if (!unlocked) {
         // Signed in, locked, and said so by the pane rather than by a toast
         // that scrolls away. `ensureIdentity` has already explained why.
-        this.display();
+        this.update();
         return;
       }
       new Notice(`Signed in as ${identity.email}`);
@@ -4604,7 +4638,7 @@ export class NectendaSettingTab extends PluginSettingTab {
       await this.createOrganisation(this.suggestedOrganisationName());
       return;
     }
-    this.display();
+    this.update();
   }
 
   /**
@@ -4620,12 +4654,12 @@ export class NectendaSettingTab extends PluginSettingTab {
       const m = await this.plugin.createOrganisation(name);
       working.hide();
       new Notice(`${m.accountName} is ready. Share a folder to start syncing.`);
-      this.display();
+      this.update();
       return true;
     } catch (err) {
       working.hide();
       new Notice(`Could not create the organisation: ${err instanceof Error ? err.message : String(err)}`);
-      this.display();
+      this.update();
       return false;
     }
   }
@@ -4681,7 +4715,7 @@ export class NectendaSettingTab extends PluginSettingTab {
         this.plugin.settings.recoveryKeyAcknowledgedAt = Math.floor(Date.now() / 1000);
         void this.plugin.saveSettings();
       }).open();
-      this.display();
+      this.update();
     } catch (err) {
       notice.hide();
       new Notice(`Recovery failed: ${err instanceof Error ? err.message : 'Could not connect'}`);
@@ -4786,7 +4820,7 @@ export class NectendaSettingTab extends PluginSettingTab {
       .setName('Logged in as')
       .setDesc(`${settings.username} (${settings.userRole})`)
       .addButton((btn) =>
-        btn.setButtonText('Logout').setWarning().onClick(async () => {
+        btn.setButtonText('Logout').setDestructive().onClick(async () => {
           await this.doLogout();
         })
       );
@@ -4813,9 +4847,9 @@ export class NectendaSettingTab extends PluginSettingTab {
       .setName('Signed in as')
       .setDesc(identity.email)
       .addButton((btn) =>
-        btn.setButtonText('Sign out').setWarning().onClick(async () => {
+        btn.setButtonText('Sign out').setDestructive().onClick(async () => {
           await this.plugin.signOutCloud('Signed out');
-          this.display();
+          this.update();
         }),
       );
 
@@ -4845,7 +4879,7 @@ export class NectendaSettingTab extends PluginSettingTab {
         .setDesc('Not set yet. It protects every note you sync and never leaves this device.')
         .addButton((btn) =>
           btn.setButtonText('Set passphrase').setCta().onClick(async () => {
-            if (await this.setCloudPassphrase()) this.display();
+            if (await this.setCloudPassphrase()) this.update();
           }),
         );
     }
@@ -4862,7 +4896,7 @@ export class NectendaSettingTab extends PluginSettingTab {
         } catch (err) {
           new Notice(err instanceof Error ? err.message : 'Could not reach the identity service');
         }
-        this.display();
+        this.update();
       }),
     );
     const slot = containerEl.createDiv();
@@ -4893,7 +4927,7 @@ export class NectendaSettingTab extends PluginSettingTab {
               working.hide();
               new Notice(`Could not accept: ${err instanceof Error ? err.message : String(err)}`);
             }
-            this.display();
+            this.update();
           }),
         )
         .addButton((btn) =>
@@ -4910,7 +4944,7 @@ export class NectendaSettingTab extends PluginSettingTab {
               }
               new Notice(err instanceof Error ? err.message : 'Could not decline');
             }
-            this.display();
+            this.update();
           }),
         );
     }
@@ -4976,14 +5010,14 @@ export class NectendaSettingTab extends PluginSettingTab {
         const row = new Setting(group).setName(invite.email).setDesc(sentInviteDescription(invite, status));
         if (invite.mailError) row.descEl.addClass('mod-warning');
         row.addButton((btn) =>
-          btn.setButtonText('Revoke').setWarning().onClick(async () => {
+          btn.setButtonText('Revoke').setDestructive().onClick(async () => {
             try {
               await client.revokeInvite(token, m.accountId, invite.id);
               new Notice(`The invitation to ${invite.email} is revoked.`);
             } catch (err) {
               new Notice(err instanceof Error ? err.message : 'Could not revoke');
             }
-            this.display();
+            this.update();
           }),
         );
       }
@@ -5072,7 +5106,7 @@ export class NectendaSettingTab extends PluginSettingTab {
           } catch (err) {
             new Notice(`Could not join: ${err instanceof Error ? err.message : String(err)}`);
           }
-          this.display();
+          this.update();
         }),
       );
   }
@@ -5133,7 +5167,7 @@ export class NectendaSettingTab extends PluginSettingTab {
         .setDesc(`${s.platform ?? 'unknown'} — last used ${new Date(s.lastUsedAt * 1000).toLocaleDateString()}`);
       if (!mine) {
         row.addButton((btn) =>
-          btn.setButtonText('Sign out').setWarning().onClick(async () => {
+          btn.setButtonText('Sign out').setDestructive().onClick(async () => {
             log.info("Ending another vault's session", { sessionId: s.id, label: s.label ?? null });
             try {
               await this.plugin.identityClient().revokeSession(this.plugin.settings.identityAccessToken, s.id);
@@ -5141,7 +5175,7 @@ export class NectendaSettingTab extends PluginSettingTab {
             } catch (err) {
               new Notice(err instanceof Error ? err.message : 'Could not revoke');
             }
-            this.display();
+            this.update();
           }),
         );
       }
@@ -5154,13 +5188,13 @@ export class NectendaSettingTab extends PluginSettingTab {
           .setName(pk.label || 'Passkey')
           .setDesc(`Created ${new Date(pk.createdAt * 1000).toLocaleDateString()}${pk.lastUsedAt ? `, last used ${new Date(pk.lastUsedAt * 1000).toLocaleDateString()}` : ''}`)
           .addButton((btn) =>
-            btn.setButtonText('Remove').setWarning().onClick(async () => {
+            btn.setButtonText('Remove').setDestructive().onClick(async () => {
               try {
                 await this.plugin.identityClient().deletePasskey(this.plugin.settings.identityAccessToken, pk.credentialId);
               } catch (err) {
                 new Notice(err instanceof Error ? err.message : 'Could not remove');
               }
-              this.display();
+              this.update();
             }),
           );
       }
@@ -5285,7 +5319,7 @@ export class NectendaSettingTab extends PluginSettingTab {
         .setDesc('See what is taking up space and delete what you no longer need.')
         .addButton((b) =>
           b.setButtonText('Manage').onClick(() => {
-            new ManageStorageModal(this.app, this.plugin, () => this.display()).open();
+            new ManageStorageModal(this.app, this.plugin, () => this.update()).open();
           }),
         );
 
@@ -5356,7 +5390,7 @@ export class NectendaSettingTab extends PluginSettingTab {
               // The membership records the new standing and the socket opens
               // on the shape change; the pane follows.
               await this.plugin.refreshMemberships().catch(() => undefined);
-              this.display();
+              this.update();
             }),
           );
       }
@@ -5374,7 +5408,7 @@ export class NectendaSettingTab extends PluginSettingTab {
         // "Disconnect": a closed socket the device reopened a second later was
         // a button that lied.
         setting.addButton((btn) =>
-          btn.setButtonText('Remove').setWarning().onClick(async () => {
+          btn.setButtonText('Remove').setDestructive().onClick(async () => {
             if (d.thisDevice && !window.confirm('Remove this device from the organisation? Its notes stay here; syncing this organisation stops until it is added again.')) return;
             const res = await this.apiFetch(`${server.base}/account/devices/${encodeURIComponent(d.deviceId)}`, {
               method: 'DELETE',
@@ -5386,7 +5420,7 @@ export class NectendaSettingTab extends PluginSettingTab {
             }
             new Notice(d.thisDevice ? 'Removed. This device no longer syncs this organisation.' : 'Removed. That device no longer syncs this organisation; its slot is free.');
             await this.plugin.refreshMemberships().catch(() => undefined);
-            this.display();
+            this.update();
           }),
         );
       }
@@ -5446,45 +5480,99 @@ export class NectendaSettingTab extends PluginSettingTab {
       } catch (err) {
         // Deliberately specific. "Something went wrong" on a payment screen is
         // the point at which somebody stops trusting the product.
+        //
+        // **On the code before the status.** Two different facts used to share
+        // a 404 and therefore shared a sentence: "we have not heard of this
+        // organisation yet" and "this organisation has never been paid for".
+        // The first is what a brand-new organisation gets for up to a minute,
+        // and it was being told it had no subscription to manage — on the
+        // button whose entire purpose is to create the first one.
+        const code = err instanceof IdentityError ? err.code : undefined;
         const message =
-          err instanceof IdentityError && err.status === 403
-            ? 'Only the owner of an organisation can change its plan.'
-            : err instanceof IdentityError && err.status === 404
+          code === 'UNKNOWN_ACCOUNT'
+            ? 'This organisation was only just created and is still being registered. Try again in a few seconds.'
+            : code === 'NO_SUBSCRIPTION'
               ? 'This organisation has no subscription to manage yet.'
-              : err instanceof IdentityError && err.status === 503
-                ? 'This server is not selling subscriptions.'
-                : err instanceof Error
-                  ? err.message
-                  : 'That could not be opened.';
+              : err instanceof IdentityError && err.status === 403
+                ? 'Only the owner of an organisation can change its plan.'
+                : err instanceof IdentityError && err.status === 404
+                  ? 'This organisation has no subscription to manage yet.'
+                  : err instanceof IdentityError && err.status === 503
+                    ? 'This server is not selling subscriptions.'
+                    : err instanceof Error
+                      ? err.message
+                      : 'That could not be opened.';
         new Notice(message, 8000);
       }
     };
 
-    new Setting(into)
+    const row = new Setting(into)
       .setName('Subscription')
       .setDesc(
         server.role === 'owner'
           ? 'Change plan, update your payment method, see invoices, or cancel. Opens in your browser.'
           : 'Only the owner of this organisation can change its plan.',
-      )
-      .addButton((b) =>
-        b
-          .setButtonText('Change plan')
-          .setDisabled(server.role !== 'owner')
-          .onClick(() => {
-            new PlanPickerModal(
-              this.app,
-              async () => (await this.plugin.identityClient().billingPlans(this.plugin.settings.identityAccessToken)).plans,
-              (choice) => void open('checkout', choice),
-            ).open();
-          }),
-      )
-      .addButton((b) =>
-        b
-          .setButtonText('Manage subscription')
-          .setDisabled(server.role !== 'owner')
-          .onClick(() => void open('portal')),
       );
+
+    row.addButton((b) =>
+      b
+        .setButtonText('Change plan')
+        // Enabled for any owner, and deliberately not gated on the summary
+        // below: its job is to create a *first* subscription, so requiring one
+        // to exist would make the button useless exactly when it is needed.
+        .setDisabled(server.role !== 'owner')
+        .onClick(() => {
+          new PlanPickerModal(
+            this.app,
+            async () => (await this.plugin.identityClient().billingPlans(this.plugin.settings.identityAccessToken)).plans,
+            (choice) => void open('checkout', choice),
+          ).open();
+        }),
+    );
+
+    // Starts disabled and is enabled only if the service says a portal can be
+    // opened. The alternative — enabling it from the local role, as this used
+    // to — is the same mistake the checkout button made: the plugin knows what
+    // the *shard* said and asserts it about a service that may not have heard
+    // of the organisation, let alone hold a customer for it.
+    let manage: { setDisabled(v: boolean): unknown } | null = null;
+    row.addButton((b) => {
+      manage = b.setButtonText('Manage subscription').setDisabled(true).onClick(() => void open('portal'));
+    });
+
+    /**
+     * What this organisation is actually on, from our own rows.
+     *
+     * Read from the identity service rather than from the shard, because only
+     * it knows the subscription: the term, when it renews, whether a
+     * cancellation is already scheduled, and whether a portal can be opened at
+     * all. The shard knows the plan and nothing about the money.
+     *
+     * `billingSummary` was written, tested and then called by nothing at all
+     * until 19 September 2026 — which is why none of this was on screen.
+     *
+     * Failure is silent on purpose. This decorates a row that already works;
+     * an organisation the service has not pulled yet is simply absent from the
+     * answer, and that is a normal few seconds after creating one rather than
+     * a fault worth a notice.
+     */
+    void this.plugin.identityClient()
+      .billingSummary(this.plugin.settings.identityAccessToken)
+      .then((summary) => {
+        const org = summary.organisations.find((o) => o.accountId === accountId);
+        if (!org) return;
+        manage?.setDisabled(!org.canManage);
+        const parts: string[] = [];
+        if (org.term) parts.push(org.term === 'year' ? 'billed yearly' : 'billed monthly');
+        if (org.seats) parts.push(`${org.seats} seat${org.seats === 1 ? '' : 's'}`);
+        // Whichever date is the live one. A scheduled ending outranks a
+        // renewal, because it is the one that changes what they get.
+        if (org.endingAt) parts.push(`ends ${new Date(org.endingAt * 1000).toLocaleDateString()}`);
+        else if (org.graceUntil) parts.push(`payment failed — update it by ${new Date(org.graceUntil * 1000).toLocaleDateString()}`);
+        else if (org.renewsAt) parts.push(`renews ${new Date(org.renewsAt * 1000).toLocaleDateString()}`);
+        if (parts.length) row.setDesc(`${parts.join(' · ')}. Opens in your browser.`);
+      })
+      .catch(() => undefined);
   }
 
   private displayMembers(
@@ -5499,7 +5587,7 @@ export class NectendaSettingTab extends PluginSettingTab {
     const isOwner = server.role === null || server.role === 'owner';
     section.createEl('h4', { text: 'Members' });
     const roleLabel: Record<string, string> = { owner: 'owner', admin: 'admin', member: 'member' };
-    const refresh = (): void => this.display();
+    const refresh = (): void => this.update();
     const explain = async (res: Response, fallback: string): Promise<void> => {
       const body = (await res.json().catch(() => ({}))) as { error?: string };
       new Notice(body.error ?? fallback);
@@ -5532,7 +5620,7 @@ export class NectendaSettingTab extends PluginSettingTab {
       }
       if (!self) {
         row.addButton((btn) =>
-          btn.setButtonText('Remove').setWarning().onClick(async () => {
+          btn.setButtonText('Remove').setDestructive().onClick(async () => {
             const res = await this.apiFetch(`${server.base}/account/users/${encodeURIComponent(u.id)}`, {
               method: 'DELETE',
               headers: { Authorization: `Bearer ${server.token}` },
@@ -5600,7 +5688,7 @@ export class NectendaSettingTab extends PluginSettingTab {
             } else {
               new Notice('Nectenda: could not change it — set it in Files and links.');
             }
-            this.display();
+            this.update();
           }),
         );
     }
@@ -5631,7 +5719,7 @@ export class NectendaSettingTab extends PluginSettingTab {
             this.plugin.settings.oversizedAttachments = oversized.filter((k) => k !== key);
             await this.plugin.saveSettings();
             await this.plugin.blobSync?.upload(folderId, relative);
-            this.display();
+            this.update();
           }),
         );
     }
@@ -5646,7 +5734,7 @@ export class NectendaSettingTab extends PluginSettingTab {
         .addButton((b) =>
           b.setButtonText(`Move into ${item.sharedFolderPath}`).onClick(async () => {
             await this.plugin.adoptStrandedAttachment(item);
-            this.display();
+            this.update();
           }),
         );
     }
@@ -5687,7 +5775,7 @@ export class NectendaSettingTab extends PluginSettingTab {
         .addButton((b) =>
           b.setButtonText('Try again').onClick(async () => {
             await this.plugin.retryAttachment(folderId, relative);
-            this.display();
+            this.update();
           }),
         );
     }
@@ -5733,7 +5821,7 @@ export class NectendaSettingTab extends PluginSettingTab {
         .setName(m.sharedFolderName)
         .setDesc(`Local: ${m.localPath}`)
         .addButton((btn) =>
-          btn.setButtonText('Unmap').setWarning().onClick(async () => {
+          btn.setButtonText('Unmap').setDestructive().onClick(async () => {
             this.plugin.settings.folderMappings = this.plugin.settings.folderMappings.filter((x) => x.sharedFolderId !== m.sharedFolderId);
             await this.plugin.saveSettings();
             this.plugin.refreshSync();
@@ -5860,7 +5948,7 @@ export class NectendaSettingTab extends PluginSettingTab {
             if (this.plugin.setAttachmentsBesideNote()) {
               new Notice('Nectenda: attachments will now be saved next to their note.');
             }
-            this.display();
+            this.update();
           }).open();
         }
       }
@@ -5901,7 +5989,7 @@ export class NectendaSettingTab extends PluginSettingTab {
                 }),
             )
             .addButton((btn) =>
-              btn.setButtonText('Unmap').setWarning().onClick(async () => {
+              btn.setButtonText('Unmap').setDestructive().onClick(async () => {
                 this.plugin.settings.folderMappings = this.plugin.settings.folderMappings.filter(
                   (m) => m.sharedFolderId !== locked.sharedFolderId,
                 );
@@ -5926,7 +6014,7 @@ export class NectendaSettingTab extends PluginSettingTab {
             .addButton((btn) =>
               btn
                 .setButtonText('Unmap')
-                .setWarning()
+                .setDestructive()
                 .onClick(async () => {
                   this.plugin.settings.folderMappings = this.plugin.settings.folderMappings.filter(
                     (m) => m.sharedFolderId !== orphan.sharedFolderId,
@@ -5958,7 +6046,7 @@ export class NectendaSettingTab extends PluginSettingTab {
           }
           if (mayUnshare(folder, server)) {
             setting.addButton((btn) =>
-              btn.setButtonText('Unshare…').setWarning().onClick(() => {
+              btn.setButtonText('Unshare…').setDestructive().onClick(() => {
                 void this.unshareFolder(folder, server, container);
               }),
             );
@@ -5996,7 +6084,7 @@ export class NectendaSettingTab extends PluginSettingTab {
             );
           if (mayUnshare(folder, server)) {
             row.addButton((btn) =>
-              btn.setButtonText('Unshare…').setWarning().onClick(() => {
+              btn.setButtonText('Unshare…').setDestructive().onClick(() => {
                 void this.unshareFolder(folder, server, container);
               }),
             );
@@ -6486,7 +6574,7 @@ export class NectendaSettingTab extends PluginSettingTab {
             await this.ensureIdentity(
               identity ? `Unlock the folders shared with ${identity.email}.` : 'Unlock your shared folders.',
             );
-            this.display();
+            this.update();
           }),
         )
         .addButton((btn) =>
@@ -6636,7 +6724,7 @@ export class NectendaSettingTab extends PluginSettingTab {
 
           if (user.role !== 'admin') {
             setting.addButton((btn) =>
-              btn.setButtonText('Remove').setWarning().onClick(async () => {
+              btn.setButtonText('Remove').setDestructive().onClick(async () => {
                 await this.removeUser(user.id, container);
               })
             );
@@ -6709,7 +6797,7 @@ export class NectendaSettingTab extends PluginSettingTab {
     } else {
       new Notice(`Logged in as ${result.user.username}`);
     }
-    this.display();
+    this.update();
   }
 
   private async doRegister(
@@ -6806,7 +6894,7 @@ export class NectendaSettingTab extends PluginSettingTab {
     this.plugin.refreshSettingsPane();
 
     new Notice('Logged out');
-    this.display();
+    this.update();
   }
 
   private async generateInvite(): Promise<void> {
@@ -6829,7 +6917,7 @@ export class NectendaSettingTab extends PluginSettingTab {
       const data = await res.json() as { token: string };
       await navigator.clipboard.writeText(data.token);
       new Notice('Invite token generated and copied to clipboard');
-      this.display();
+      this.update();
     } catch {
       new Notice('Failed to generate invite token');
     }
@@ -6897,7 +6985,7 @@ class UnshareFolderModal extends Modal {
 
     new Setting(contentEl)
       .addButton((b) => b.setButtonText('Keep sharing').onClick(() => this.answer(false)))
-      .addButton((b) => b.setButtonText('Unshare').setWarning().onClick(() => this.answer(true)));
+      .addButton((b) => b.setButtonText('Unshare').setDestructive().onClick(() => this.answer(true)));
   }
 
   private answer(proceed: boolean): void {
@@ -7058,7 +7146,7 @@ class ManageStorageModal extends Modal {
           .setName(item.relativePath)
           .setDesc(formatBytes(item.bytes))
           .addButton((b) =>
-            b.setButtonText('Delete').setWarning().onClick(async () => {
+            b.setButtonText('Delete').setDestructive().onClick(async () => {
               const ok = await this.plugin.deleteAttachment(
                 mapping.sharedFolderId, item.relativePath,
               );
