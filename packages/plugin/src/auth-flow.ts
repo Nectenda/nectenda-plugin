@@ -151,7 +151,10 @@ export interface PollOptions {
 export async function pollForResult(opts: PollOptions): Promise<PollOutcome> {
   // Wrapped so a browser never sees a foreign `this`; see identity-client.ts.
   const fetchFn: typeof fetch = opts.fetchFn ?? ((input, init) => serverFetch(input, init));
-  const sleep = opts.sleep ?? ((ms) => new Promise<void>((r) => setTimeout(r, ms)));
+  // `window.setTimeout` for popout-window compatibility. Only the default is
+  // affected — every caller in the suite injects its own `sleep`, so this
+  // branch does not run under test.
+  const sleep = opts.sleep ?? ((ms) => new Promise<void>((r) => window.setTimeout(r, ms)));
   const started = Date.now();
   const timeout = opts.timeoutMs ?? 5 * 60_000;
   let interval = opts.intervalMs ?? 1000;

@@ -188,10 +188,16 @@
 .theme-light .nectenda-presence-dot { color: #ffffff; }
 .theme-dark .nectenda-presence-dot { color: #14201b; }
 
-/* The overflow chip is not a person, so it does not take a person's colour. */
-.nectenda-presence-more {
+/* The overflow chip is not a person, so it does not take a person's colour.
+   Both classes are on the one element (see `nectenda-presence-dot
+   nectenda-presence-more` in main.ts), so this has to outrank
+   `.theme-* .nectenda-presence-dot` above — two classes does it, and being
+   later in the file wins the tie. It used to say `!important`, which was
+   fighting this file rather than a theme. `background-color` never needed it:
+   the person dots get theirs from an inline style, which this chip has none of. */
+.nectenda-presence-dot.nectenda-presence-more {
   background-color: var(--background-modifier-border);
-  color: var(--text-muted) !important;
+  color: var(--text-muted);
 }
 
 /* The provider marks, wherever they are drawn. */
@@ -567,6 +573,22 @@
   padding: 0.75em;
 }
 
+/* The `!important` stays, and Obsidian's review flagging it does not change
+   that. Three reasons, in order of weight.
+   
+   It is a blanket: `.nectenda-signin *` cancels motion on everything inside the
+   sign-in pane, not only on the rules we wrote. Replacing it with
+   `prefers-reduced-motion: no-preference` around our own declarations would
+   stop covering anything we did not author.
+   
+   It cannot win any other way. The blanket is (0,1,0) and the transitions it
+   must beat sit on `.nectenda-surface button.nectenda-primary` and its two
+   siblings at (0,2,1); a media query adds no specificity, and ordering does
+   not break a specificity difference. `!important` is the mechanism, not a
+   shortcut past one.
+   
+   And the failure mode is a person who asked for less motion getting it
+   anyway. That is worth more than one line on a scorecard. */
 @media (prefers-reduced-motion: reduce) {
   .nectenda-signin *, .nectenda-usage-fill { transition: none !important; }
 }

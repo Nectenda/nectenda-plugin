@@ -4100,19 +4100,18 @@ export class NectendaSettingTab extends PluginSettingTab {
   /** The organisation page on screen, if one is. Tests reach it here. */
   openPage: { containerEl: HTMLElement; membershipId: string } | null = null;
 
-  /**
-   * The pane is rendered from definitions (Obsidian 1.13), not drawn by this
-   * method: once `getSettingDefinitions()` answers, Obsidian never calls
-   * `display()`. Every action in here that used to redraw by calling it
-   * still does — through `update()`, which re-reads the definitions and
-   * rebuilds. That is the same wipe a redraw always was; what changed is
-   * that most refreshes no longer need it (see `refreshSection`).
+  /*
+   * There is deliberately no `display()` here.
+   *
+   * The pane is rendered from definitions: once `getSettingDefinitions()`
+   * answers, Obsidian never calls `display()`, and everything in here that
+   * redraws does so through `update()`, which re-reads the definitions and
+   * rebuilds. A shim forwarding `display()` to `update()` used to sit at this
+   * spot, kept for "an older Obsidian that has no update()" — but `update()`
+   * arrived in 1.13.0 and `manifest.json` asks for 1.13.7, so no app that can
+   * install this plugin has ever lacked it. `SettingTab.display()` is declared
+   * non-abstract and deprecated, so leaving it out is the supported shape.
    */
-  display(): void {
-    // Obsidian 1.13 renders the definitions and never calls this; an older
-    // Obsidian calls it and has no `update()` to draw them with.
-    (this as { update?: () => void }).update?.();
-  }
 
   /**
    * The pane's sections, as the settings framework wants them.
@@ -4566,7 +4565,10 @@ export class NectendaSettingTab extends PluginSettingTab {
     window.open(provider ? providerStartUrl(client.baseUrl, provider, flow.nonce) : flow.url);
     const cancel = new AbortController();
     const waiting = new Notice('Finish signing in in your browser, then come back here. Click to cancel.', 0);
-    waiting.noticeEl.addEventListener('click', () => cancel.abort());
+    // `containerEl`, not the `messageEl` the deprecation notice suggests:
+    // messageEl is the inner text, and this makes the whole notice the cancel
+    // target, which is what `noticeEl` used to be.
+    waiting.containerEl.addEventListener('click', () => cancel.abort());
     const outcome = await pollForResult({ baseUrl: client.baseUrl, nonce: flow.nonce, verifier: pkce.verifier, signal: cancel.signal });
     waiting.hide();
     if (outcome.status === 'cancelled') return;
@@ -5418,7 +5420,7 @@ export class NectendaSettingTab extends PluginSettingTab {
         // a button that lied.
         setting.addButton((btn) =>
           btn.setButtonText('Remove').setDestructive().onClick(async () => {
-            if (d.thisDevice && !window.confirm('Remove this device from the organisation? Its notes stay here; syncing this organisation stops until it is added again.')) return;
+            if (d.thisDevice && !(await this.confirmRemoveDevice(server.label))) return;
             const res = await this.apiFetch(`${server.base}/account/devices/${encodeURIComponent(d.deviceId)}`, {
               method: 'DELETE',
               headers: { Authorization: `Bearer ${server.token}` },
@@ -6239,6 +6241,11 @@ export class NectendaSettingTab extends PluginSettingTab {
     return new Promise((resolve) => new UnshareFolderModal(this.app, name, others, resolve).open());
   }
 
+  /** Its own method so a test can answer it without driving a modal. */
+  private confirmRemoveDevice(organisation: string): Promise<boolean> {
+    return new Promise((resolve) => new RemoveDeviceModal(this.app, organisation, resolve).open());
+  }
+
   /** Why a share or a map was refused: the mapping in the way, and where it belongs. */
   private alreadySharedMessage(path: string, covering: FolderMapping): string {
     const org = this.plugin.settings.mode === 'cloud'
@@ -7016,6 +7023,51 @@ class UnshareFolderModal extends Modal {
   onClose(): void {
     this.contentEl.empty();
     // Dismissing is not consent to something that cannot be undone.
+    if (!this.answered) this.decide(false);
+  }
+}
+
+/**
+ * Removing the device you are sitting at, confirmed.
+ *
+ * `window.confirm` did this until 18 September 2026. Obsidian's review flags it,
+ * and it deserved flagging for a reason beyond the rule: a browser dialog blocks
+ * the renderer, looks nothing like the app around it, and cannot be answered by
+ * a test. This shape can — see `confirmRemoveDevice`, and `unshare-folder.test.ts`
+ * for the same seam being used to answer without driving a modal.
+ */
+class RemoveDeviceModal extends Modal {
+  private answered = false;
+
+  constructor(app: App, private readonly organisation: string, private readonly decide: (proceed: boolean) => void) {
+    super(app);
+  }
+
+  onOpen(): void {
+    const { contentEl } = this;
+    contentEl.createEl('h3', { text: 'Remove this device?' });
+    contentEl.createEl('p', {
+      text: `This is the device you are using. It stops syncing ${this.organisation} until it is added again.`,
+    });
+    contentEl.createEl('p', {
+      text: 'Nothing on disk changes. Every note in this vault stays exactly where it is — they simply stop receiving changes from other people, and yours stop reaching them.',
+      cls: 'setting-item-description',
+    });
+
+    new Setting(contentEl)
+      .addButton((b) => b.setButtonText('Keep it').onClick(() => this.answer(false)))
+      .addButton((b) => b.setButtonText('Remove').setDestructive().onClick(() => this.answer(true)));
+  }
+
+  private answer(proceed: boolean): void {
+    this.answered = true;
+    this.decide(proceed);
+    this.close();
+  }
+
+  onClose(): void {
+    this.contentEl.empty();
+    // Dismissing is not consent, the same rule UnshareFolderModal keeps.
     if (!this.answered) this.decide(false);
   }
 }

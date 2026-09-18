@@ -60,7 +60,13 @@ export function setVerboseLogging(on: boolean): void {
 
 export const log = {
   debug(...args: unknown[]) { if (verbose) console.debug(PREFIX, ...args); emit('DEBUG', args); },
-  info(...args: unknown[]) { if (verbose) console.log(PREFIX, ...args); emit('INFO ', args); },
+  // `console.debug`, like `debug` above: Obsidian asks that a plugin's console
+  // output be errors only by default. The cost is that devtools hides debug
+  // level unless "Verbose" is ticked, so somebody talked through turning
+  // diagnostics on sees nothing here until they raise it too — the vault file
+  // still receives every line, and that is the artefact we ask people for.
+  // The sink label stays 'INFO ', padding included: it aligns the file.
+  info(...args: unknown[]) { if (verbose) console.debug(PREFIX, ...args); emit('INFO ', args); },
   warn(...args: unknown[]) { console.warn(PREFIX, ...args); emit('WARN ', args); },
   error(...args: unknown[]) { console.error(PREFIX, ...args); emit('ERROR', args); },
 };

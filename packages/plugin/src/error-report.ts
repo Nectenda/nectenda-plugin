@@ -154,7 +154,7 @@ export function parseStack(stack: string | undefined): Frame[] {
 function uuid(): string {
   // `crypto.randomUUID` is present in Obsidian's Electron and on mobile; the
   // fallback keeps this pure-testable without stubbing globals.
-  const c = (globalThis as { crypto?: { randomUUID?: () => string } }).crypto;
+  const c = (window as { crypto?: { randomUUID?: () => string } }).crypto;
   const raw = c?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`;
   return raw.replace(/-/g, '').slice(0, 32).padEnd(32, '0');
 }
@@ -311,7 +311,7 @@ export class ErrorReports {
   private post(dsn: ParsedDsn, event: ClientEvent): void {
     const ac = new AbortController();
     this.inFlight.add(ac);
-    const timer = setTimeout(() => ac.abort(), SEND_TIMEOUT_MS);
+    const timer = window.setTimeout(() => ac.abort(), SEND_TIMEOUT_MS);
     const send = this.opts.fetchFn ?? fetch;
     void send(envelopeUrl(dsn), {
       method: 'POST',
@@ -324,7 +324,7 @@ export class ErrorReports {
       .then(() => this.opts.onSent?.(event))
       .catch(() => undefined)
       .finally(() => {
-        clearTimeout(timer);
+        window.clearTimeout(timer);
         this.inFlight.delete(ac);
       });
   }
