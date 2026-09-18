@@ -4,7 +4,7 @@ import { DEFAULT_PORT, apiBaseUrl } from '@nectenda/shared';
 import type { UserRole, UserInfo, InviteTokenInfo, SharedFolderInfo, KeyMaterial, KdfParams } from '@nectenda/shared';
 import { hashCredential } from '@nectenda/shared';
 import { ProviderRouter, type ShardConnection } from './provider-router';
-import { IdentityClient, IdentityError, ShardClient, type SentInvite, type ShardSession } from './identity-client';
+import { IdentityClient, IdentityError, ShardClient, type SentInvite, type ShardSession, type PlanOffer } from './identity-client';
 import { recoverSignedOutConnection } from './signed-out';
 import { SingleFlight } from './single-flight';
 import { partitionFolders, mappingBelongsTo, mayUnshare, foldersSyncedFor, unclaimedMappings } from './folder-sections';
@@ -1356,6 +1356,233 @@ export class PasswordPromptModal extends Modal {
     this.settle(false);
     this.contentEl.empty();
   }
+}
+
+/**
+ * Choosing a plan, before being sent to the payment page.
+ *
+ * Until this existed, *Change plan* went straight to a checkout for Personal,
+ * monthly, one seat, whatever the person actually wanted. It could not offer
+ * anything else because the plugin had no idea what was for sale.
+ *
+ * **Every figure here comes from the server**, fetched when the dialog opens.
+ * The prices exist in three places already — the shard's plans table, the
+ * public pricing page, and the payment provider's own products — and a fourth
+ * compiled into this bundle would be the only copy that could not be corrected
+ * without shipping a release. So this file contains no prices, and if the
+ * server cannot be reached it says so rather than guessing.
+ *
+ * The seat control follows `perSeat`, which is not cosmetic. A flat plan sells
+ * one subscription with its seats included; treating that as "one seat" is
+ * exactly what once capped a six-seat plan at one, below the free tier.
+ */
+class PlanPickerModal extends Modal {
+  private plans: PlanOffer[] = [];
+  private planId = '';
+  private term: 'month' | 'year' = 'year';
+  private seats = 1;
+  private loading = true;
+  private error: string | null = null;
+
+  constructor(
+    app: App,
+    private readonly load: () => Promise<PlanOffer[]>,
+    private readonly onChosen: (choice: { planId: string; term: 'month' | 'year'; seats: number }) => void,
+  ) {
+    super(app);
+  }
+
+  onOpen(): void {
+    void this.fetch();
+    this.render();
+  }
+
+  private async fetch(): Promise<void> {
+    try {
+      this.plans = await this.load();
+      // Default to whatever is cheapest per month, which is the yearly line of
+      // the smallest plan — not to a hardcoded name that may not be for sale.
+      const first = [...this.plans].sort((a, b) => monthly(a) - monthly(b))[0];
+      if (first) {
+        this.planId = first.planId;
+        this.term = first.term;
+        this.seats = first.perSeat ? 1 : 1;
+      } else {
+        this.error = 'This server is not selling any plans at the moment.';
+      }
+    } catch (err) {
+      // Named, not smoothed over. Somebody is about to be asked for money and
+      // a dialog that shrugs is the point at which they stop trusting it.
+      this.error = err instanceof Error ? err.message : 'The plans could not be loaded.';
+    } finally {
+      this.loading = false;
+      this.render();
+    }
+  }
+
+  private offer(): PlanOffer | undefined {
+    return this.plans.find((p) => p.planId === this.planId && p.term === this.term);
+  }
+
+  private render(): void {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl('h2', { text: 'Choose a plan' });
+
+    if (this.loading) {
+      contentEl.createEl('p', { text: 'Loading what is available…' });
+      return;
+    }
+    if (this.error) {
+      contentEl.createEl('p', { text: this.error });
+      contentEl.createEl('p', {
+        cls: 'mod-warning',
+        text: 'Nothing has been charged. Try again in a moment, or write to support@nectenda.com.',
+      });
+      return;
+    }
+
+    // One row per plan, not per plan-and-term: the term is its own control, so
+    // six products read as three choices and a billing toggle.
+    const names = [...new Set(this.plans.map((p) => p.planId))];
+    new Setting(contentEl)
+      .setName('Plan')
+      .addDropdown((d) => {
+        for (const id of names) d.addOption(id, planLabel(id));
+        d.setValue(this.planId).onChange((v) => {
+          this.planId = v;
+          // A flat plan has no seats to choose, so any count carried over from
+          // a per-seat plan is dropped rather than quietly sent.
+          if (!this.offer()?.perSeat) this.seats = 1;
+          this.render();
+        });
+      });
+
+    new Setting(contentEl)
+      .setName('Billing')
+      .setDesc(this.savingLine())
+      .addDropdown((d) => {
+        for (const t of ['month', 'year'] as const) {
+          if (this.plans.some((p) => p.planId === this.planId && p.term === t)) {
+            d.addOption(t, t === 'month' ? 'Monthly' : 'Yearly');
+          }
+        }
+        d.setValue(this.term).onChange((v) => { this.term = v as 'month' | 'year'; this.render(); });
+      });
+
+    const chosen = this.offer();
+    if (chosen?.perSeat) {
+      new Setting(contentEl)
+        .setName('Seats')
+        .setDesc(`Up to ${chosen.maxSeats}. You can change this later.`)
+        .addText((t) => {
+          t.inputEl.type = 'number';
+          t.inputEl.min = '1';
+          t.inputEl.max = String(chosen.maxSeats);
+          t.setValue(String(this.seats)).onChange((v) => {
+            const n = Number(v);
+            // Clamped rather than refused: the server enforces the same ceiling
+            // and would reject it, but being told at checkout is too late to be
+            // useful.
+            this.seats = Number.isInteger(n) && n >= 1 ? Math.min(n, chosen.maxSeats) : 1;
+            this.renderTotal();
+          });
+        });
+    } else if (chosen) {
+      new Setting(contentEl)
+        .setName('Seats')
+        .setDesc(`${chosen.maxSeats} included. This plan is one subscription rather than a price per seat.`);
+    }
+
+    const total = contentEl.createDiv({ cls: 'setting-item' });
+    total.createDiv({ cls: 'setting-item-info' }).createDiv({ cls: 'setting-item-name', text: 'Total' });
+    this.totalEl = total.createDiv({ cls: 'setting-item-control' });
+    this.renderTotal();
+
+    contentEl.createEl('p', {
+      cls: 'setting-item-description',
+      text:
+        'Payment is taken by Creem, our payment provider, on their page in your browser. ' +
+        'Tax is included in the price shown.',
+    });
+
+    const buttons = contentEl.createDiv({ cls: 'modal-button-container' });
+    buttons.createEl('button', { text: 'Continue to payment', cls: 'mod-cta' }).onclick = () => {
+      const offer = this.offer();
+      if (!offer) return;
+      this.onChosen(planChoice(offer, this.seats));
+      super.close();
+    };
+    buttons.createEl('button', { text: 'Cancel' }).onclick = () => super.close();
+  }
+
+  private totalEl: HTMLElement | null = null;
+
+  private renderTotal(): void {
+    const offer = this.offer();
+    if (!this.totalEl || !offer) return;
+    const seats = offer.perSeat ? this.seats : 1;
+    this.totalEl.setText(
+      `${formatMoney(offer.amount * seats, offer.currency)} ${offer.term === 'year' ? 'a year' : 'a month'}`,
+    );
+  }
+
+  /** Only shown when both terms exist and the yearly one is actually cheaper. */
+  private savingLine(): string {
+    const m = this.plans.find((p) => p.planId === this.planId && p.term === 'month');
+    const y = this.plans.find((p) => p.planId === this.planId && p.term === 'year');
+    if (!m || !y || y.amount >= m.amount * 12) return 'Billed by the month or by the year.';
+    const saved = m.amount * 12 - y.amount;
+    return `Yearly saves ${formatMoney(saved, y.currency)} a year.`;
+  }
+
+  onClose(): void {
+    this.contentEl.empty();
+  }
+}
+
+/** Per-month cost, for ordering plans by price whatever their term. */
+export function monthly(p: PlanOffer): number {
+  return p.term === 'year' ? p.amount / 12 : p.amount;
+}
+
+/**
+ * What gets sent to checkout for a chosen plan and seat count.
+ *
+ * Exported because it is the rule that cost a real customer seats, and a rule
+ * that only exists inside a modal's click handler cannot be tested. **A flat
+ * plan is one subscription**: whatever the seat field says, what goes to the
+ * provider is 1, because the provider reports that back as `units` and `units`
+ * became the account's seat cap. Sending 4 there would cap a six-seat plan at
+ * four; sending 1 for a per-seat plan would charge for one seat and cap at one.
+ *
+ * The count is also clamped to the plan's own ceiling. The server enforces the
+ * same limit and would refuse, but being refused at the payment page is too
+ * late to be useful.
+ */
+export function planChoice(offer: PlanOffer, requestedSeats: number): { planId: string; term: 'month' | 'year'; seats: number } {
+  if (!offer.perSeat) return { planId: offer.planId, term: offer.term, seats: 1 };
+  const seats = Number.isInteger(requestedSeats) && requestedSeats >= 1
+    ? Math.min(requestedSeats, offer.maxSeats)
+    : 1;
+  return { planId: offer.planId, term: offer.term, seats };
+}
+
+/**
+ * Minor units to something a person reads.
+ *
+ * The server sends cents because that is what the provider charges in;
+ * dividing happens once, here, at the point of display. A price stored or
+ * passed around as a decimal is a price that has been rounded somewhere.
+ */
+export function formatMoney(minorUnits: number, currency: string): string {
+  const figure = (minorUnits / 100).toFixed(2);
+  return currency === 'USD' ? `$${figure}` : `${figure} ${currency}`;
+}
+
+/** Plan ids are lowercase and hyphenated; these are the names the site uses. */
+function planLabel(planId: string): string {
+  return { personal: 'Personal', team: 'Team', 'small-business': 'Small Business' }[planId] ?? planId;
 }
 
 /**
@@ -2826,9 +3053,6 @@ export default class NectendaPlugin extends Plugin {
         if (!state.isSkipped(mapping.sharedFolderId, relative)) continue;
 
         const notice = embed.createDiv({ cls: 'nectenda-surface nectenda-skipped-attachment' });
-        notice.style.border = '1px solid var(--background-modifier-border)';
-        notice.style.borderRadius = '6px';
-        notice.style.padding = '0.75em';
         notice.createDiv({
           text: `${relative} was not downloaded to this device.`,
           cls: 'setting-item-description',
@@ -3299,11 +3523,11 @@ export default class NectendaPlugin extends Plugin {
     const failed = (err: unknown): void => {
       if (complained) return;
       complained = true;
-      // `console`, not `log`: the sink `log` writes to is the thing that has
-      // just failed, so routing this through it would be swallowed by the
-      // same fault it is reporting.
-      // eslint-disable-next-line no-console
-      console.error('[Nectenda] Diagnostic log could not be written', err);
+      // `log.error` writes to the console before it touches the sink, so this
+      // is reported even though the sink is the thing that just failed. It
+      // does also re-enter the sink, but `complained` above is already set by
+      // then, so the second pass returns immediately rather than looping.
+      log.error('Diagnostic log could not be written', err);
     };
 
     let queue: Promise<void> = adapter
@@ -3897,7 +4121,7 @@ export class NectendaSettingTab extends PluginSettingTab {
 
     // The page class needs the enclosing tab and its private sections, which
     // only a class defined inside this method can reach.
-    // eslint-disable-next-line @typescript-eslint/no-this-alias
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- the class below is defined inside this method precisely so it can close over the tab; there is no other way to reach its private sections
     const tab = this;
     class OrganisationPage extends SettingPage {
       membershipId: string;
@@ -5202,14 +5426,20 @@ export class NectendaSettingTab extends PluginSettingTab {
   ): void {
     if (this.plugin.settings.mode !== 'cloud' || !this.plugin.settings.identity) return;
 
-    const open = async (what: 'checkout' | 'portal'): Promise<void> => {
+    const open = async (
+      what: 'checkout' | 'portal',
+      choice?: { planId: string; term: 'month' | 'year'; seats: number },
+    ): Promise<void> => {
       const client = this.plugin.identityClient();
       const token = this.plugin.settings.identityAccessToken;
       try {
         const { url } =
           what === 'portal'
             ? await client.billingPortal(token, accountId)
-            : await client.checkout(token, { accountId, planId: 'personal', term: 'month', seats: 1 });
+            // Never a default plan. Until 19 September 2026 this sent everyone
+            // to Personal, monthly, one seat, whatever they had chosen — the
+            // picker is what makes the other five buyable.
+            : await client.checkout(token, { accountId, ...choice! });
         // The system browser, never a webview. A payment page rendered inside
         // Obsidian would be indistinguishable from one a malicious plugin drew.
         window.open(url);
@@ -5241,7 +5471,13 @@ export class NectendaSettingTab extends PluginSettingTab {
         b
           .setButtonText('Change plan')
           .setDisabled(server.role !== 'owner')
-          .onClick(() => void open('checkout')),
+          .onClick(() => {
+            new PlanPickerModal(
+              this.app,
+              async () => (await this.plugin.identityClient().billingPlans(this.plugin.settings.identityAccessToken)).plans,
+              (choice) => void open('checkout', choice),
+            ).open();
+          }),
       )
       .addButton((b) =>
         b

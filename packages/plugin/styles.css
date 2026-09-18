@@ -557,7 +557,15 @@
 .nectenda-folders { margin-top: var(--nectenda-space-2); }
 /* Two more that were created in code and had no rules at all. */
 .nectenda-admin-content { margin-top: var(--nectenda-space-2); }
-.nectenda-skipped-attachment { margin: var(--nectenda-space-2) 0; }
+.nectenda-skipped-attachment {
+  margin: var(--nectenda-space-2) 0;
+  /* Were set inline on the element until 18 September 2026. Static values in
+     JavaScript cannot be restyled by a theme and cannot be overridden by the
+     user, which is why Obsidian's review rejects them. */
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 6px;
+  padding: 0.75em;
+}
 
 @media (prefers-reduced-motion: reduce) {
   .nectenda-signin *, .nectenda-usage-fill { transition: none !important; }

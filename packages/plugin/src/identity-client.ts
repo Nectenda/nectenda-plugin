@@ -62,6 +62,18 @@ export interface DeviceReport {
 }
 
 /** One organisation's subscription, as the billing summary reports it. */
+/** One buyable plan, as the identity service reports it. */
+export interface PlanOffer {
+  planId: string;
+  term: 'month' | 'year';
+  /** Minor units — cents for USD. Formatted at the point of display, never stored. */
+  amount: number;
+  currency: string;
+  /** True when seats are bought and become the cap; false when the plan is one flat subscription. */
+  perSeat: boolean;
+  maxSeats: number;
+}
+
 export interface BillingOrganisation {
   accountId: string;
   name: string;
@@ -215,6 +227,18 @@ export class IdentityClient {
    */
   billingPortal(accessToken: string, accountId: string): Promise<{ url: string }> {
     return this.json(`/api/billing/portal/${encodeURIComponent(accountId)}`, { method: 'POST', body: {}, token: accessToken }, 'The billing portal could not be opened');
+  }
+
+  /**
+   * What this server sells, priced by whoever will charge for it.
+   *
+   * Asked every time the picker opens rather than remembered here. The
+   * figures already exist in the plans table, on the pricing page and in the
+   * provider's products, and a fourth copy inside a released plugin would be
+   * the one nobody could correct without shipping a new release.
+   */
+  billingPlans(accessToken: string): Promise<{ provider: string | null; plans: PlanOffer[] }> {
+    return this.json('/api/billing/plans', { token: accessToken }, 'Could not load the available plans');
   }
 
   /** What each organisation is on, for how many seats, until when. Reads our own rows, so it answers when the provider is down. */
