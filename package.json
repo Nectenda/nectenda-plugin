@@ -2,6 +2,7 @@
   "name": "nectenda-plugin",
   "private": true,
   "type": "module",
+  "license": "SEE LICENSE IN LICENSE",
   "packageManager": "pnpm@10.11.0",
   "scripts": {
     "build": "pnpm -r build && node -e \"require('fs').copyFileSync('packages/plugin/main.js','main.js')\"",
