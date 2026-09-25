@@ -1,17 +1,42 @@
-import { Notice, Plugin, PluginSettingTab, App, Setting, FuzzySuggestModal, TFolder, Modal, MarkdownView, SettingPage, apiVersion, type SettingDefinitionItem, type SettingGroupItem } from 'obsidian';
+import { Notice, Plugin, PluginSettingTab, App, Setting, MarkdownView, SettingPage, TFile, TFolder, apiVersion, type SettingDefinitionItem, type SettingGroupItem } from 'obsidian';
 import type { Extension } from '@codemirror/state';
-import { DEFAULT_PORT, apiBaseUrl } from '@nectenda/shared';
-import type { UserRole, UserInfo, InviteTokenInfo, SharedFolderInfo, KeyMaterial, KdfParams } from '@nectenda/shared';
+import { DEFAULT_PORT, MAX_PUSH_BYTES, apiBaseUrl } from '@nectenda/shared';
+import type { UserInfo, InviteTokenInfo, SharedFolderInfo, KeyMaterial, KdfParams } from '@nectenda/shared';
 import { hashCredential } from '@nectenda/shared';
 import { ProviderRouter, type ShardConnection } from './provider-router';
-import { IdentityClient, IdentityError, ShardClient, type SentInvite, type ShardSession, type PlanOffer } from './identity-client';
+import { IdentityClient, IdentityError, ShardClient, type SentInvite, type ShardSession } from './identity-client';
 import { recoverSignedOutConnection } from './signed-out';
 import { SingleFlight } from './single-flight';
 import { partitionFolders, mappingBelongsTo, mayUnshare, foldersSyncedFor, unclaimedMappings } from './folder-sections';
-import { memberLabel, pickerCandidates, type PickerCandidate, type RosterUser } from './folder-members';
+import type { FolderRole } from './folder-members';
 import { sessionIdFromToken } from './jwt-claims';
-import { newPkce, pollForResult, type PendingInvite, type SignInResult } from './auth-flow';
-import { establishMemberships, membershipId, type StoredIdentity, type StoredMembership, syncsHere, deviceOf } from './cloud-session';
+import { FolderKeyService } from './folder-key-service';
+import {
+  AttachmentLocationModal,
+  ChoicePickerModal,
+  FolderMembersModal,
+  ManageStorageModal,
+  ErrorReportConsentModal,
+  FolderPickerModal,
+  InviteByEmailModal,
+  LargeAttachmentModal,
+  NameOrganisationModal,
+  PasswordPromptModal,
+  PlanPickerModal,
+  RecoveryKeyModal,
+  RecoveryModal,
+  RemoveDeviceModal,
+  SetPassphraseModal,
+  UnshareFolderModal,
+  MIN_PASSWORD_LENGTH,
+} from './modals';
+import type { TimerHandle } from './timers';
+import { IdentitySession, type VerifyOutcome } from './identity-session';
+import { DEFAULT_SETTINGS, DEFAULT_IDENTITY_URL, type NectendaSettings } from './settings-type';
+import { type ChangeReason, type PaneSection, sectionsFor, REFRESH_COALESCE_MS, PANE_POLL_MS, ChangeFanout, SectionGenerations } from './pane-refresh';
+import { formatBytes, describeAge, ambiguousNames, storageSummary, forgetUnmappedRecords, membershipShape, organisationSummary, organisationWarning, pageName, type FolderServer, pagesKey, type SentInviteStatus, sentInviteStatus, sentInviteDescription, shouldCreateFirstOrganisation } from './pane-summaries';
+import { newPkce, pollForResult, type SignInResult } from './auth-flow';
+import { establishMemberships, membershipId, type StoredMembership, syncsHere, deviceOf } from './cloud-session';
 import { ObsidianVaultAdapter } from './obsidian-vault';
 import { PROVIDER_LABELS, PROVIDER_ORDER, providerMark, providerStartUrl, type ProviderName } from './provider-marks';
 import { nectendaMark, nectendaWordmark } from './brand-marks';
@@ -30,7 +55,6 @@ import {
   openFolderName,
   sealFolderName,
   serialiseFolderKeys,
-  unwrapFolderKeys,
   wrapKeysFor,
   type FolderKeyRecord,
   type StoredFolderKeys,
@@ -38,10 +62,16 @@ import {
 import type { SessionKeys, SessionResult } from './session';
 import { MultiplexedProvider } from './multiplexed-provider';
 import { ContentSync } from './content-sync';
+import { OversizedNotes, describeOversizedNotes, type OversizedNote } from './oversized-notes';
+import { mib } from './sync-status';
 import { EditorBridge } from './editor-bridge';
 import type { FolderMapping } from './editor-bridge';
 import { basenameOf, mappingCovering } from './folder-mapping';
 import { FolderIndicator } from './folder-indicator';
+import { FileStatusIndicator, buildStatusIndex } from './file-status-indicator';
+import { HeaderStatus, countOthers, registerHeaderIcon, type ConnectionStatus } from './header-status';
+import { INSPECTOR_VIEW, createInspectorView, isInspector, type InspectorDeps } from './sync-inspector';
+import { COMMAND_IDS, COMMAND_NAMES, FOLDER_MENU_TITLES, commandAvailable, folderMenuItems, ownedMappingFor, ownedMappings, shareLinkFor, shareLinkMemberships, type CommandId, type CommandState } from './commands';
 import { FileSync } from './file-sync';
 import { BlobSync } from './blob-sync';
 import { DeviceStateStore, type StateFile } from './device-state';
@@ -56,15 +86,6 @@ import { log, setLogSink, setVerboseLogging } from './logger';
 import { initials, type Person } from './presence';
 import { serverFetch } from './client-version.js';
 
-/** A `window.setTimeout`/`setInterval` handle: a number.
- *
- * Spelled out rather than `ReturnType<typeof window.setTimeout>`, which looks
- * tidier and is wrong here. `@types/node` is a devDependency, so the global is
- * overloaded, and `ReturnType<>` resolves the *last* overload — Node's
- * `Timeout` — while the call itself resolves the DOM one and returns a number.
- * The two disagree and nothing says so until an assignment fails.
- */
-type TimerHandle = number;
 
 /** What `GET /api/account` answers with. */
 interface AccountResponse {
@@ -95,55 +116,6 @@ interface AccountResponse {
   deviceSlots?: { used: number; max: number; thisDeviceEnrolled: boolean };
 }
 
-/** Bytes for people, not for machines. */
-function formatBytes(n: number): string {
-  if (n < 1024) return `${n} B`;
-  const units = ['KB', 'MB', 'GB', 'TB'];
-  let value = n / 1024;
-  let unit = 0;
-  while (value >= 1024 && unit < units.length - 1) {
-    value /= 1024;
-    unit += 1;
-  }
-  return `${value < 10 ? value.toFixed(1) : Math.round(value)} ${units[unit]}`;
-}
-
-/**
- * How long ago something happened, for people rather than for a log.
- *
- * Relative where the rest of the pane uses absolute dates, and deliberately so:
- * these rows exist to answer "which of these two folders is dead", and
- * "no changes in 4 months" answers it where `14/09/2026` leaves the reader to
- * do the arithmetic.
- */
-export function describeAge(at: number | null | undefined, now = Date.now()): string | null {
-  if (!at) return null;
-  const seconds = Math.max(0, Math.round(now / 1000 - at));
-  const scale: Array<[number, Intl.RelativeTimeFormatUnit]> = [
-    [60, 'second'], [3600, 'minute'], [86400, 'hour'],
-    [86400 * 7, 'day'], [86400 * 30, 'week'], [86400 * 365, 'month'], [Infinity, 'year'],
-  ];
-  const divisor: Record<string, number> = {
-    second: 1, minute: 60, hour: 3600, day: 86400, week: 86400 * 7, month: 86400 * 30, year: 86400 * 365,
-  };
-  const unit = scale.find(([limit]) => seconds < limit)?.[1] ?? 'year';
-  const value = Math.round(seconds / divisor[unit]);
-  return new Intl.RelativeTimeFormat(undefined, { numeric: 'auto' }).format(-value, unit);
-}
-
-/**
- * Names that more than one listed folder opens to.
- *
- * Two folders can carry the same name — sharing "test" again after unmapping an
- * earlier "test" leaves both, since unmapping is not unsharing — and then
- * nothing on the row tells them apart. The short id is appended only to the
- * rows that clash, so the ordinary case stays clean.
- */
-export function ambiguousNames(folders: Array<{ name: string }>): Set<string> {
-  const seen = new Map<string, number>();
-  for (const f of folders) seen.set(f.name, (seen.get(f.name) ?? 0) + 1);
-  return new Set([...seen].filter(([, n]) => n > 1).map(([name]) => name));
-}
 
 /** The Nectenda Cloud identity service. Overridable only for a staging service. */
 /**
@@ -201,86 +173,7 @@ function rowGroup(parent: HTMLElement): HTMLElement {
  * and it comes back by itself if the folder is shared again and the upload is
  * refused again.
  */
-/**
- * What the Storage row should say, and whether a bar belongs under it.
- *
- * The quota governs attachments and only attachments: the server compares
- * `blob_bytes` against it and nothing else, and text sync is never blocked by
- * it on any plan. Counting text here overstated what is measured against the
- * limit — and on a plan with no attachments it invented a figure entirely, so
- * an organisation holding nothing read "0 B of 1.0 GB", a number that is
- * neither true nor reachable.
- *
- * That figure is not nonsense in the database, which is the trap: `free` seeds
- * a quota because 0 already means unlimited, and it survives as the reference
- * the text-growth flag is measured against. It simply must not be shown as an
- * allowance, because there is none.
- */
-export function storageSummary(
-  limits: { quotaBytes: number; attachmentsEnabled?: boolean },
-  usage: { blobBytes: number },
-): { text: string; bar: boolean; used: number } {
-  if (limits.attachmentsEnabled === false) {
-    return {
-      text: 'Attachments are not included in this plan, so there is no storage to use. Notes sync as normal.',
-      bar: false,
-      used: usage.blobBytes,
-    };
-  }
-  if (limits.quotaBytes === 0) {
-    return { text: `${formatBytes(usage.blobBytes)} used — no limit on this plan`, bar: false, used: usage.blobBytes };
-  }
-  const pct = Math.round((usage.blobBytes / limits.quotaBytes) * 100);
-  return {
-    text: `${formatBytes(usage.blobBytes)} of ${formatBytes(limits.quotaBytes)} (${pct}%)`,
-    bar: true,
-    used: usage.blobBytes,
-  };
-}
 
-export function forgetUnmappedRecords(keys: string[], mappedFolderIds: ReadonlySet<string>): string[] {
-  return keys.filter((key) => {
-    const gap = key.indexOf(' ');
-    // A key with no folder in it cannot be attributed, so it cannot be shown
-    // usefully either. Dropping it is the same judgement as the rest.
-    if (gap < 0) return false;
-    return mappedFolderIds.has(key.slice(0, gap));
-  });
-}
-
-/**
- * What about a set of memberships would make a connection change.
- *
- * The identity of the seat, where it lives, and whether it is active — and
- * not the session token. The shard mints a fresh token on every session call,
- * same claims and a new issue time, so the string differs every refresh;
- * including it made every refresh look like a change, and every change tore
- * down every socket and announced a lost connection. A fresh token is stored
- * and handed to the live connection for its next reconnect. It is not a
- * reason to reconnect now.
- */
-export function membershipShape(list: Array<{ id: string; endpoint: string; accountStatus: string; device?: { enrolled: boolean } }>): string {
-  // Whether this device is on the roster is part of the shape: a device that
-  // was just added or removed there needs its socket opened or closed.
-  return JSON.stringify(list.map((m) => [m.id, m.endpoint, m.accountStatus, m.device?.enrolled ?? null]));
-}
-
-/**
- * What an organisation's entry says beside its name, before the page is
- * opened: the one fact that explains "why is this not syncing", or the
- * roster count when nothing is wrong.
- */
-export function organisationSummary(m: { accountStatus: string; device?: { enrolled: boolean; used: number; max: number } }, foldersSynced = 0): string {
-  if (m.accountStatus !== 'active') return m.accountStatus;
-  const folders = foldersSynced > 0 ? `${foldersSynced} ${foldersSynced === 1 ? 'folder' : 'folders'} synced` : '';
-  const devices = !m.device ? '' : !m.device.enrolled ? 'not added on this device' : m.device.max > 0 ? `${m.device.used} of ${m.device.max} devices` : 'devices unlimited';
-  return [folders, devices].filter(Boolean).join(' · ');
-}
-
-/** The entry's status mark: something on the page needs the person's attention. */
-export function organisationWarning(m: { accountStatus: string; device?: { enrolled: boolean } }): 'warning' | null {
-  return m.accountStatus !== 'active' || (m.device !== undefined && !m.device.enrolled) ? 'warning' : null;
-}
 
 /**
  * What a change to the memberships has to rebuild the pane for.
@@ -291,90 +184,7 @@ export function organisationWarning(m: { accountStatus: string; device?: { enrol
  * lost). So the pane rebuilds when this key moves and refreshes in place
  * otherwise; a rotated token, which every refresh brings, is not in it.
  */
-/**
- * Obsidian addresses a page by its name among siblings, so two organisations
- * called the same thing need telling apart; the second is numbered.
- */
-export function pageName(m: StoredMembership, index: number, all: StoredMembership[]): string {
-  const before = all.slice(0, index).filter((x) => x.accountName === m.accountName).length;
-  return before === 0 ? m.accountName : `${m.accountName} (${before + 1})`;
-}
 
-/** What the shared-folders section needs to know of a server. */
-export type FolderServer = { base: string; token: string; membershipId: string | null; localUserId?: string | null; localUsername?: string | null };
-
-export function pagesKey(
-  list: Array<{ id: string; accountName: string; accountStatus: string; role: string; device?: { enrolled: boolean; used: number; max: number } }>,
-  mappings: Array<{ membershipId?: string }> = [],
-): string {
-  return JSON.stringify(list.map((m) => [
-    m.id, m.accountName, m.accountStatus, m.role, m.device?.enrolled ?? null, m.device?.used ?? null, m.device?.max ?? null,
-    // The entry counts the folders synced here, so a map or unmap redraws it.
-    foldersSyncedFor(m.id, mappings, list.length),
-  ]));
-}
-
-export type SentInviteStatus = 'pending' | 'accepted' | 'declined' | 'revoked' | 'expired';
-
-/**
- * What became of an invitation, from four timestamps.
- *
- * The service records each end state and computes nothing, so the reading is
- * made here, in the order that matters: a person who accepted is a member
- * whatever else was stamped on the row afterwards; a revoked one is finished
- * whether or not it was declined first; an expired one simply ran out.
- */
-export function sentInviteStatus(
-  i: { acceptedAt: number | null; declinedAt: number | null; revokedAt: number | null; expiresAt: number },
-  now = Date.now() / 1000,
-): SentInviteStatus {
-  if (i.acceptedAt) return 'accepted';
-  if (i.revokedAt) return 'revoked';
-  if (i.declinedAt) return 'declined';
-  if (i.expiresAt <= now) return 'expired';
-  return 'pending';
-}
-
-/** The row's second line: what was sent, and what has happened to it since. */
-export function sentInviteDescription(i: SentInvite, status: SentInviteStatus): string {
-  const day = (t: number) => new Date(t * 1000).toLocaleDateString();
-  const base = `As ${i.role}, sent ${day(i.createdAt)}`;
-  // A bounce is the thing an owner most needs to know and could not see: the
-  // service records it and the plugin still said "Invitation sent".
-  if (i.mailError) return `${base}. The email could not be delivered: ${i.mailError}`;
-  switch (status) {
-    case 'pending': return `${base}. Waiting for a reply; expires ${day(i.expiresAt)}.`;
-    case 'declined': return `${base}. Declined ${day(i.declinedAt!)}.`;
-    case 'expired': return `${base}. Expired ${day(i.expiresAt)} without a reply.`;
-    default: return `${base}.`;
-  }
-}
-
-/** Why the plugin's state changed, as far as anything watching it cares. */
-export type ChangeReason = 'connection' | 'structure' | 'memberships';
-
-/** The fetched parts of the settings pane, each owning a container it can rebuild alone. */
-export type PaneSection = 'account' | 'cloudDevices' | 'sentInvites' | 'sharedFolders' | 'invitations' | 'organisations';
-
-/**
- * Which parts of the pane a change can have made stale.
- *
- * A connection edge changes what the account says — which devices are live,
- * what has uploaded since. A structural change (a folder mapped or unmapped,
- * memberships reconciled) changes the folder list and, through seats and
- * roles, the account. A membership refresh rewrites the settings the
- * invitation and organisation rows are drawn from. The poll asks for
- * everything that comes from a server, because it exists to catch what other
- * devices did.
- */
-export function sectionsFor(reason: ChangeReason | 'poll'): PaneSection[] {
-  switch (reason) {
-    case 'connection': return ['account'];
-    case 'structure': return ['sharedFolders', 'account', 'organisations'];
-    case 'memberships': return ['invitations', 'organisations', 'sentInvites', 'cloudDevices'];
-    case 'poll': return ['account', 'cloudDevices', 'sentInvites', 'sharedFolders'];
-  }
-}
 
 /**
  * One counter per section, so a slow answer to an old request cannot land
@@ -382,10 +192,6 @@ export function sectionsFor(reason: ChangeReason | 'poll'): PaneSection[] {
  * an event; without this the pane would sometimes show the older of two
  * responses and call it current.
  */
-/** How long the pane waits to fold a burst of changes into one refresh. */
-const REFRESH_COALESCE_MS = 250;
-/** How often the open pane asks the servers what other devices have done. */
-const PANE_POLL_MS = 30_000;
 
 /**
  * One account section's containers, each rebuilt only when its slice of the
@@ -403,53 +209,6 @@ interface AccountSlots {
   last: Partial<Record<'facts' | 'members' | 'attachments' | 'devices', string>>;
 }
 
-/**
- * Who is listening for a change, and telling them.
- *
- * Copied before iterating so a listener that unsubscribes itself mid-notify
- * does not skip its neighbour, and each call is fenced so one listener's
- * fault does not silence the rest.
- */
-export class ChangeFanout {
-  private listeners = new Set<(reason: ChangeReason) => void>();
-  on(listener: (reason: ChangeReason) => void): () => void {
-    this.listeners.add(listener);
-    return () => { this.listeners.delete(listener); };
-  }
-  notify(reason: ChangeReason): void {
-    for (const listener of [...this.listeners]) {
-      try {
-        listener(reason);
-      } catch (err) {
-        log.warn('A change listener threw', { reason, error: String(err) });
-      }
-    }
-  }
-}
-
-export class SectionGenerations {
-  private latest = new Map<string, number>();
-  next(section: string): number {
-    const n = (this.latest.get(section) ?? 0) + 1;
-    this.latest.set(section, n);
-    return n;
-  }
-  isCurrent(section: string, generation: number): boolean {
-    return this.latest.get(section) === generation;
-  }
-}
-
-export function shouldCreateFirstOrganisation(settings: {
-  keyMaterial?: { publicKey?: string | null } | null;
-  memberships: unknown[];
-  pendingInvites?: unknown[] | null;
-}): boolean {
-  return (
-    !!settings.keyMaterial?.publicKey &&
-    settings.memberships.length === 0 &&
-    (settings.pendingInvites ?? []).length === 0
-  );
-}
 
 function noteRow(parent: HTMLElement, text: string | DocumentFragment, cls?: string): Setting {
   const row = new Setting(parent).setDesc(text);
@@ -457,210 +216,8 @@ function noteRow(parent: HTMLElement, text: string | DocumentFragment, cls?: str
   return row;
 }
 
-const DEFAULT_IDENTITY_URL = 'https://accounts.nectenda.com';
+export { DEFAULT_SETTINGS, type NectendaSettings };
 
-interface NectendaSettings {
-  /**
-   * Which kind of server this vault talks to.
-   *
-   * `self-hosted` is a server you run: one URL, a username and a password, and
-   * both authentication and encryption derive from that password. `cloud` is
-   * Nectenda Cloud: identity is proved at the identity service (an emailed
-   * code, a passkey or a provider), organisations may live on several sync
-   * servers, and the passphrase is used for encryption only and never sent.
-   *
-   * **The default is `cloud`, and that is a decision rather than an accident.**
-   * It was `self-hosted` until 18 September 2026 — not chosen, just left alone
-   * when cloud was added beside it, back when self-hosted was the only thing
-   * there was. The consequence only became visible once the plugin shipped: a
-   * fresh install opened on a form asking for the address of a server the
-   * reader does not have and cannot currently buy. Whichever this is, it
-   * decides which sign-in screen a vault with no settings sees, so treat it as
-   * the first thing a new user is told about the product.
-   */
-  mode: 'self-hosted' | 'cloud';
-  identityUrl: string;
-  /** Who is signed in to Nectenda Cloud. Null in self-hosted mode or when signed out. */
-  identity: StoredIdentity | null;
-  /** Short-lived; kept in the keychain when there is one. */
-  identityAccessToken: string;
-  /** The device's long-lived session with the identity service. Keychain when possible. */
-  refreshToken: string;
-  /** Every organisation this identity belongs to, with a session on each sync server. */
-  memberships: StoredMembership[];
-  /** Invitations addressed to this identity's email, shown in settings and the status bar. */
-  pendingInvites: PendingInvite[];
-  /**
-   * When the recovery key was confirmed saved. The modal that shows it cannot
-   * be dismissed any other way, because the key is shown once and a
-   * forgotten passphrase without it is unrecoverable data loss.
-   */
-  recoveryKeyAcknowledgedAt: number | null;
-  /**
-   * The vault name this install last sealed and published, so it is republished
-   * only when it actually changes.
-   *
-   * Needed because every seal draws a fresh ephemeral key, so the ciphertext
-   * differs on every call even for an identical name — without this the row
-   * would be rewritten on every launch and look like activity that never
-   * happened. Plaintext and local: it is this vault's own name, which the vault
-   * already knows, and it is never sent.
-   */
-  publishedVaultLabel: string;
-  serverUrl: string;
-  username: string;
-  token: string;
-  userRole: UserRole;
-  folderMappings: FolderMapping[];
-  /**
-   * Deliberately always empty.
-   *
-   * The master key used to be cached here so a restart could skip the KDF. It
-   * also unwraps the identity key with no password, so anyone who read this
-   * file — including whatever cloud service syncs the vault — gained every
-   * folder ever shared with the account, not merely the notes already on disk.
-   * The field remains only so an existing value can be cleared. See
-   * docs/key-storage.md.
-   */
-  masterKey: string;
-  /**
-   * The wrapped identity keypair and recovery material, as the server holds
-   * them. On Nectenda Cloud it also carries the KDF parameters, because the
-   * identity service is where the passphrase's parameters live.
-   */
-  keyMaterial: (KeyMaterial & { kdfParams?: KdfParams | null }) | null;
-  /**
-   * Percentage of the storage quota at which to start warning.
-   *
-   * A bar that only turns red at the limit tells the user when it is already
-   * too late to plan, so where the warning starts is theirs to choose.
-   */
-  quotaWarnPercent: number;
-  /**
-   * Attachments whose upload has not got through, as "folderId relativePath".
-   *
-   * Persisted from the outset. The in-memory version of this queue is a mistake
-   * this codebase has already made once with `pendingDeletes`: an operation
-   * deferred while offline is lost on restart, and for a delete that leaves a
-   * permanent orphan nothing will ever collect.
-   */
-  pendingBlobUploads: string[];
-  /** Attachment purges not yet accepted, as "folderId blobId". */
-  pendingBlobDeletes: string[];
-  /**
-   * Largest attachment this account accepts, cached from the server.
-   *
-   * Cached so an upload can be refused before the file is read and encrypted,
-   * rather than after. Zero means "not known yet", and the built-in default is
-   * used until the server says otherwise; -1 means the server said there is no
-   * limit, which used to be cached as zero and so read as "not known" for ever.
-   */
-  maxBlobBytes: number;
-  /**
-   * Attachments the server will never accept, as "folderId relativePath".
-   *
-   * Kept apart from `pendingBlobUploads`, which is for things that might work
-   * later. A file bigger than the account's maximum is not one of them, and
-   * queueing it re-encrypts it on every reconnect for ever.
-   */
-  oversizedAttachments: string[];
-  /**
-   * Mirror the plugin log to a file in the vault, for reporting a problem.
-   *
-   * Off by default and deliberately not something to leave on: the file grows
-   * without bound, and its lines carry vault-relative paths — precisely what
-   * Phase 7 exists to keep off the server. It earns its place because copied
-   * console output proved unreliable when diagnosing sync problems: truncated,
-   * objects collapsed, or from a stale session. A full ordered trace settled in
-   * one run what four rounds of pasted output could not.
-   */
-  diagnosticLog: boolean;
-  /**
-   * Send crash reports to the server you are signed in to.
-   *
-   * On by default, and it still sends nothing until
-   * `errorReportsAcknowledgedAt` is set: the default is the answer, but the
-   * person is told first. What goes is the exception, its scrubbed message,
-   * stack frames as numbers in our own unminified bundle, the plugin and
-   * Obsidian versions, the platform, and the install id the server already
-   * holds — see `error-report.ts`, which builds the payload from an allowlist.
-   *
-   * Reporting is impossible without a DSN, and only a hosted identity service
-   * hands one out, so a self-hosted vault reports nothing whatever this says.
-   */
-  errorReports: boolean;
-  /**
-   * When the person was shown what crash reporting sends. Null until then.
-   *
-   * Same shape as `recoveryKeyAcknowledgedAt`: a timestamp rather than a
-   * boolean, so that a later change to what is sent can ask again by
-   * comparing against a date.
-   */
-  errorReportsAcknowledgedAt: number | null;
-  /**
-   * The crash-report endpoint the identity service last named, or ''.
-   *
-   * Cached so that a crash during a start with no network can still be
-   * reported. Cleared at sign-out beside the token and the folder keys,
-   * because it belongs to the server that issued it.
-   */
-  errorReportDsn: string;
-  /**
-   * Unwrapped folder keys, cached per folder id.
-   *
-   * Load-bearing rather than an optimisation: without it a start with no
-   * network has no keys, cannot read any shared folder, and the vault silently
-   * stops syncing. Kept in the keychain where there is one — which is every
-   * supported build — and in this file otherwise, where the notes they protect
-   * sit in the same vault anyway. Cleared on logout.
-   */
-  folderKeys: Record<string, StoredFolderKeys>;
-  /**
-   * The fallback secret store, used only where no keychain is available.
-   *
-   * Empty when secrets live in the keychain — which is the point, since this
-   * file travels with the vault.
-   */
-  secrets: Record<string, string>;
-}
-
-export const DEFAULT_SETTINGS: NectendaSettings = {
-  mode: 'cloud',
-  identityUrl: DEFAULT_IDENTITY_URL,
-  identity: null,
-  identityAccessToken: '',
-  refreshToken: '',
-  memberships: [],
-  pendingInvites: [],
-  recoveryKeyAcknowledgedAt: null,
-  publishedVaultLabel: '',
-  // Empty, not a localhost address. A cloud vault never sets this, so a
-  // default here is written into every cloud install's data.json and reads as
-  // configuration nobody chose. Empty also lets the self-hosted pane tell
-  // "never touched" from "deliberately set", which is what the pre-`mode`
-  // migration in loadSettings needed and could not get from this field.
-  // The pane still shows ws://localhost:1234 — as a placeholder.
-  serverUrl: '',
-  username: '',
-  token: '',
-  userRole: 'editor',
-  folderMappings: [],
-  masterKey: '',
-  keyMaterial: null,
-  quotaWarnPercent: 80,
-  pendingBlobUploads: [],
-  pendingBlobDeletes: [],
-  maxBlobBytes: 0,
-  oversizedAttachments: [],
-  diagnosticLog: false,
-  errorReports: true,
-  errorReportsAcknowledgedAt: null,
-  errorReportDsn: '',
-  folderKeys: {},
-  secrets: {},
-};
-
-const MIN_PASSWORD_LENGTH = 8;
 
 /**
  * How often to tell the server what this vault still references.
@@ -670,1118 +227,15 @@ const MIN_PASSWORD_LENGTH = 8;
  */
 const ATTEST_INTERVAL_MS = 6 * 60 * 60 * 1000;
 
-/**
- * Shown exactly once, after registration or first key enrolment.
- *
- * There is no second chance to display this: the server holds only the master
- * key wrapped under it and cannot reproduce it. Without it, a forgotten
- * password means unrecoverable data loss.
- */
-/**
- * What crash reporting sends, shown once before anything is sent.
- *
- * The setting defaults to on, and `ErrorReports.capture` still refuses until
- * this has been acknowledged. That combination is the whole point: the default
- * is the answer most people want, and nobody discovers after the fact that
- * their editor has been talking to us. Escape and a click outside are allowed
- * here — unlike the recovery key, nothing is lost by closing it, and the
- * acknowledgement is recorded either way, because being shown the notice is
- * the thing that matters.
- *
- * Both buttons are the same size on purpose. A dialogue whose "no" is a
- * greyed-out link is not a choice, and this product's whole claim is that we
- * do not need to be trusted.
- */
-class ErrorReportConsentModal extends Modal {
-  constructor(
-    app: App,
-    private readonly onDecided: (send: boolean) => void,
-  ) {
-    super(app);
-  }
-
-  onOpen(): void {
-    const { contentEl } = this;
-    contentEl.createEl('h2', { text: 'Crash reports' });
-    contentEl.createEl('p', {
-      text:
-        'When Nectenda hits a bug, it can send us a crash report so we can fix it. ' +
-        'This is on unless you turn it off, and nothing has been sent yet.',
-    });
-
-    contentEl.createEl('p', { text: 'A report contains:' });
-    const sends = contentEl.createEl('ul');
-    for (const line of [
-      'The error and its message, with note names, file paths and anything that looks like a key or a token removed.',
-      'Where in our own code it happened — line numbers in the published plugin file, which is not minified, so no separate debug file is ever uploaded.',
-      'Your plugin and Obsidian versions, and whether you are on desktop or mobile.',
-      'The identifier this vault already sends with every request.',
-    ]) sends.createEl('li', { text: line });
-
-    contentEl.createEl('p', { text: 'A report never contains:' });
-    const never = contentEl.createEl('ul');
-    for (const line of [
-      'Anything you have written, or the name of any note, folder or attachment.',
-      "Your vault's name.",
-      'Your passphrase, your keys, or any token.',
-    ]) never.createEl('li', { text: line });
-
-    contentEl.createEl('p', {
-      text:
-        'Reports go to an error tracker we run ourselves, not a third party, and are deleted after 90 days. ' +
-        'This only applies when you are signed in to Nectenda Cloud: against your own server there is nowhere to send them, and none are.',
-    });
-    const more = contentEl.createEl('p', { text: 'Full detail: ' });
-    more.createEl('a', { text: 'nectenda.com/privacy', href: 'https://nectenda.com/privacy' });
-
-    const buttons = contentEl.createDiv({ cls: 'modal-button-container' });
-    buttons.createEl('button', { text: 'Send crash reports', cls: 'mod-cta' }).onclick = () => {
-      this.onDecided(true);
-      super.close();
-    };
-    buttons.createEl('button', { text: "Don't send" }).onclick = () => {
-      this.onDecided(false);
-      super.close();
-    };
-  }
-
-  onClose(): void {
-    this.contentEl.empty();
-  }
-}
-
-class RecoveryKeyModal extends Modal {
-  private recoveryKey: string;
-  private acknowledged = false;
-  private onAcknowledged: (() => void) | undefined;
-
-  constructor(app: App, recoveryKey: string, onAcknowledged?: () => void) {
-    super(app);
-    this.recoveryKey = recoveryKey;
-    this.onAcknowledged = onAcknowledged;
-  }
-
-  /**
-   * Escape, a click outside, and the close button all land here. None of them
-   * closes this modal: there is no second showing of the key, so the only way
-   * out is to say it has been saved.
-   */
-  close(): void {
-    if (!this.acknowledged) {
-      new Notice('Save the recovery key first, then confirm below.');
-      return;
-    }
-    super.close();
-  }
-
-  onOpen(): void {
-    const { contentEl } = this;
-    contentEl.createEl('h2', { text: 'Save your recovery key' });
-    contentEl.createEl('p', {
-      text:
-        'This is the only way back into your notes if you forget your password. ' +
-        'It is shown once and cannot be retrieved later — not even by a server admin. ' +
-        'Store it in a password manager now.',
-    });
-
-    const code = contentEl.createEl('pre', { cls: 'nectenda-recovery-key' });
-    code.setText(this.recoveryKey);
-
-    const buttons = contentEl.createDiv('modal-button-container');
-    const copy = buttons.createEl('button', { text: 'Copy to clipboard' });
-    copy.addEventListener('click', () => {
-      void navigator.clipboard.writeText(this.recoveryKey);
-      new Notice('Recovery key copied');
-    });
-    const done = buttons.createEl('button', { text: "I've saved it", cls: 'mod-cta' });
-    done.addEventListener('click', () => {
-      this.acknowledged = true;
-      this.onAcknowledged?.();
-      this.close();
-    });
-  }
-
-  onClose(): void {
-    this.contentEl.empty();
-  }
-}
 
 // Modal for picking a vault folder
-type FolderRole = 'owner' | 'editor';
 
-interface FolderMember {
-  userId: string;
-  username: string;
-  /** Sent by shards from 15 September 2026; the username stands in before that. */
-  displayName?: string;
-  email?: string;
-  role: FolderRole;
-  publicKey: string | null;
-}
 
-/** Someone from the organisation's roster to add to a folder. */
-class FolderMemberPickerModal extends FuzzySuggestModal<PickerCandidate> {
-  constructor(app: App, private readonly candidates: PickerCandidate[], private readonly onChoose: (c: PickerCandidate) => void) {
-    super(app);
-    this.setPlaceholder(candidates.length ? 'Choose someone in this organisation…' : 'Everyone in this organisation is already a member');
-  }
-  getItems(): PickerCandidate[] { return this.candidates; }
-  getItemText(item: PickerCandidate): string { return item.label; }
-  onChooseItem(item: PickerCandidate): void {
-    if (!item.addable) {
-      new Notice('They have not enrolled encryption keys yet, so no folder key can be wrapped for them. Ask them to set a passphrase first.');
-      return;
-    }
-    this.onChoose(item);
-  }
-}
+// What one passphrase attempt came to. Defined beside the code that produces
+// it; re-exported because the prompt modal below and its tests take it from
+// here.
+export type { VerifyOutcome } from './identity-session';
 
-/**
- * Who can reach a shared folder, and what they may do.
- *
- * Membership is editing rights: every member may read and write. Owners can
- * additionally change who else is a member.
- *
- * There is deliberately no read-only role. Obsidian gives a plugin no way to
- * veto a file operation, so while the editor can be locked and the server can
- * refuse writes, nothing prevents a read-only member deleting or creating files
- * from the file explorer — and a role that implies a guarantee it cannot keep
- * is worse than no role at all.
- *
- * Adding someone here grants them access on the server. Under end-to-end
- * encryption that is only half of it — they also need the folder key wrapped
- * for them, which the server cannot do because it does not have it; this
- * modal wraps it (`grantKey`) the moment the server says who they are. A
- * member added before that step existed sees the folder but cannot read it.
- */
-class FolderMembersModal extends Modal {
-  private plugin: NectendaPlugin;
-  private folderId: string;
-  private folderName: string;
-
-  constructor(app: App, plugin: NectendaPlugin, folderId: string, folderName: string) {
-    super(app);
-    this.plugin = plugin;
-    this.folderId = folderId;
-    this.folderName = folderName;
-  }
-
-  onOpen(): void {
-    this.titleEl.setText(`Members of ${this.folderName}`);
-    void this.render();
-  }
-
-  private headers(): Record<string, string> {
-    return {
-      Authorization: `Bearer ${this.plugin.serverFor(this.folderId).token}`,
-      'Content-Type': 'application/json',
-    };
-  }
-
-  private async render(): Promise<void> {
-    const { contentEl } = this;
-    contentEl.empty();
-
-    const { base } = this.plugin.serverFor(this.folderId);
-    let members: FolderMember[] = [];
-    try {
-      const res = await serverFetch(`${base}/folders/${this.folderId}/members`, { headers: this.headers() });
-      if (!res.ok) {
-        contentEl.createEl('p', { text: 'Could not load members.' });
-        return;
-      }
-      ({ members } = (await res.json()) as { members: FolderMember[] });
-    } catch {
-      contentEl.createEl('p', { text: 'Could not reach the server.' });
-      return;
-    }
-
-    for (const member of members) {
-      // The fingerprint is the only defence against a server that substitutes
-      // its own public key for a collaborator's. Without comparing these out of
-      // band — in person, over a call — the guarantee holds against an operator
-      // who only reads, not one who actively interferes.
-      const fingerprint = member.publicKey
-        ? await publicKeyFingerprint(member.publicKey)
-        : null;
-      // A person, not the shard's username — which for a hosted user is two
-      // ids joined by a dot. The address goes on the second line when the
-      // first is a display name; the fingerprint stays, as the check it is.
-      const who = memberLabel(member);
-      const address = member.displayName && member.email ? `${member.email} — ` : '';
-      const setting = new Setting(contentEl)
-        .setName(who)
-        .setDesc(
-          fingerprint
-            ? `${address}${member.role} — key ${fingerprint}`
-            : `${address}${member.role} — no encryption keys yet, cannot be given folder access`,
-        );
-
-      setting.addDropdown((drop) => {
-        drop
-          .addOption('owner', 'Owner')
-          .addOption('editor', 'Editor')
-          .setValue(member.role)
-          .onChange(async (role) => {
-            await this.post(member.userId, who, role as FolderRole);
-            await this.render();
-          });
-      });
-
-      setting.addButton((btn) =>
-        btn
-          .setButtonText('Remove')
-          .setDestructive()
-          .onClick(async () => {
-            const res = await serverFetch(`${base}/folders/${this.folderId}/members/${member.userId}`, {
-              method: 'DELETE',
-              headers: this.headers(),
-            });
-            if (!res.ok) {
-              const body = (await res.json().catch(() => ({}))) as { error?: string };
-              new Notice(body.error ?? 'Could not remove that member');
-              return;
-            }
-            new Notice(`Removed ${who}`);
-            await this.render();
-          }),
-      );
-    }
-
-    const mine = this.plugin.settings.keyMaterial?.publicKey;
-    if (mine) {
-      const note = contentEl.createEl('p', { cls: 'setting-item-description' });
-      note.setText(
-        `Your key: ${await publicKeyFingerprint(mine)} — compare these with collaborators ` +
-          'through some channel other than this server. A server that swapped a key for its ' +
-          'own could read everything, and the fingerprint is what would give it away.',
-      );
-    }
-
-    contentEl.createEl('h4', { text: 'Add someone' });
-    let role: FolderRole = 'editor';
-    // Picked from the organisation's roster, not typed: the person must
-    // already hold a seat here — folders never cross organisations — and an
-    // address typed by hand had to match exactly or the add failed.
-    new Setting(contentEl)
-      .setName('Add a member')
-      .setDesc('Someone who already belongs to this organisation.')
-      .addDropdown((drop) =>
-        drop
-          .addOption('editor', 'Editor')
-          .addOption('owner', 'Owner')
-          .setValue('editor')
-          .onChange((v) => (role = v as FolderRole)),
-      )
-      .addButton((btn) =>
-        btn
-          .setButtonText('Choose…')
-          .setCta()
-          .onClick(async () => {
-            let users: RosterUser[];
-            try {
-              const res = await serverFetch(`${base}/account`, { headers: this.headers() });
-              if (!res.ok) throw new Error(`account: ${res.status}`);
-              ({ users = [] } = (await res.json()) as { users?: RosterUser[] });
-            } catch (err) {
-              new Notice('Could not load the organisation\'s members.');
-              log.warn('Could not list the roster for a folder picker', { error: String(err) });
-              return;
-            }
-            // The owner is a member already, so the roster minus the members
-            // leaves them out without needing to know their own id here.
-            new FolderMemberPickerModal(this.app, pickerCandidates(users, members, null), (c) => {
-              void (async () => {
-                await this.post(c.id, c.label.split(' — ')[0], role);
-                await this.render();
-              })().catch((err: unknown) => {
-                log.warn('Could not add the member', { error: String(err) });
-              });
-            }).open();
-          }),
-      );
-  }
-
-  private async post(userId: string, who: string, role: FolderRole): Promise<void> {
-    const { base } = this.plugin.serverFor(this.folderId);
-    const res = await serverFetch(`${base}/folders/${this.folderId}/members`, {
-      method: 'POST',
-      headers: this.headers(),
-      body: JSON.stringify({ userId, role }),
-    });
-    if (!res.ok) {
-      const body = (await res.json().catch(() => ({}))) as { error?: string };
-      new Notice(body.error ?? 'Could not change membership');
-      return;
-    }
-
-    const { member } = (await res.json().catch(() => ({}))) as { member?: { userId: string } };
-    // Only claim success if the key actually reached them. grantKey reports its
-    // own failures, and a cheerful "is now editor" printed afterwards is the
-    // last thing the user reads — which buries the one message that matters,
-    // in the state that already looks exactly like a sync failure.
-    const shared = member ? await this.grantKey(member.userId, who) : false;
-    if (shared) new Notice(`${who} is now ${role}`);
-  }
-
-  /**
-   * Seal this folder's keys to a new member.
-   *
-   * Access and readability are separate things here, and the server can only
-   * grant the first: it has no folder key to give away. Without this the member
-   * sees the folder and receives ciphertext they cannot decrypt, which looks
-   * exactly like a sync failure.
-   *
-   * ECIES needs only the recipient's public key, so this works without the
-   * folder's original owner being online — but it does need *this* client to
-   * hold the folder key, which is why it reports plainly when it does not.
-   */
-  private async grantKey(userId: string, username: string): Promise<boolean> {
-    const keys = this.plugin.folderCrypto.get(this.folderId);
-    if (!keys) {
-      new Notice(`${username} was added, but this device has no key for the folder to share.`);
-      return false;
-    }
-
-    const { base } = this.plugin.serverFor(this.folderId);
-    try {
-      const res = await serverFetch(`${base}/folders/${this.folderId}/members`, {
-        headers: this.headers(),
-      });
-      const { members } = (await res.json()) as { members: FolderMember[] };
-      const recipient = members.find((m) => m.userId === userId);
-      if (!recipient?.publicKey) {
-        new Notice(`${username} has not enrolled encryption keys yet — no key was shared.`);
-        return false;
-      }
-
-      const wrapped = await wrapKeysFor(keys, userId, recipient.publicKey);
-      const put = await serverFetch(`${base}/folders/${this.folderId}/keys`, {
-        method: 'POST',
-        headers: this.headers(),
-        body: JSON.stringify({ keys: wrapped }),
-      });
-      if (!put.ok && put.status !== 409) {
-        new Notice(`${username} was added, but the folder key could not be shared.`);
-        return false;
-      }
-      return true;
-    } catch (err) {
-      new Notice(`${username} was added, but the folder key could not be shared.`);
-      log.error('Could not grant a folder key', { userId, error: String(err) });
-      return false;
-    }
-  }
-
-  onClose(): void {
-    this.contentEl.empty();
-  }
-}
-
-/**
- * Recover a forgotten password with the recovery key.
- *
- * Collects everything in one modal because the flow is atomic from the user's
- * point of view: recovering the master key without setting a new password
- * leaves them able to read nothing and log in nowhere, since `authHash` is
- * salted with the password itself and the old one is gone with it.
- */
-class RecoveryModal extends Modal {
-  private onSubmit: (result: { recoveryKey: string; password: string } | null) => void;
-  private settled = false;
-
-  constructor(
-    app: App,
-    onSubmit: (result: { recoveryKey: string; password: string } | null) => void,
-  ) {
-    super(app);
-    this.onSubmit = onSubmit;
-  }
-
-  onOpen(): void {
-    this.titleEl.setText('Recover with your recovery key');
-    this.contentEl.createEl('p', {
-      text:
-        'Enter the recovery key you saved when you registered, and choose a new ' +
-        'password. Your notes and every folder shared with you are unaffected.',
-    });
-    this.contentEl.createEl('p', {
-      cls: 'setting-item-description',
-      text:
-        'Without the recovery key there is nothing to do here — the server cannot ' +
-        'reset a password it has never seen. Case and dashes do not matter.',
-    });
-
-    let recoveryKey = '';
-    let password = '';
-    let confirm = '';
-
-    const submit = (): void => {
-      if (!recoveryKey.trim()) {
-        new Notice('Enter your recovery key');
-        return;
-      }
-      if (password.length < MIN_PASSWORD_LENGTH) {
-        new Notice(`Password must be at least ${MIN_PASSWORD_LENGTH} characters`);
-        return;
-      }
-      if (password !== confirm) {
-        new Notice('The two passwords do not match');
-        return;
-      }
-      this.settle({ recoveryKey: recoveryKey.trim(), password });
-      this.close();
-    };
-
-    new Setting(this.contentEl).setName('Recovery key').addText((text) => {
-      text.setPlaceholder('XXXX-XXXX-XXXX-XXXX-XXXX').onChange((v) => (recoveryKey = v));
-      window.setTimeout(() => text.inputEl.focus(), 0);
-    });
-
-    new Setting(this.contentEl).setName('New password').addText((text) => {
-      text.inputEl.type = 'password';
-      text.onChange((v) => (password = v));
-    });
-
-    new Setting(this.contentEl).setName('Confirm new password').addText((text) => {
-      text.inputEl.type = 'password';
-      text.onChange((v) => (confirm = v));
-      text.inputEl.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter') submit();
-      });
-    });
-
-    new Setting(this.contentEl).addButton((btn) =>
-      btn.setButtonText('Recover').setCta().onClick(submit),
-    );
-  }
-
-  private settle(value: { recoveryKey: string; password: string } | null): void {
-    if (this.settled) return;
-    this.settled = true;
-    this.onSubmit(value);
-  }
-
-  onClose(): void {
-    this.settle(null);
-    this.contentEl.empty();
-  }
-}
-
-/** What one passphrase attempt came to. `fatal` means do not offer another. */
-export type VerifyOutcome = { ok: true } | { ok: false; message: string; fatal?: boolean };
-
-/**
- * How long to refuse the next attempt, after `failures` wrong ones.
- *
- * **This is a speed bump, not a security control, and must not be promoted into
- * one.** Anyone who can open this dialog can also read `data.json`, which holds
- * the salt, the iteration count *and* the wrapped private key — everything
- * needed to grind offline on a GPU without ever opening Obsidian. A counter
- * here stops none of that. What it does stop is somebody trying a handful of
- * guesses at a machine left unattended.
- *
- * So: no lockout, ever. A lockout would block nothing an attacker cannot route
- * around, while risking shutting the real owner out of their own folders — the
- * trade this codebase never takes. The first two attempts are free, because
- * typos are normal. See docs/key-storage.md.
- */
-export function retryDelayMs(failures: number): number {
-  if (failures <= 2) return 0;
-  return Math.min(8_000, 1_000 * 2 ** (failures - 3));
-}
-
-/**
- * Asks for the passphrase so the identity key can be unwrapped, and keeps
- * asking until it opens.
- *
- * The check happens *here*, through `verify`, rather than after the dialog has
- * closed. It used to run in the caller, so a wrong passphrase could only
- * produce a toast against a dialog that was already gone, and the caller's only
- * recourse at sign-in was to treat one typo as a failed sign-in and tear the
- * session down. A wrong attempt is now answered in place.
- *
- * The master key is not stored, so nothing on disk can open a folder-key
- * envelope this device has not already cached. Folders already mapped never
- * reach this — they sync from their cached folder keys.
- *
- * Three callers, and the last two are easy to miss: confirming the passphrase
- * at sign-in, joining a folder (`loadFolderKeys`), and **Show names**, which
- * needs the identity key to read the sealed names of folders shared since the
- * last unlock. The last fires to render a list rather than to join anything.
- */
-export class PasswordPromptModal extends Modal {
-  private settled = false;
-  private failures = 0;
-  private busy = false;
-  private password = '';
-  private error: HTMLElement | null = null;
-  private setDisabled: ((v: boolean) => void) | null = null;
-  private clearInput: (() => void) | null = null;
-  private countdown: TimerHandle | null = null;
-  /** Wall-clock deadline for the pause. Enter bypasses a disabled button. */
-  private blockedUntil = 0;
-
-  constructor(
-    app: App,
-    private opts: {
-      reason: string;
-      verify: (password: string) => Promise<VerifyOutcome>;
-      onDone: (unlocked: boolean) => void;
-    },
-  ) {
-    super(app);
-  }
-
-  onOpen(): void {
-    this.titleEl.setText('Passphrase required');
-    this.contentEl.createEl('p', { text: this.opts.reason });
-    this.contentEl.createEl('p', {
-      cls: 'setting-item-description',
-      text:
-        'Your passphrase is not stored and never leaves this device. It is needed here to ' +
-        'unwrap your encryption key, and takes a moment to process.',
-    });
-
-    new Setting(this.contentEl).setName('Passphrase').addText((text) => {
-      text.inputEl.type = 'password';
-      text.onChange((v) => (this.password = v));
-      text.inputEl.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter') void this.attempt();
-      });
-      this.clearInput = () => {
-        this.password = '';
-        text.setValue('');
-        text.inputEl.focus();
-      };
-      window.setTimeout(() => text.inputEl.focus(), 0);
-    });
-
-    // `mod-warning` is Obsidian's own, so this needs no rule in styles.css and
-    // stays outside the nectenda-* contract styles-contract.test.ts enforces.
-    this.error = this.contentEl.createEl('p', { cls: 'mod-warning' });
-    this.error.hide();
-
-    new Setting(this.contentEl)
-      .addButton((btn) =>
-        // Cancelling is a real choice and needs a button. There was none: the
-        // only way out was Esc, which the caller could not tell from a wrong
-        // passphrase, and which used to cost the whole session.
-        btn.setButtonText('Cancel').onClick(() => this.close()),
-      )
-      .addButton((btn) => {
-        btn.setButtonText('Unlock').setCta().onClick(() => void this.attempt());
-        this.setDisabled = (v) => { btn.setDisabled(v); };
-      });
-  }
-
-  private show(message: string): void {
-    if (!this.error) return;
-    this.error.setText(message);
-    this.error.show();
-  }
-
-  private async attempt(): Promise<void> {
-    // Guarded rather than trusted: Enter and the button both land here, and a
-    // second press while the KDF is running would start a parallel derivation
-    // against a dialog that may already have settled.
-    if (this.busy || this.settled) return;
-    // Checked here rather than only on the button: the field takes Enter too,
-    // and disabling the button alone would let the keyboard walk past the pause.
-    if (Date.now() < this.blockedUntil) return;
-    if (!this.password) {
-      this.show('Enter your passphrase.');
-      return;
-    }
-    this.busy = true;
-    this.setDisabled?.(true);
-    this.show('Checking…');
-    let outcome: VerifyOutcome;
-    try {
-      outcome = await this.opts.verify(this.password);
-    } catch (err) {
-      // verify is not meant to throw; if it does, say so rather than leaving
-      // the dialog stuck on "Checking…".
-      log.error('The passphrase check threw', { error: String(err) });
-      outcome = { ok: false, message: 'Something went wrong checking that passphrase.' };
-    }
-    // The dialog may have been closed while the KDF ran. Everything below this
-    // point either touches a detached element or re-settles a finished prompt.
-    if (this.settled) return;
-    this.busy = false;
-
-    if (outcome.ok) {
-      this.settle(true);
-      this.close();
-      return;
-    }
-    if (outcome.fatal) {
-      // Not a typo — the caller has said something more specific and asked the
-      // user not to try again until they know why. Offering another attempt
-      // here would contradict it.
-      this.settle(false);
-      this.close();
-      return;
-    }
-
-    this.failures += 1;
-    this.clearInput?.();
-    const wait = retryDelayMs(this.failures);
-    this.blockedUntil = Date.now() + wait;
-    if (wait === 0) {
-      this.show(outcome.message);
-      this.setDisabled?.(false);
-      return;
-    }
-    let left = Math.ceil(wait / 1000);
-    const tick = (): void => this.show(`${outcome.message} Try again in ${left}s.`);
-    tick();
-    this.countdown = window.setInterval(() => {
-      left -= 1;
-      if (left > 0) {
-        tick();
-        return;
-      }
-      this.stopCountdown();
-      if (this.settled) return;
-      this.show(outcome.message);
-      this.setDisabled?.(false);
-    }, 1_000);
-  }
-
-  private stopCountdown(): void {
-    if (this.countdown === null) return;
-    window.clearInterval(this.countdown);
-    this.countdown = null;
-  }
-
-  private settle(unlocked: boolean): void {
-    if (this.settled) return;
-    this.settled = true;
-    this.opts.onDone(unlocked);
-  }
-
-  onClose(): void {
-    // Closing without unlocking has to resolve the caller, or a cancelled
-    // prompt would leave whatever awaited it hanging for the session. Esc, the
-    // background and Cancel all arrive here; the latch means a successful
-    // unlock that closed the dialog itself is not overwritten.
-    this.stopCountdown();
-    this.settle(false);
-    this.contentEl.empty();
-  }
-}
-
-/**
- * Choosing a plan, before being sent to the payment page.
- *
- * Until this existed, *Change plan* went straight to a checkout for Personal,
- * monthly, one seat, whatever the person actually wanted. It could not offer
- * anything else because the plugin had no idea what was for sale.
- *
- * **Every figure here comes from the server**, fetched when the dialog opens.
- * The prices exist in three places already — the shard's plans table, the
- * public pricing page, and the payment provider's own products — and a fourth
- * compiled into this bundle would be the only copy that could not be corrected
- * without shipping a release. So this file contains no prices, and if the
- * server cannot be reached it says so rather than guessing.
- *
- * The seat control follows `perSeat`, which is not cosmetic. A flat plan sells
- * one subscription with its seats included; treating that as "one seat" is
- * exactly what once capped a six-seat plan at one, below the free tier.
- */
-class PlanPickerModal extends Modal {
-  private plans: PlanOffer[] = [];
-  private planId = '';
-  private term: 'month' | 'year' = 'year';
-  private seats = 1;
-  private loading = true;
-  private error: string | null = null;
-
-  constructor(
-    app: App,
-    private readonly load: () => Promise<PlanOffer[]>,
-    private readonly onChosen: (choice: { planId: string; term: 'month' | 'year'; seats: number }) => void,
-  ) {
-    super(app);
-  }
-
-  onOpen(): void {
-    void this.fetch();
-    this.render();
-  }
-
-  private async fetch(): Promise<void> {
-    try {
-      this.plans = await this.load();
-      // Default to whatever is cheapest per month, which is the yearly line of
-      // the smallest plan — not to a hardcoded name that may not be for sale.
-      const first = [...this.plans].sort((a, b) => monthly(a) - monthly(b))[0];
-      if (first) {
-        this.planId = first.planId;
-        this.term = first.term;
-        this.seats = first.perSeat ? 1 : 1;
-      } else {
-        this.error = 'This server is not selling any plans at the moment.';
-      }
-    } catch (err) {
-      // Named, not smoothed over. Somebody is about to be asked for money and
-      // a dialog that shrugs is the point at which they stop trusting it.
-      this.error = err instanceof Error ? err.message : 'The plans could not be loaded.';
-    } finally {
-      this.loading = false;
-      this.render();
-    }
-  }
-
-  private offer(): PlanOffer | undefined {
-    return this.plans.find((p) => p.planId === this.planId && p.term === this.term);
-  }
-
-  private render(): void {
-    const { contentEl } = this;
-    contentEl.empty();
-    contentEl.createEl('h2', { text: 'Choose a plan' });
-
-    if (this.loading) {
-      contentEl.createEl('p', { text: 'Loading what is available…' });
-      return;
-    }
-    if (this.error) {
-      contentEl.createEl('p', { text: this.error });
-      contentEl.createEl('p', {
-        cls: 'mod-warning',
-        text: 'Nothing has been charged. Try again in a moment, or write to support@nectenda.com.',
-      });
-      return;
-    }
-
-    // One row per plan, not per plan-and-term: the term is its own control, so
-    // six products read as three choices and a billing toggle.
-    const names = [...new Set(this.plans.map((p) => p.planId))];
-    new Setting(contentEl)
-      .setName('Plan')
-      .addDropdown((d) => {
-        for (const id of names) d.addOption(id, planLabel(id));
-        d.setValue(this.planId).onChange((v) => {
-          this.planId = v;
-          // A flat plan has no seats to choose, so any count carried over from
-          // a per-seat plan is dropped rather than quietly sent.
-          if (!this.offer()?.perSeat) this.seats = 1;
-          this.render();
-        });
-      });
-
-    new Setting(contentEl)
-      .setName('Billing')
-      .setDesc(this.savingLine())
-      .addDropdown((d) => {
-        for (const t of ['month', 'year'] as const) {
-          if (this.plans.some((p) => p.planId === this.planId && p.term === t)) {
-            d.addOption(t, t === 'month' ? 'Monthly' : 'Yearly');
-          }
-        }
-        d.setValue(this.term).onChange((v) => { this.term = v as 'month' | 'year'; this.render(); });
-      });
-
-    const chosen = this.offer();
-    if (chosen?.perSeat) {
-      new Setting(contentEl)
-        .setName('Seats')
-        .setDesc(`Up to ${chosen.maxSeats}. You can change this later.`)
-        .addText((t) => {
-          t.inputEl.type = 'number';
-          t.inputEl.min = '1';
-          t.inputEl.max = String(chosen.maxSeats);
-          t.setValue(String(this.seats)).onChange((v) => {
-            const n = Number(v);
-            // Clamped rather than refused: the server enforces the same ceiling
-            // and would reject it, but being told at checkout is too late to be
-            // useful.
-            this.seats = Number.isInteger(n) && n >= 1 ? Math.min(n, chosen.maxSeats) : 1;
-            this.renderTotal();
-          });
-        });
-    } else if (chosen) {
-      new Setting(contentEl)
-        .setName('Seats')
-        .setDesc(`${chosen.maxSeats} included. This plan is one subscription rather than a price per seat.`);
-    }
-
-    const total = contentEl.createDiv({ cls: 'setting-item' });
-    total.createDiv({ cls: 'setting-item-info' }).createDiv({ cls: 'setting-item-name', text: 'Total' });
-    this.totalEl = total.createDiv({ cls: 'setting-item-control' });
-    this.renderTotal();
-
-    contentEl.createEl('p', {
-      cls: 'setting-item-description',
-      text:
-        'Payment is taken by Creem, our payment provider, on their page in your browser. ' +
-        'Tax is included in the price shown.',
-    });
-
-    const buttons = contentEl.createDiv({ cls: 'modal-button-container' });
-    buttons.createEl('button', { text: 'Continue to payment', cls: 'mod-cta' }).onclick = () => {
-      const offer = this.offer();
-      if (!offer) return;
-      this.onChosen(planChoice(offer, this.seats));
-      super.close();
-    };
-    buttons.createEl('button', { text: 'Cancel' }).onclick = () => super.close();
-  }
-
-  private totalEl: HTMLElement | null = null;
-
-  private renderTotal(): void {
-    const offer = this.offer();
-    if (!this.totalEl || !offer) return;
-    const seats = offer.perSeat ? this.seats : 1;
-    this.totalEl.setText(
-      `${formatMoney(offer.amount * seats, offer.currency)} ${offer.term === 'year' ? 'a year' : 'a month'}`,
-    );
-  }
-
-  /** Only shown when both terms exist and the yearly one is actually cheaper. */
-  private savingLine(): string {
-    const m = this.plans.find((p) => p.planId === this.planId && p.term === 'month');
-    const y = this.plans.find((p) => p.planId === this.planId && p.term === 'year');
-    if (!m || !y || y.amount >= m.amount * 12) return 'Billed by the month or by the year.';
-    const saved = m.amount * 12 - y.amount;
-    return `Yearly saves ${formatMoney(saved, y.currency)} a year.`;
-  }
-
-  onClose(): void {
-    this.contentEl.empty();
-  }
-}
-
-/** Per-month cost, for ordering plans by price whatever their term. */
-export function monthly(p: PlanOffer): number {
-  return p.term === 'year' ? p.amount / 12 : p.amount;
-}
-
-/**
- * What gets sent to checkout for a chosen plan and seat count.
- *
- * Exported because it is the rule that cost a real customer seats, and a rule
- * that only exists inside a modal's click handler cannot be tested. **A flat
- * plan is one subscription**: whatever the seat field says, what goes to the
- * provider is 1, because the provider reports that back as `units` and `units`
- * became the account's seat cap. Sending 4 there would cap a six-seat plan at
- * four; sending 1 for a per-seat plan would charge for one seat and cap at one.
- *
- * The count is also clamped to the plan's own ceiling. The server enforces the
- * same limit and would refuse, but being refused at the payment page is too
- * late to be useful.
- */
-export function planChoice(offer: PlanOffer, requestedSeats: number): { planId: string; term: 'month' | 'year'; seats: number } {
-  if (!offer.perSeat) return { planId: offer.planId, term: offer.term, seats: 1 };
-  const seats = Number.isInteger(requestedSeats) && requestedSeats >= 1
-    ? Math.min(requestedSeats, offer.maxSeats)
-    : 1;
-  return { planId: offer.planId, term: offer.term, seats };
-}
-
-/**
- * Minor units to something a person reads.
- *
- * The server sends cents because that is what the provider charges in;
- * dividing happens once, here, at the point of display. A price stored or
- * passed around as a decimal is a price that has been rounded somewhere.
- */
-export function formatMoney(minorUnits: number, currency: string): string {
-  const figure = (minorUnits / 100).toFixed(2);
-  return currency === 'USD' ? `$${figure}` : `${figure} ${currency}`;
-}
-
-/** Plan ids are lowercase and hyphenated; these are the names the site uses. */
-function planLabel(planId: string): string {
-  return { personal: 'Personal', team: 'Team', 'small-business': 'Small Business' }[planId] ?? planId;
-}
-
-/**
- * Choose the encryption passphrase on the first device.
- *
- * Said plainly before it is chosen, not after: this passphrase cannot be reset
- * by anyone, and the recovery key that follows is the only way back.
- */
-class SetPassphraseModal extends Modal {
-  private onSubmit: (password: string | null) => void;
-  private settled = false;
-
-  constructor(app: App, onSubmit: (password: string | null) => void) {
-    super(app);
-    this.onSubmit = onSubmit;
-  }
-
-  onOpen(): void {
-    this.titleEl.setText('Choose an encryption passphrase');
-    this.contentEl.createEl('p', {
-      text:
-        'This passphrase protects every note you sync. It never leaves this device and nobody at ' +
-        'Nectenda can reset it. You will be given a recovery key next — keep it somewhere safe.',
-    });
-    let first = '';
-    let second = '';
-    const submit = (): void => {
-      if (first.length < MIN_PASSWORD_LENGTH) {
-        new Notice(`Use at least ${MIN_PASSWORD_LENGTH} characters`);
-        return;
-      }
-      if (first !== second) {
-        new Notice('The two entries do not match');
-        return;
-      }
-      this.settle(first);
-      this.close();
-    };
-    new Setting(this.contentEl).setName('Passphrase').addText((text) => {
-      text.inputEl.type = 'password';
-      text.onChange((v) => (first = v));
-      window.setTimeout(() => text.inputEl.focus(), 0);
-    });
-    new Setting(this.contentEl).setName('Again').addText((text) => {
-      text.inputEl.type = 'password';
-      text.onChange((v) => (second = v));
-      text.inputEl.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter') submit();
-      });
-    });
-    new Setting(this.contentEl).addButton((btn) => btn.setButtonText('Set passphrase').setCta().onClick(submit));
-  }
-
-  private settle(value: string | null): void {
-    if (this.settled) return;
-    this.settled = true;
-    this.onSubmit(value);
-  }
-
-  onClose(): void {
-    this.settle(null);
-    this.contentEl.empty();
-  }
-}
-
-/** Invite someone to an organisation by email. The email is a notification; the invitation also shows in their settings. */
-class InviteByEmailModal extends Modal {
-  constructor(
-    app: App,
-    private readonly membership: StoredMembership,
-    private readonly onSubmit: (email: string, role: 'member' | 'admin') => Promise<void>,
-  ) {
-    super(app);
-  }
-
-  onOpen(): void {
-    this.titleEl.setText(`Invite to ${this.membership.accountName}`);
-    let email = '';
-    let role: 'member' | 'admin' = 'member';
-    new Setting(this.contentEl).setName('Email address').addText((text) => {
-      text.setPlaceholder('name@example.com').onChange((v) => (email = v.trim()));
-      window.setTimeout(() => text.inputEl.focus(), 0);
-    });
-    const roles = new Setting(this.contentEl).setName('Role');
-    roles.addDropdown((drop) => {
-      drop.addOption('member', 'Member');
-      // Only an owner may make an admin; the service refuses otherwise.
-      if (this.membership.role === 'owner') drop.addOption('admin', 'Admin');
-      drop.setValue('member').onChange((v) => (role = v as 'member' | 'admin'));
-    });
-    new Setting(this.contentEl).addButton((btn) =>
-      btn.setButtonText('Send invitation').setCta().onClick(async () => {
-        if (!email.includes('@')) {
-          new Notice('Enter an email address');
-          return;
-        }
-        await this.onSubmit(email, role);
-        this.close();
-      }),
-    );
-  }
-
-  onClose(): void {
-    this.contentEl.empty();
-  }
-}
-
-/** Naming an organisation you are about to create. */
-class NameOrganisationModal extends Modal {
-  constructor(
-    app: App,
-    private readonly suggestion: string,
-    private readonly onSubmit: (name: string) => Promise<void>,
-  ) {
-    super(app);
-  }
-
-  onOpen(): void {
-    this.titleEl.setText('Create an organisation');
-    let name = this.suggestion;
-    this.contentEl.createEl('p', {
-      cls: 'setting-item-description',
-      text: 'An organisation holds shared folders and the people you share them with. '
-        + 'It starts on the free plan: three people, text sync, no attachments.',
-    });
-    new Setting(this.contentEl).setName('Name').addText((text) => {
-      text.setValue(this.suggestion).onChange((v) => (name = v.trim()));
-      window.setTimeout(() => { text.inputEl.focus(); text.inputEl.select(); }, 0);
-    });
-    new Setting(this.contentEl).addButton((btn) =>
-      btn.setButtonText('Create').setCta().onClick(async () => {
-        if (!name) {
-          new Notice('Give the organisation a name');
-          return;
-        }
-        this.close();
-        await this.onSubmit(name);
-      }),
-    );
-  }
-
-  onClose(): void {
-    this.contentEl.empty();
-  }
-}
-
-
-class FolderPickerModal extends FuzzySuggestModal<TFolder> {
-  private folders: TFolder[];
-  private onChoose: (folder: TFolder) => void;
-
-  constructor(app: App, onChoose: (folder: TFolder) => void) {
-    super(app);
-    this.folders = this.getAllFolders();
-    this.onChoose = onChoose;
-    this.setPlaceholder('Pick a folder...');
-  }
-
-  private getAllFolders(): TFolder[] {
-    const folders: TFolder[] = [];
-    const root = this.app.vault.getRoot();
-    const walk = (folder: TFolder) => {
-      // Skip hidden folders
-      if (folder.path.startsWith('.')) return;
-      if (folder.path) folders.push(folder);
-      for (const child of folder.children) {
-        if (child instanceof TFolder) walk(child);
-      }
-    };
-    walk(root);
-    return folders.sort((a, b) => a.path.localeCompare(b.path));
-  }
-
-  getItems(): TFolder[] {
-    return this.folders;
-  }
-
-  getItemText(item: TFolder): string {
-    return item.path;
-  }
-
-  onChooseItem(item: TFolder): void {
-    this.onChoose(item);
-  }
-}
 
 export default class NectendaPlugin extends Plugin {
   settings: NectendaSettings = DEFAULT_SETTINGS;
@@ -1800,7 +254,7 @@ export default class NectendaPlugin extends Plugin {
    *
    * Also held for the device where the OS provides a credential store, so the
    * passphrase is asked once per machine rather than once per vault — see
-   * `deviceSecrets` and docs/key-storage.md. Not in memory only any more.
+   * `deviceSecrets`. Not in memory only any more.
    */
   sessionKeys: SessionKeys | null = null;
   /** Every shared folder's keys, keyed by folder id. */
@@ -1849,12 +303,33 @@ export default class NectendaPlugin extends Plugin {
   folderIndicator: FolderIndicator | null = null;
   fileSync: FileSync | null = null;
   blobSync: BlobSync | null = null;
+  /**
+   * Notes too large to sync (SAFE-A12). Built once for the plugin's lifetime
+   * rather than with each start of sync, because the record it keeps outlives
+   * a restart of sync and the settings tab reads it.
+   */
+  readonly oversizedNotes = new OversizedNotes({
+    store: {
+      get: () => this.settings.oversizedNotes ?? [],
+      set: (keys) => { this.settings.oversizedNotes = keys; },
+    },
+    save: () => this.saveSettings(),
+    notify: (notes) => this.reportOversizedNotes(notes),
+  });
   /** What this device has learned it cannot open. Survives a crash. */
   deviceState: DeviceStateStore | null = null;
   /** Crash reporting; see `installErrorReports`. Null only before `onload` has run. */
   errorReports: ErrorReports | null = null;
   vaultWatcher: VaultWatcher | null = null;
-  statusBarItem: HTMLElement | null = null;
+  /** Connection state, as the header icon shows it. */
+  connectionStatus: ConnectionStatus = 'disconnected';
+  /** People other than this device in the active note. */
+  presenceOthers = 0;
+  headerStatus: HeaderStatus | null = null;
+  fileStatus: FileStatusIndicator | null = null;
+  private statusUiTimer: TimerHandle | null = null;
+  /** The most recent note to have focus, for the inspector. */
+  private lastNotePath: string | null = null;
   // Registered ONCE in onload — EditorBridge mutates this array
   private collabExts: Extension[] = [];
 
@@ -1948,6 +423,7 @@ export default class NectendaPlugin extends Plugin {
     this.settingTab = new NectendaSettingTab(this.app, this);
     this.addSettingTab(this.settingTab);
     this.registerSkippedAttachmentMarkers();
+    this.registerCommands();
 
     // obsidian://nectenda?invite=<id> from an invitation email, or
     // obsidian://nectenda?key=nk_… from a share link. Navigation only: no
@@ -1957,8 +433,51 @@ export default class NectendaPlugin extends Plugin {
       void this.handleDeepLink(params);
     });
 
-    this.statusBarItem = this.addStatusBarItem();
-    this.updateStatusBar('disconnected');
+    // The header icon replaced the status-bar text. Obsidian on a phone has no
+    // status bar, so the text never reached anyone there; a note's header is
+    // on every platform.
+    registerHeaderIcon();
+    this.headerStatus = new HeaderStatus({
+      app: this.app,
+      connection: () => this.connectionStatus,
+      statusIndex: () => this.statusIndex(),
+      othersInActiveNote: () => this.presenceOthers,
+      invites: () => this.settings.pendingInvites?.length ?? 0,
+      pointers: () => ({ share: this.settings.sharePointer, show: this.settings.showPointers }),
+      setSharePointer: (on) => this.setSharePointer(on),
+      setShowPointers: (on) => this.setShowPointers(on),
+      inspect: (path) => this.openInspector(path),
+      openSettings: () => this.openSettingsTab(),
+    });
+    this.registerEvent(this.app.workspace.on('layout-change', () => this.refreshStatusUi()));
+    this.registerEvent(this.app.workspace.on('active-leaf-change', (leaf) => {
+      // Remembered because the inspector takes focus when it opens, and from
+      // then on the active view is the inspector, not the note it is about.
+      if (leaf?.view instanceof MarkdownView && leaf.view.file) this.lastNotePath = leaf.view.file.path;
+      this.refreshStatusUi();
+    }));
+    this.registerEvent(this.app.workspace.on('file-open', () => this.refreshStatusUi()));
+    this.registerView(INSPECTOR_VIEW, (leaf) => createInspectorView(
+      leaf,
+      this.inspectorDeps(),
+      () => this.app.workspace.getActiveViewOfType(MarkdownView)?.file?.path ?? this.lastNotePath,
+    ));
+    this.addCommand({
+      id: 'inspect-note-sync-state',
+      name: 'Inspect sync state of this note',
+      checkCallback: (checking) => {
+        const path = this.app.workspace.getActiveViewOfType(MarkdownView)?.file?.path;
+        if (!path) return false;
+        if (!checking) void this.openInspector(path);
+        return true;
+      },
+    });
+    this.addCommand({
+      id: 'open-sync-inspector',
+      name: 'Open sync-state inspector',
+      callback: () => void this.openInspector(null),
+    });
+    this.updateStatus('disconnected');
 
     // Register extension array exactly once
     this.registerEditorExtension(this.collabExts);
@@ -1968,7 +487,7 @@ export default class NectendaPlugin extends Plugin {
       // provides one, so a folder shared since the last unlock opens without a
       // prompt. A miss is normal and must not stop the start: folders already
       // mapped sync from their cached folder keys and need no identity at all.
-      // The master key is still never stored. See docs/key-storage.md.
+      // The master key is still never stored.
       const held = await this.restoreIdentity();
       if (held) this.sessionKeys = { identity: held };
 
@@ -1995,6 +514,166 @@ export default class NectendaPlugin extends Plugin {
       // here on the next start.
       void this.publishVaultLabel().catch(() => undefined);
     }
+  }
+
+  // -------------------------------------------------------------------------
+  // Commands, the ribbon and the folder menu
+  // -------------------------------------------------------------------------
+
+  /** What the rules in commands.ts decide from, read fresh on every check. */
+  private commandState(): CommandState {
+    return {
+      signedIn: this.isSignedIn(),
+      mode: this.settings.mode,
+      locked: this.isLocked(),
+      hasKeys: !!this.settings.keyMaterial?.publicKey,
+      mappings: this.settings.folderMappings,
+      memberships: this.settings.memberships,
+    };
+  }
+
+  /**
+   * Every entry point here runs an action the settings pane already has,
+   * through the pane's own code, so a command cannot behave differently from
+   * the button it stands in for.
+   */
+  private registerCommands(): void {
+    this.addRibbonIcon('folder-sync', 'Open Nectenda settings', () => this.openSettings());
+
+    for (const id of COMMAND_IDS) {
+      this.addCommand({
+        id,
+        name: COMMAND_NAMES[id],
+        // checkCallback rather than callback: the palette then hides a command
+        // that cannot work right now instead of offering it and failing.
+        checkCallback: (checking) => {
+          if (!commandAvailable(id, this.commandState())) return false;
+          if (!checking) void this.runCommand(id);
+          return true;
+        },
+      });
+    }
+
+    this.registerEvent(
+      this.app.workspace.on('file-menu', (menu, file) => {
+        if (!(file instanceof TFolder)) return;
+        for (const item of folderMenuItems(file.path, this.commandState())) {
+          if (item === 'share') {
+            menu.addItem((mi) => mi.setTitle(FOLDER_MENU_TITLES.share).setIcon('folder-sync').onClick(() => {
+              void this.guarded('share the folder', () => this.shareFromCommand(file));
+            }));
+          } else {
+            const mapping = this.settings.folderMappings.find((m) => m.localPath === file.path);
+            if (!mapping) continue;
+            menu.addItem((mi) => mi.setTitle(FOLDER_MENU_TITLES.members).setIcon('users').onClick(() => this.showMembers(mapping)));
+          }
+        }
+      }),
+    );
+  }
+
+  /** Obsidian's settings, open on this plugin's tab. `app.setting` is not in the typings. */
+  openSettings(): void {
+    const setting = (this.app as unknown as { setting: { open(): void; openTabById(id: string): void } }).setting;
+    setting.open();
+    setting.openTabById(this.manifest.id);
+  }
+
+  /** A command's work, with any failure said in a notice rather than lost to the console. */
+  private async guarded(what: string, run: () => Promise<void> | void): Promise<void> {
+    try {
+      await run();
+    } catch (err) {
+      log.warn(`Could not ${what}`, { error: String(err) });
+      new Notice(err instanceof Error ? err.message : `Could not ${what}`);
+    }
+  }
+
+  private runCommand(id: CommandId): Promise<void> {
+    switch (id) {
+      case 'open-settings':
+        return this.guarded('open settings', () => this.openSettings());
+      case 'toggle-diagnostic-log':
+        return this.guarded('change the diagnostic log', () => this.setDiagnosticLog(!this.settings.diagnosticLog));
+      case 'share-folder':
+        return this.guarded('share the folder', () => this.shareFromCommand(null));
+      case 'show-folder-members':
+        return this.guarded('show the members', () => this.showMembersFromCommand());
+      case 'copy-share-link':
+        return this.guarded('copy the share link', () => this.copyShareLinkFromCommand());
+      case 'enter-passphrase':
+        return this.guarded('unlock', () => this.enterPassphrase());
+    }
+  }
+
+  /** One of several, asked only when there really are several. */
+  private pick<T>(items: T[], text: (item: T) => string, placeholder: string, then: (item: T) => Promise<void> | void): void {
+    if (items.length === 0) return;
+    if (items.length === 1) {
+      void this.guarded('continue', () => then(items[0]));
+      return;
+    }
+    new ChoicePickerModal(this.app, items, text, placeholder, (item) => {
+      void this.guarded('continue', () => then(item));
+    }).open();
+  }
+
+  /**
+   * Share a vault folder: the given one from the folder menu, or one picked
+   * from the palette. On the cloud the organisation is chosen first, because
+   * a vault folder belongs to exactly one.
+   */
+  private async shareFromCommand(folder: TFolder | null): Promise<void> {
+    const tab = this.settingTab;
+    if (!tab) return;
+    const share = (server: FolderServer): void => {
+      const go = (f: TFolder): void => {
+        void this.guarded('share the folder', () => tab.shareFolder(f.path, f.name, server));
+      };
+      if (folder) go(folder);
+      else new FolderPickerModal(this.app, go).open();
+    };
+    if (this.settings.mode !== 'cloud') {
+      const server = this.servers()[0];
+      if (server) share(server);
+      return;
+    }
+    this.pick(this.settings.memberships, (m) => m.accountName, 'Share into which organisation?', (m) => share(this.serverForMembership(m.id)));
+  }
+
+  /** The existing members dialog, for a folder this vault owns. */
+  private showMembers(mapping: FolderMapping): void {
+    const folderId = mapping.sharedFolderId;
+    new FolderMembersModal(this.app, {
+      server: () => this.serverFor(folderId),
+      ownPublicKey: () => this.settings.keyMaterial?.publicKey ?? null,
+      folderKeys: () => this.folderCrypto.get(folderId),
+    }, folderId, mapping.sharedFolderName).open();
+  }
+
+  /** The folder of the open note when this vault owns it; otherwise asked. */
+  private showMembersFromCommand(): void {
+    const here = ownedMappingFor(this.app.workspace.getActiveFile()?.path ?? null, this.settings.folderMappings);
+    if (here) {
+      this.showMembers(here);
+      return;
+    }
+    this.pick(ownedMappings(this.settings.folderMappings), (m) => m.localPath, 'Members of which shared folder?', (m) => this.showMembers(m));
+  }
+
+  private copyShareLinkFromCommand(): void {
+    const tab = this.settingTab;
+    if (!tab) return;
+    this.pick(shareLinkMemberships(this.settings.memberships), (m) => m.accountName, "Which organisation's share link?", (m) => tab.copyShareLink(m));
+  }
+
+  /** The pane's "Enter passphrase", from the palette. */
+  private async enterPassphrase(): Promise<void> {
+    const tab = this.settingTab;
+    if (!tab) return;
+    const identity = this.settings.identity;
+    await tab.ensureIdentity(identity ? `Unlock the folders shared with ${identity.email}.` : 'Unlock your shared folders.');
+    this.refreshSettingsPane();
   }
 
   // -------------------------------------------------------------------------
@@ -2365,10 +1044,10 @@ export default class NectendaPlugin extends Plugin {
     // that is not yet connected into "disconnected": straight after a reconcile
     // it is connecting, and saying otherwise for that moment was a lie.
     const status = this.provider?.status();
-    if (status === 'connected') this.updateStatusBar('connected');
-    else if (status === 'connecting') this.updateStatusBar('offline');
-    else if (status === 'idle') this.updateStatusBar('idle');
-    else this.updateStatusBar('disconnected');
+    if (status === 'connected') this.updateStatus('connected');
+    else if (status === 'connecting') this.updateStatus('offline');
+    else if (status === 'idle') this.updateStatus('idle');
+    else this.updateStatus('disconnected');
     if (enrol) this.reportRefusedDevice(memberships);
     this.notifyChange('memberships');
   }
@@ -3393,6 +2072,11 @@ export default class NectendaPlugin extends Plugin {
     // A clean shutdown is not a crash, so nothing may be left looking like one.
     void this.deviceState?.endAttempt();
     this.stopSync();
+    this.oversizedNotes.dispose();
+    if (this.statusUiTimer) window.clearTimeout(this.statusUiTimer);
+    this.statusUiTimer = null;
+    this.headerStatus?.stop();
+    this.headerStatus = null;
   }
 
   startSync(): void {
@@ -3406,7 +2090,7 @@ export default class NectendaPlugin extends Plugin {
     this.provider.setFolderRoutes(this.folderRoutes());
     this.provider.on('status', (status: unknown) => {
       if (status === 'connected') {
-        this.updateStatusBar('connected');
+        this.updateStatus('connected');
         this.deviceLimitNotified = false;
         this.disconnectNotified = false;
         this.updateRequiredNotified = false;
@@ -3417,7 +2101,7 @@ export default class NectendaPlugin extends Plugin {
         void this.refreshAccountLimits().then(() => this.blobSync?.flushPending());
         this.startAttestation();
       } else if (status === 'device-limit') {
-        this.updateStatusBar('device-limit');
+        this.updateStatus('device-limit');
         // Once per episode, not once per retry. A refused device retries
         // slowly; asking the servers where it stands lets the membership
         // record the refusal and close this connection rather than knock.
@@ -3435,7 +2119,7 @@ export default class NectendaPlugin extends Plugin {
         // episode, like the siblings above: the provider retries slowly, and
         // one notice per retry would be a nag about something the person
         // cannot fix in the next thirty seconds.
-        this.updateStatusBar('update-required');
+        this.updateStatus('update-required');
         if (!this.updateRequiredNotified) {
           this.updateRequiredNotified = true;
           new Notice(
@@ -3445,22 +2129,22 @@ export default class NectendaPlugin extends Plugin {
           );
         }
       } else if (status === 'suspended') {
-        this.updateStatusBar('suspended');
+        this.updateStatus('suspended');
         this.reportAccountSuspended();
       } else if (status === 'moving') {
         // Short-lived: the organisation is being carried to another server.
         // Editing continues locally and the identity service names the new
-        // server within a minute; nothing to say beyond the status bar.
-        this.updateStatusBar('moving');
+        // server within a minute; nothing to say beyond the header icon.
+        this.updateStatus('moving');
         void this.refreshMemberships().catch(() => undefined);
       } else if (status === 'restarting') {
         // A deploy. Seconds long, retried quickly, and no notice: the
-        // status bar says so, and a notice would announce an outage that is
+        // header icon says so, and a notice would announce an outage that is
         // not one. If the window closes without a connection the provider
         // reports 'disconnected' and the branch below speaks.
-        this.updateStatusBar('restarting');
+        this.updateStatus('restarting');
       } else if (status === 'disconnected') {
-        this.updateStatusBar('offline');
+        this.updateStatus('offline');
         // Once per episode. A flapping link would otherwise stack a notice per
         // drop, and the sibling notices above already work this way.
         if (!this.disconnectNotified) {
@@ -3470,9 +2154,9 @@ export default class NectendaPlugin extends Plugin {
       } else if (status === 'signed-out') {
         // Transient: the handler below is asking the identity service what
         // this means, and ends in a reconnect or a sign-out.
-        this.updateStatusBar('signed-out');
+        this.updateStatus('signed-out');
       } else if (status === 'idle') {
-        this.updateStatusBar('idle');
+        this.updateStatus('idle');
       }
     });
     this.provider.on('signed-out', (id: unknown) => void this.handleSignedOutConnection(String(id)));
@@ -3481,7 +2165,15 @@ export default class NectendaPlugin extends Plugin {
 
     // Content sync for background file syncing
     const vaultAdapter = new ObsidianVaultAdapter(this.app.vault);
-    this.contentSync = new ContentSync(this, this.provider, vaultAdapter);
+    this.contentSync = new ContentSync({
+      hasKeys: (id) => this.folderCrypto.hasKeys(id),
+      docIndex: this.docIndex,
+      vaultKey: () => this.vaultKey,
+      mappings: () => this.settings.folderMappings,
+      checkNoteSize: (folderId, path, bytes) => this.oversizedNotes.check(folderId, path, bytes),
+      noteMoved: (folderId, from, to) => this.oversizedNotes.move(folderId, from, to),
+      noteGone: (folderId, path) => this.oversizedNotes.forget(folderId, path),
+    }, this.provider, vaultAdapter);
     // A file whose subscribe was refused for want of a connection is retried
     // when one appears, rather than waiting for something to touch it again.
     // Without this it stayed unconnected — looking healthy, syncing nothing —
@@ -3489,23 +2181,72 @@ export default class NectendaPlugin extends Plugin {
     this.provider.on('routes-changed', () => this.contentSync?.retryUnplaced());
 
     // File operations sync (meta docs)
-    this.fileSync = new FileSync(this, this.provider, vaultAdapter);
+    this.fileSync = new FileSync({
+      hasKeys: (id) => this.folderCrypto.hasKeys(id),
+      docIndex: this.docIndex,
+      vaultKey: () => this.vaultKey,
+      // Late, not captured: blobSync is assigned further down this method.
+      blobSync: () => this.blobSync ?? null,
+    }, this.provider, vaultAdapter);
     this.fileSync.setContentSync(this.contentSync);
 
     // Attachments
-    this.blobSync = new BlobSync(this, vaultAdapter);
+    this.blobSync = new BlobSync({
+      folderKeys: (id) => this.folderCrypto.get(id),
+      server: (id) => this.serverFor(id),
+      maxBlobBytes: () => this.maxBlobBytes(),
+      username: () => this.settings.username,
+      deviceState: () => this.deviceState,
+      // The listing owns the blobs map; attachment sync only reads and writes
+      // entries in it. Late, because fileSync is assigned just above and its
+      // meta document connects later still.
+      listing: () => this.fileSync ?? null,
+      // The three lists that outlive a restart. Read through, rather than
+      // captured: `settings` is replaced wholesale when it is reloaded.
+      oversized: {
+        get: () => this.settings.oversizedAttachments ?? [],
+        set: (keys) => { this.settings.oversizedAttachments = keys; },
+      },
+      pendingUploads: {
+        get: () => this.settings.pendingBlobUploads ?? [],
+        set: (keys) => { this.settings.pendingBlobUploads = keys; },
+      },
+      pendingDeletes: {
+        get: () => this.settings.pendingBlobDeletes ?? [],
+        set: (keys) => { this.settings.pendingBlobDeletes = keys; },
+      },
+      save: () => this.saveSettings(),
+      notify: {
+        confirmLargeDownload: (path, bytes) => this.confirmLargeDownload(path, bytes),
+        attachmentTooLarge: (path, bytes, limit) => this.reportAttachmentTooLarge(path, bytes, limit),
+        attachmentsNotIncluded: () => this.reportAttachmentsNotIncluded(),
+        accountSuspended: () => this.reportAccountSuspended(),
+        storageFull: (blobId) => this.reportStorageFull(blobId),
+      },
+    }, vaultAdapter);
 
     // Vault watcher for local file changes
-    this.vaultWatcher = new VaultWatcher(
-      this, this.fileSync, this.contentSync, vaultAdapter, this.blobSync,
-    );
+    this.vaultWatcher = new VaultWatcher({
+      app: this.app,
+      registerEvent: (ref) => this.registerEvent(ref),
+      mappings: () => this.settings.folderMappings,
+      onMappedFolderRename: (oldPath, newPath, moved) =>
+        this.handleMappedFolderRename(oldPath, newPath, moved),
+    }, this.fileSync, this.contentSync, vaultAdapter, this.blobSync);
     this.vaultWatcher.start();
 
     // Editor bridge for live collaborative editing
     // What collaborators see above this person's cursor: the display name on
     // Nectenda Cloud, the username on a self-hosted server.
-    const presenceName = this.settings.mode === 'cloud' ? this.settings.identity?.displayName || this.settings.identity?.email || 'someone' : this.settings.username;
-    this.editorBridge = new EditorBridge(this, this.contentSync, this.provider, presenceName, this.collabExts);
+    const presenceName = this.presenceName();
+    this.editorBridge = new EditorBridge({
+      app: this.app,
+      registerEvent: (ref) => this.registerEvent(ref),
+      docIndex: this.docIndex,
+      mappings: () => this.settings.folderMappings,
+      sharePointer: () => this.settings.sharePointer,
+      showPointers: () => this.settings.showPointers,
+    }, this.contentSync, this.provider, presenceName, this.collabExts);
     this.editorBridge.setPresenceCallback((people) => {
       this.updatePresence(people);
     });
@@ -3527,9 +2268,33 @@ export default class NectendaPlugin extends Plugin {
       }
     });
 
-    this.folderIndicator = new FolderIndicator(this);
+    this.folderIndicator = new FolderIndicator({
+      mappings: () => this.settings.folderMappings,
+      isStorageFull: () => this.isStorageFull(),
+    });
     this.folderIndicator.start();
-    this.updateStatusBar(this.provider.list().length ? 'connected' : 'idle');
+
+    // Per-file status. The provider reports on every keystroke and the engine
+    // on every attach; both only ask for a redraw, which is coalesced.
+    this.fileStatus = new FileStatusIndicator({
+      mappings: () => this.settings.folderMappings,
+      trackedDocs: () => this.contentSync?.trackedDocs() ?? [],
+      docSyncState: (docName) => this.provider?.docSyncState(docName) ?? null,
+      enabled: () => this.settings.fileStatusIcons,
+    });
+    this.fileStatus.start();
+    if (this.contentSync) this.contentSync.onStateChange = () => this.refreshStatusUi();
+    this.provider.on('doc-state', () => this.refreshStatusUi());
+
+    this.updateStatus(this.provider.list().length ? 'connected' : 'idle');
+  }
+
+  /** Turn the diagnostic log on or off: the settings toggle and the palette command. */
+  async setDiagnosticLog(on: boolean): Promise<void> {
+    this.settings.diagnosticLog = on;
+    await this.saveSettings();
+    this.applyDiagnosticLogSetting();
+    new Notice(on ? 'Diagnostic log enabled' : 'Diagnostic log disabled');
   }
 
   /**
@@ -3599,6 +2364,11 @@ export default class NectendaPlugin extends Plugin {
   stopSync(): void {
     this.vaultWatcher?.stop();
     this.vaultWatcher = null;
+    // Before the engine is dismantled: its teardown reports each detach, and a
+    // redraw fired from inside it would read state half taken apart.
+    if (this.contentSync) this.contentSync.onStateChange = null;
+    this.fileStatus?.stop();
+    this.fileStatus = null;
     this.contentSync?.disconnectAll();
     this.contentSync = null;
     // Before the provider goes, so every in-flight transfer is aborted while
@@ -3614,7 +2384,7 @@ export default class NectendaPlugin extends Plugin {
     this.editorBridge = null;
     this.provider?.destroy();
     this.provider = null;
-    this.updateStatusBar('disconnected');
+    this.updateStatus('disconnected');
   }
 
   /** Called when folder mappings change — no need to restart sync */
@@ -3631,8 +2401,10 @@ export default class NectendaPlugin extends Plugin {
     const mapped = new Set(this.settings.folderMappings.map((m) => m.sharedFolderId));
     const oversized = forgetUnmappedRecords(this.settings.oversizedAttachments ?? [], mapped);
     const pending = forgetUnmappedRecords(this.settings.pendingBlobUploads ?? [], mapped);
+    const notesChanged = this.oversizedNotes.forgetUnmapped(mapped);
     if (oversized.length === (this.settings.oversizedAttachments ?? []).length
-      && pending.length === (this.settings.pendingBlobUploads ?? []).length) return;
+      && pending.length === (this.settings.pendingBlobUploads ?? []).length
+      && !notesChanged) return;
     this.settings.oversizedAttachments = oversized;
     this.settings.pendingBlobUploads = pending;
     void this.saveSettings();
@@ -3666,7 +2438,7 @@ export default class NectendaPlugin extends Plugin {
   refreshSync(): void {
     this.pruneAttachmentRecords();
     // A folder the server no longer has is not reconnected: the sockets would
-    // be refused in silence and the status bar would claim it still syncs.
+    // be refused in silence and the header icon would claim it still syncs.
     // Unmapping it is what clears this, which is the person's own decision.
     const mapped = new Set(this.settings.folderMappings.map((m) => m.sharedFolderId));
     for (const id of [...this.goneFolders]) if (!mapped.has(id)) this.goneFolders.delete(id);
@@ -3692,26 +2464,81 @@ export default class NectendaPlugin extends Plugin {
     this.notifyChange('structure');
   }
 
-  updateStatusBar(status: 'connected' | 'disconnected' | 'offline' | 'restarting' | 'device-limit' | 'suspended' | 'moving' | 'signed-out' | 'update-required' | 'idle'): void {
-    if (!this.statusBarItem) return;
-    const labels: Record<string, string> = {
-      connected: 'Nectenda: Connected',
-      idle: 'Nectenda: Signed in — not syncing an organisation on this device',
-      disconnected: 'Nectenda: Disconnected',
-      'signed-out': 'Nectenda: Session ended — checking…',
-      // Says what is wrong rather than "offline", which would send the user
-      // looking for a network fault that does not exist.
-      'device-limit': 'Nectenda: Device limit reached',
-      suspended: 'Nectenda: Account suspended',
-      moving: 'Nectenda: Organisation moving servers…',
-      offline: 'Nectenda: Offline (reconnecting...)',
-      restarting: 'Nectenda: Server updating — back in a moment…',
-      'update-required': 'Nectenda: Update the plugin to keep syncing',
-    };
-    const invites = this.settings.pendingInvites?.length ?? 0;
-    this.statusBarItem.setText(labels[status]);
-    this.statusBarItem.setAttribute('aria-label', invites ? `${labels[status]} — ${invites} invitation(s) waiting` : labels[status]);
+  updateStatus(status: ConnectionStatus): void {
+    this.connectionStatus = status;
+    this.refreshStatusUi();
     this.notifyChange('connection');
+  }
+
+  /** A status lookup for one redraw, from the engine and provider as they stand. */
+  private statusIndex(): ReturnType<typeof buildStatusIndex> {
+    return buildStatusIndex({
+      mappings: () => this.settings.folderMappings,
+      trackedDocs: () => this.contentSync?.trackedDocs() ?? [],
+      docSyncState: (docName) => this.provider?.docSyncState(docName) ?? null,
+    });
+  }
+
+  /**
+   * Redraw the header icons, the explorer marks and any open inspector, once
+   * per burst. Coalesced because the provider reports on every keystroke.
+   */
+  refreshStatusUi(): void {
+    if (this.statusUiTimer) return;
+    this.statusUiTimer = window.setTimeout(() => {
+      this.statusUiTimer = null;
+      this.headerStatus?.refresh();
+      this.fileStatus?.refresh();
+      for (const leaf of this.app.workspace.getLeavesOfType(INSPECTOR_VIEW)) {
+        if (isInspector(leaf.view)) leaf.view.refresh();
+      }
+    }, 250);
+  }
+
+  private inspectorDeps(): InspectorDeps {
+    return {
+      trackedDocs: () => this.contentSync?.trackedDocs() ?? [],
+      docSyncState: (docName) => this.provider?.docSyncState(docName) ?? null,
+      diskMatchesDocument: (docName) => this.contentSync?.diskMatchesDocument(docName) ?? Promise.resolve(null),
+      inSharedFolder: (path) => this.settings.folderMappings.some((m) => path.startsWith(`${m.localPath}/`)),
+    };
+  }
+
+  /** Show the inspector in the right sidebar, pointed at a note or the active one. */
+  async openInspector(path: string | null): Promise<void> {
+    let leaf = this.app.workspace.getLeavesOfType(INSPECTOR_VIEW)[0];
+    if (!leaf) {
+      const right = this.app.workspace.getRightLeaf(false);
+      if (!right) return;
+      await right.setViewState({ type: INSPECTOR_VIEW, active: true });
+      leaf = right;
+    }
+    await this.app.workspace.revealLeaf(leaf);
+    if (isInspector(leaf.view)) leaf.view.show(path);
+  }
+
+  openSettingsTab(): void {
+    const setting = (this.app as unknown as { setting?: { open(): void; openTabById(id: string): void } }).setting;
+    setting?.open();
+    setting?.openTabById(this.manifest.id);
+  }
+
+  /**
+   * The pointer switches, shared by the settings pane and the header menu so
+   * the two cannot drift: turning sharing off has to withdraw the last
+   * position sent, or it stays on everyone else's screen with no next move to
+   * replace it.
+   */
+  async setSharePointer(on: boolean): Promise<void> {
+    this.settings.sharePointer = on;
+    await this.saveSettings();
+    if (!on) this.editorBridge?.clearPointer();
+  }
+
+  async setShowPointers(on: boolean): Promise<void> {
+    this.settings.showPointers = on;
+    await this.saveSettings();
+    this.editorBridge?.refreshPointers();
   }
 
   private updateRequiredNotified = false;
@@ -3742,6 +2569,27 @@ export default class NectendaPlugin extends Plugin {
   /** Guards the device-limit Notice so a slow retry loop cannot spam it. */
   private deviceLimitNotified = false;
   private disconnectNotified = false;
+
+  /**
+   * Notes too large to sync, named when they arrive (SAFE-A12).
+   *
+   * MiB to one decimal rather than `formatBytes`, which rounds past 10 and would
+   * print a note just over the limit as the same "16 MB" as the limit itself.
+   */
+  reportOversizedNotes(notes: OversizedNote[]): void {
+    log.warn('Notes too large to sync', {
+      notes: notes.map((n) => ({ relativePath: n.relativePath, bytes: n.bytes })),
+    });
+    new Notice(describeOversizedNotes(notes, mib), 15000);
+  }
+
+  /** Size on disk of a note in a mapped folder, or null when it is not there. */
+  noteSize(sharedFolderId: string, relativePath: string): number | null {
+    const mapping = this.settings.folderMappings.find((m) => m.sharedFolderId === sharedFolderId);
+    if (!mapping) return null;
+    const file = this.app.vault.getAbstractFileByPath(`${mapping.localPath}/${relativePath}`);
+    return file instanceof TFile ? file.stat.size : null;
+  }
 
   /**
    * An attachment was refused because the account is full.
@@ -3876,14 +2724,17 @@ export default class NectendaPlugin extends Plugin {
   /**
    * Who else is in this note.
    *
-   * Rendered twice, deliberately. The circles are the fast read; the status bar
-   * keeps words because the design system's rule is that presence must never be
-   * identified by colour alone — and a reader who cannot separate teal from
-   * indigo, or who has the note header hidden, still gets the count.
+   * Rendered twice, deliberately. The circles are the fast read; the header
+   * icon keeps a number and words because the design system's rule is that
+   * presence must never be identified by colour alone — a reader who cannot
+   * separate teal from indigo still gets the count from the badge, and the
+   * names from the icon's label and menu. This used to be status-bar text,
+   * which also covered a hidden note header; it moved because mobile has no
+   * status bar at all, which left nobody there with a count.
    */
   updatePresence(people: Person[]): void {
     this.renderPresenceStack(people);
-    this.updatePresenceCount(people.length);
+    this.updatePresenceCount(people);
   }
 
   /**
@@ -3926,18 +2777,22 @@ export default class NectendaPlugin extends Plugin {
     }
   }
 
-  updatePresenceCount(count: number): void {
-    if (!this.statusBarItem) return;
-    if (count <= 0) {
-      // Nobody else in this document is not the same as no connection, and
-      // saying "Disconnected" here sent us looking for a network fault that did
-      // not exist.
-      this.statusBarItem.setText('Nectenda: Connected');
-    } else if (count === 1) {
-      this.statusBarItem.setText('Nectenda: Online (just you)');
-    } else {
-      this.statusBarItem.setText(`Nectenda: ${count} online`);
-    }
+  /** The name this device shows to others in a note. */
+  private presenceName(): string {
+    return this.settings.mode === 'cloud' ? this.settings.identity?.displayName || this.settings.identity?.email || 'someone' : this.settings.username;
+  }
+
+  /**
+   * Others in the active note, for the badge on the header icon. Counted by
+   * name, the way the circles are, and without this device's own name: the
+   * local entry is absent while no editor is bound, so subtracting one would
+   * undercount exactly then.
+   */
+  updatePresenceCount(people: Person[]): void {
+    const others = countOthers(people, this.editorBridge?.broadcastName() ?? this.presenceName());
+    if (others === this.presenceOthers) return;
+    this.presenceOthers = others;
+    this.refreshStatusUi();
   }
 
   /** Called when a 401 response indicates the JWT has expired */
@@ -4062,8 +2917,54 @@ export class NectendaSettingTab extends PluginSettingTab {
     this.plugin = plugin;
   }
 
+  /**
+   * Folder keys, and the rules about when not to ask for them.
+   *
+   * Every dependency is an arrow calling through `this`, so they bind at call
+   * time: `apiFetch` needs `this.update()`, and a test that replaces one of
+   * these on the instance still replaces what the service reaches.
+   *
+   * `prompt` and `held` are the same keypair by two routes, and the difference
+   * is the point — `held` never asks, so anything reached from a render cannot
+   * raise a password prompt.
+   */
+  private keys = new FolderKeyService({
+    fetch: (url, init) => this.apiFetch(url, init),
+    prompt: (reason) => this.ensureIdentity(reason),
+    held: () => this.plugin.sessionKeys?.identity ?? null,
+    // Two call sites asked this two ways — `get(id) !== null` and
+    // `hasKeys(id)`. Both read the same map, so the service asks once.
+    hasKeys: (id) => this.plugin.folderCrypto.hasKeys(id),
+    remember: (k) => this.plugin.rememberFolderKeys(k),
+    serverFor: (id) => this.plugin.serverFor(id),
+    serverForMembership: (id) => this.plugin.serverForMembership(id),
+    ownPublicKey: () => {
+      const publicKey = this.plugin.settings.keyMaterial?.publicKey;
+      if (!publicKey) throw new Error('This account has no encryption keys enrolled');
+      return publicKey;
+    },
+  });
+
+  /**
+   * The identity keypair, and the rules about not replacing it.
+   *
+   * Arrows through `this` for the same reason as `keys` above: `ask` and
+   * `enrol` open modals that need `this.app`, and `account` must be read late
+   * because `refreshMemberships` rewrites `keyMaterial` on a timer.
+   */
+  private identity = new IdentitySession({
+    account: () => this.plugin.settings,
+    held: () => this.plugin.sessionKeys?.identity ?? null,
+    cache: (keys) => { this.plugin.sessionKeys = keys; },
+    restoreFromDevice: () => this.plugin.restoreIdentity(),
+    rememberOnDevice: (identity) => this.plugin.rememberIdentity(identity),
+    ask: (reason, verify) => this.promptForPassphrase(reason, verify),
+    enrol: () => this.setCloudPassphrase(),
+    notify: (message) => { new Notice(message); },
+  });
+
   /** Fetch wrapper that handles session expiry (401) automatically */
-  private async apiFetch(input: string, init?: RequestInit): Promise<Response> {
+  async apiFetch(input: string, init?: RequestInit): Promise<Response> {
     const res = await serverFetch(input, init);
     if (res.status === 401 && this.plugin.isSignedIn()) {
       await this.plugin.handleSessionExpired();
@@ -4231,6 +3132,7 @@ export class NectendaSettingTab extends PluginSettingTab {
       ...(unclaimedMappings(settings.folderMappings, settings.memberships.length).length > 0
         ? [host('Folders needing attention', (el) => this.displayUnclaimedMappings(el))]
         : []),
+      host('Collaboration', (el) => this.displayCollaboration(el)),
       host('Encryption', (el) => this.displayEncryption(el)),
       host('Signed-in vaults', (el) => this.displayCloudDevices(el)),
       host('Troubleshooting', (el) => this.displayTroubleshooting(el)),
@@ -4259,7 +3161,7 @@ export class NectendaSettingTab extends PluginSettingTab {
     this.slots = {};
     this.accountSlots.clear();
     this.folderSlots.clear();
-    this.envelopeChecked.clear();
+    this.keys.recheck();
   }
 
   hide(): void {
@@ -4299,7 +3201,7 @@ export class NectendaSettingTab extends PluginSettingTab {
   private scheduleRefresh(reason: ChangeReason | 'poll'): void {
     // A poll, or a change to the folders, is a fresh chance that a key has
     // been wrapped for us; a burst of connection edges is not.
-    if (reason === 'poll' || reason === 'structure') this.envelopeChecked.clear();
+    if (reason === 'poll' || reason === 'structure') this.keys.recheck();
     for (const section of sectionsFor(reason)) this.pendingSections.add(section);
     if (this.flushTimer) return;
     this.flushTimer = window.setTimeout(() => {
@@ -4839,6 +3741,7 @@ export class NectendaSettingTab extends PluginSettingTab {
     // Shared Folders section
     this.displaySharedFolders(containerEl, this.plugin.servers()[0]);
 
+    this.displayCollaboration(containerEl);
     this.displayEncryption(containerEl);
     this.displayAccount(containerEl);
 
@@ -5056,24 +3959,23 @@ export class NectendaSettingTab extends PluginSettingTab {
         }),
       )
       .addButton((btn) =>
-        btn.setButtonText('Share link').onClick(async () => {
-          try {
-            const server = this.plugin.serverForMembership(m.id);
-            const res = await this.apiFetch(`${server.base}/account/share-key`, { headers: { Authorization: `Bearer ${server.token}` } });
-            if (!res.ok) throw new Error('The server did not reveal the share key');
-            const { shareKey, enabled } = (await res.json()) as { shareKey: string; enabled: boolean };
-            if (!enabled) {
-              new Notice('The share link is turned off for this organisation.');
-              return;
-            }
-            const link = `obsidian://nectenda?key=${encodeURIComponent(shareKey)}&endpoint=${encodeURIComponent(m.endpoint)}`;
-            await navigator.clipboard.writeText(link);
-            new Notice('Share link copied. Anyone with it can take a seat, so send it only to people you mean to.');
-          } catch (err) {
-            new Notice(err instanceof Error ? err.message : 'Could not fetch the share link');
-          }
-        }),
+        btn.setButtonText('Share link').onClick(() => this.copyShareLink(m)),
       );
+  }
+
+  /** Copy an organisation's share link. The pane's button and the palette command both land here. */
+  async copyShareLink(m: StoredMembership): Promise<void> {
+    try {
+      const result = await shareLinkFor(m, this.plugin.serverForMembership(m.id), (url, init) => this.apiFetch(url, init));
+      if (!result.enabled) {
+        new Notice('The share link is turned off for this organisation.');
+        return;
+      }
+      await navigator.clipboard.writeText(result.link);
+      new Notice('Share link copied. Anyone with it can take a seat, so send it only to people you mean to.');
+    } catch (err) {
+      new Notice(err instanceof Error ? err.message : 'Could not fetch the share link');
+    }
   }
 
   private displayOrganisationControls(containerEl: HTMLElement): void {
@@ -5330,7 +4232,11 @@ export class NectendaSettingTab extends PluginSettingTab {
         .setDesc('See what is taking up space and delete what you no longer need.')
         .addButton((b) =>
           b.setButtonText('Manage').onClick(() => {
-            new ManageStorageModal(this.app, this.plugin, () => this.update()).open();
+            new ManageStorageModal(this.app, {
+              mappings: () => this.plugin.settings.folderMappings,
+              stored: (id) => this.plugin.storedAttachments(id),
+              remove: (id, relativePath) => this.plugin.deleteAttachment(id, relativePath),
+            }, () => this.update()).open();
           }),
         );
 
@@ -5353,6 +4259,9 @@ export class NectendaSettingTab extends PluginSettingTab {
     redraw('attachments', [
       this.plugin.settings.pendingBlobUploads,
       this.plugin.settings.oversizedAttachments,
+      // What is on disk, not the record: a listed note deleted or resized
+      // changes nothing in the record until this reads it.
+      this.plugin.oversizedNotes.listStillOversized((f, p) => this.plugin.noteSize(f, p)),
       this.plugin.strandedAttachments(),
       this.plugin.attachmentSettingWillStrandFiles(),
       this.plugin.deviceState?.skippedEntries() ?? [],
@@ -5681,9 +4590,14 @@ export class NectendaSettingTab extends PluginSettingTab {
     const stranded = this.plugin.strandedAttachments();
     const misconfigured = this.plugin.attachmentSettingWillStrandFiles();
     const oversizedCount = (this.plugin.settings.oversizedAttachments ?? []).length;
-    if (stranded.length === 0 && !misconfigured && oversizedCount === 0) return;
+    // Read from disk each time, which also drops notes since trimmed or gone.
+    const largeNotes = this.plugin.oversizedNotes.listStillOversized(
+      (folderId, path) => this.plugin.noteSize(folderId, path),
+    );
+    if (stranded.length === 0 && !misconfigured && oversizedCount === 0 && largeNotes.length === 0) return;
 
-    containerEl.createEl('h4', { text: 'Attachments that will not sync' });
+    // "Files", not "Attachments": notes too large to sync are listed here too.
+    containerEl.createEl('h4', { text: 'Files that will not sync' });
 
     if (misconfigured) {
       new Setting(containerEl)
@@ -5709,6 +4623,27 @@ export class NectendaSettingTab extends PluginSettingTab {
     // Both lists are files with a problem, so they share one box. The row
     // above is a setting to change, not a file, and stays outside it.
     const problems = rowGroup(containerEl);
+
+    // No "Try again" here, unlike an attachment: a held note retries by itself
+    // on its next edit (SAFE-A11), so the button would have nothing to do.
+    for (const note of largeNotes) {
+      const mapping = this.plugin.settings.folderMappings.find((m) => m.sharedFolderId === note.sharedFolderId);
+      if (!mapping) continue;
+      const path = `${mapping.localPath}/${note.relativePath}`;
+      new Setting(problems)
+        .setName(path)
+        .setDesc(
+          `A note of ${mib(note.bytes)}, over the ${mib(MAX_PUSH_BYTES)} limit for a note, so it `
+            + 'does not sync. It stays on this device. Split it or remove the large part, '
+            + 'and it syncs by itself.',
+        )
+        .addButton((b) =>
+          b.setButtonText('Open').onClick(() => {
+            void this.app.workspace.openLinkText(path, '', false);
+          }),
+        );
+    }
+
     const oversized = this.plugin.settings.oversizedAttachments ?? [];
     for (const key of oversized) {
       const gap = key.indexOf(' ');
@@ -6054,7 +4989,11 @@ export class NectendaSettingTab extends PluginSettingTab {
           if (folder.role === 'owner') {
             setting.addButton((btn) =>
               btn.setButtonText('Members').onClick(() => {
-                new FolderMembersModal(this.app, this.plugin, folder.id, folder.name).open();
+                new FolderMembersModal(this.app, {
+                  server: () => this.plugin.serverFor(folder.id),
+                  ownPublicKey: () => this.plugin.settings.keyMaterial?.publicKey ?? null,
+                  folderKeys: () => this.plugin.folderCrypto.get(folder.id),
+                }, folder.id, folder.name).open();
               }),
             );
           }
@@ -6115,7 +5054,28 @@ export class NectendaSettingTab extends PluginSettingTab {
     }
   }
 
-  private async shareFolder(path: string, name: string, server: FolderServer, container: HTMLElement): Promise<void> {
+  /**
+   * Paths with a share or a map under way. Either adds its mapping only after
+   * a round trip (the server for a share, the key unwrap for a map), so the
+   * covering check alone lets a second one onto the same path while the first
+   * is in flight — two mappings for one vault folder, the replacement it
+   * exists to stop. The pane's picker, the palette and the folder menu can
+   * each start a share, and the pane's folder list can start a map.
+   */
+  private sharing = new Set<string>();
+
+  /** The in-flight path overlapping `path`, if any; otherwise claims it and returns undefined. */
+  private claimPath(path: string): string | undefined {
+    const inFlight = [...this.sharing].find((p) => mappingCovering(path, [{ sharedFolderId: '', sharedFolderName: '', localPath: p }]));
+    if (inFlight !== undefined) {
+      new Notice(`"${inFlight}" is being shared or mapped already. Wait for that to finish.`);
+      return inFlight;
+    }
+    this.sharing.add(path);
+    return undefined;
+  }
+
+  async shareFolder(path: string, name: string, server: FolderServer, container: HTMLElement | null = null): Promise<void> {
     // A vault folder belongs to one organisation. Sharing a path that is
     // mapped already — here or anywhere else — used to replace the earlier
     // mapping without a word; it is refused, naming what is in the way.
@@ -6124,6 +5084,15 @@ export class NectendaSettingTab extends PluginSettingTab {
       new Notice(this.alreadySharedMessage(path, covering));
       return;
     }
+    if (this.claimPath(path) !== undefined) return;
+    try {
+      await this.doShareFolder(path, name, server, container);
+    } finally {
+      this.sharing.delete(path);
+    }
+  }
+
+  private async doShareFolder(path: string, name: string, server: FolderServer, container: HTMLElement | null): Promise<void> {
     const membershipId = server.membershipId;
     try {
       const { base } = server;
@@ -6183,7 +5152,11 @@ export class NectendaSettingTab extends PluginSettingTab {
 
       new Notice(`Folder "${name}" shared and mapped`);
       // Redraw the list in place: a rebuild of the pane would close the page.
-      await this.loadSharedFolders(container, server);
+      // A share from the palette or the folder menu passes no container, but
+      // settings open in a window of their own on 1.13, so the organisation's
+      // page may be on screen beside it; its list is redrawn where it is.
+      const list = container ?? this.folderSlots.get(server.base)?.el ?? null;
+      if (list) await this.loadSharedFolders(list, server);
     } catch (err) {
       log.error('Failed to share folder:', err);
       new Notice('Failed to share folder');
@@ -6286,150 +5259,29 @@ export class NectendaSettingTab extends PluginSettingTab {
 
   /** This account's identity public key, for sealing a folder key to itself. */
   private async ownPublicKey(): Promise<string> {
-    const publicKey = this.plugin.settings.keyMaterial?.publicKey;
-    if (!publicKey) throw new Error('This account has no encryption keys enrolled');
-    return publicKey;
+    return this.keys.ownPublicKey();
   }
 
   private async publishKeys(
     folderId: string,
     keys: Omit<FolderKeyRecord, 'folderId'>[],
-    server: { base: string; token: string } = this.plugin.serverFor(folderId),
+    server?: { base: string; token: string },
   ): Promise<void> {
-    const res = await this.apiFetch(`${server.base}/folders/${folderId}/keys`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${server.token}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ keys }),
-    });
-    if (!res.ok) throw new Error(`Server refused the folder keys (${res.status})`);
+    return this.keys.publish(folderId, keys, server);
   }
 
-  /**
-   * The identity keypair, asking for the password if this session has none.
-   *
-   * Held for the rest of the session once unlocked, and — where the OS gives
-   * somewhere to hold it — for the device, so this is asked once per machine
-   * rather than once per vault. It used to say "never written down"; that
-   * stopped being true. See docs/key-storage.md.
-   */
-  private async ensureIdentity(reason: string): Promise<CryptoKeyPair | null> {
-    const existing = this.plugin.sessionKeys?.identity;
-    if (existing) return existing;
-
-    // Held for this device, where the OS provides somewhere to hold it. Asked
-    // here as well as at startup so that signing in partway through a session
-    // gets the same answer, rather than the cache depending on onload timing.
-    const held = await this.plugin.restoreIdentity();
-    if (held) {
-      this.plugin.sessionKeys = { identity: held };
-      return held;
-    }
-
-    const { username, keyMaterial, serverUrl, mode } = this.plugin.settings;
-    const enrolled = !!keyMaterial?.publicKey;
-    const unlockable = enrolled && !!keyMaterial?.wrappedPrivateKey;
-
-    // Three states, not two. This used to branch on `wrappedPrivateKey` alone —
-    // the only guard in the file that did, against fourteen testing
-    // `publicKey` — so key material with a public key and no wrapped key fell
-    // into enrolment and generated a *new* keypair, orphaning every folder key
-    // ever wrapped to the old one. Silent, permanent, and one missing field
-    // away. `unlockIdentity` already requires both halves; this now agrees.
-    if (!enrolled && !keyMaterial?.wrappedPrivateKey) {
-      if (mode === 'cloud') {
-        // No keys at all: this is the first device. Setting the passphrase is
-        // the enrolment, and it leaves the keypair unlocked in memory.
-        if (await this.setCloudPassphrase()) return this.plugin.sessionKeys?.identity ?? null;
-        return null;
-      }
-      new Notice('This account has no encryption keys enrolled. Log in again to enrol them.');
-      return null;
-    }
-
-    if (!unlockable) {
-      // Half-enrolled. Never offer to set a passphrase here: that would replace
-      // the keypair the account's folder keys are wrapped to.
-      new Notice('This account\u2019s encryption keys are incomplete. Sign in again, or recover with your recovery key.');
-      log.error('Key material is half-enrolled; refusing to re-enrol over it', {
-        hasPublicKey: enrolled, hasWrappedPrivateKey: !!keyMaterial?.wrappedPrivateKey,
-      });
-      return null;
-    }
-
-    // Self-hosted needs its KDF parameters from the server, and they are
-    // fetched once here rather than inside each attempt. The prompt retries in
-    // place, so folding this into the attempt would spend one request per guess
-    // against `kdfParamsLimiter` (60 per 15 minutes per IP) and start answering
-    // a mistyping user with 429s. The call verifies nothing — the same salt and
-    // iteration count come back whatever is typed. The hosted service needs no
-    // equivalent: its parameters are already in `keyMaterial`.
-    let selfHostedParams: KdfParams | null = null;
-    if (mode !== 'cloud') {
-      try {
-        selfHostedParams = await session.fetchUnlockParams(serverUrl, username);
-      } catch (err) {
-        new Notice('Could not reach your server to unlock. Check the connection and try again.');
-        log.warn('Could not fetch the KDF parameters for an unlock', { error: String(err) });
-        return null;
-      }
-    }
-
-    const unlocked = await this.promptForPassphrase(reason, (password) =>
-      this.verifyPassphrase(password, keyMaterial, selfHostedParams),
-    );
-    if (!unlocked) {
-      // Said rather than silent: a dismissed prompt used to leave no trace at
-      // all, and the folders it would have opened just render as locked.
-      new Notice('Passphrase not entered. Your shared folders stay locked until it is.');
-      return null;
-    }
-    return this.plugin.sessionKeys?.identity ?? null;
+  /** The identity keypair, asking for the password if this session has none. */
+  async ensureIdentity(reason: string): Promise<CryptoKeyPair | null> {
+    return this.identity.ensure(reason);
   }
 
-  /**
-   * One attempt at the passphrase, as an outcome rather than an exception.
-   *
-   * Split from the prompt so it can be tested without a modal, and so the two
-   * failures stay distinguishable: a wrong passphrase is a typo and is offered
-   * another go; halves that do not belong together are not, and say so.
-   *
-   * On success the keys land in `sessionKeys`, which holds them for the rest of
-   * the Obsidian session even where nothing can be written to a credential
-   * store, and `rememberIdentity` keeps them for the device where it can.
-   */
+  /** One attempt at the passphrase, as an outcome rather than an exception. */
   private async verifyPassphrase(
     password: string,
     keyMaterial: KeyMaterial & { kdfParams?: KdfParams | null },
     selfHostedParams: KdfParams | null,
   ): Promise<VerifyOutcome> {
-    // Taken as an argument, not re-read from settings. The caller checked both
-    // halves are present, and `refreshMemberships` rewrites `keyMaterial` from
-    // the server on a timer of its own — re-reading here would let it change
-    // between the check and the attempt.
-    const { mode } = this.plugin.settings;
-    try {
-      const keys = mode === 'cloud'
-        ? await session.cloudUnlock(password, { ...keyMaterial, kdfParams: keyMaterial.kdfParams ?? null })
-        : await session.unlockWith(selfHostedParams!, password, keyMaterial);
-      if (!(await identityPairs(keys.identity))) {
-        // The passphrase was right — AES-GCM proved that by opening the blob.
-        // The halves not belonging together means the material is corrupt or
-        // was substituted, which must not read as a typo and must not invite
-        // another attempt.
-        log.error('Unwrapped identity does not pair with the stored public key');
-        new Notice('Your encryption keys did not verify. Do not enter your passphrase again until you know why.');
-        return { ok: false, fatal: true, message: 'Your encryption keys did not verify.' };
-      }
-      this.plugin.sessionKeys = keys;
-      await this.plugin.rememberIdentity(keys.identity);
-      return { ok: true };
-    } catch (err) {
-      log.warn('Identity unlock failed', { error: String(err) });
-      return { ok: false, message: 'That passphrase did not open your key.' };
-    }
+    return this.identity.verify(password, keyMaterial, selfHostedParams);
   }
 
   /** Open the prompt and resolve once it is unlocked, cancelled or dismissed. */
@@ -6444,61 +5296,33 @@ export class NectendaSettingTab extends PluginSettingTab {
 
   /** Fetch this folder's wrapped keys and unwrap them. False when unusable. */
   private async loadFolderKeys(folderId: string, folderName = 'this folder', membershipId: string | null = null): Promise<boolean> {
-    // Already held: no fetch, and — more to the point — no password prompt.
-    // ensureIdentity below will ask for one, and asking again for keys this
-    // device has already unwrapped is a prompt the user cannot make sense of.
-    if (this.plugin.folderCrypto.get(folderId)) return true;
-
-    const identity = await this.ensureIdentity(
-      `Unlocking the encryption key for “${folderName}”.`,
-    );
-    if (!identity) return false;
-    const server = membershipId ? this.plugin.serverForMembership(membershipId) : this.plugin.serverFor(folderId);
-    return this.fetchFolderKeys(folderId, identity, server);
+    return this.keys.load(folderId, folderName, membershipId);
   }
 
-  /**
-   * Fetch this folder's wrapped keys and unwrap them with an identity already
-   * in hand. Never prompts, so the pane's own rendering can call it. False
-   * when the server holds nothing this identity can open — a folder shared
-   * before a key was wrapped for us — or on any failure.
-   */
+  /** As above, with an identity already in hand. Never prompts. */
   private async fetchFolderKeys(folderId: string, identity: CryptoKeyPair, server: { base: string; token: string }): Promise<boolean> {
-    try {
-      const res = await this.apiFetch(`${server.base}/folders/${folderId}/keys`, {
-        headers: { Authorization: `Bearer ${server.token}` },
-      });
-      if (!res.ok) return false;
-      const { keys } = (await res.json()) as { keys: FolderKeyRecord[] };
-      const unwrapped = await unwrapFolderKeys(folderId, keys, identity.privateKey);
-      if (!unwrapped) return false;
-      await this.plugin.rememberFolderKeys(unwrapped);
-      return true;
-    } catch (err) {
-      log.error('Could not load folder keys', { folderId, error: String(err) });
-      return false;
-    }
+    return this.keys.fetch(folderId, identity, server);
   }
 
-  /**
-   * Folders this device holds no key for, asked about once per poll while the
-   * pane is open — and only when the passphrase is already in memory, so a
-   * render never raises a prompt. Keys were fetched only on map or unlock
-   * before, so a folder shared with this person stayed "Locked folder (…)"
-   * however long they looked at it.
-   */
-  private envelopeChecked = new Set<string>();
-
+  /** Open what this device has no key for yet. Safe to call from a render. */
   private async openEnvelopes(folders: Array<{ id: string }>, server: FolderServer): Promise<void> {
-    const identity = this.plugin.sessionKeys?.identity;
-    if (!identity) return;
-    for (const f of folders) {
-      if (this.plugin.folderCrypto.hasKeys(f.id) || this.envelopeChecked.has(f.id)) continue;
-      if (!(await this.fetchFolderKeys(f.id, identity, server))) this.envelopeChecked.add(f.id);
-    }
+    return this.keys.openEnvelopes(folders, server);
   }
 
   private async mapFolder(
+    folder: SharedFolderInfo & { role?: FolderRole; membershipId?: string | null },
+    localPath: string,
+    container: HTMLElement,
+  ): Promise<void> {
+    if (this.claimPath(localPath) !== undefined) return;
+    try {
+      await this.doMapFolder(folder, localPath, container);
+    } finally {
+      this.sharing.delete(localPath);
+    }
+  }
+
+  private async doMapFolder(
     folder: SharedFolderInfo & { role?: FolderRole; membershipId?: string | null },
     localPath: string,
     container: HTMLElement,
@@ -6631,6 +5455,55 @@ export class NectendaSettingTab extends PluginSettingTab {
       );
   }
 
+  /**
+   * The two pointer switches. Separate on purpose, because they answer
+   * different questions: the first is privacy (may others see where my mouse
+   * is?), the second is noise (do I want to see theirs?). Turning off one says
+   * nothing about the other.
+   */
+  private displayCollaboration(containerEl: HTMLElement): void {
+    containerEl.createEl('h3', { text: 'Collaboration' });
+
+    new Setting(containerEl)
+      .setName('Share my mouse pointer')
+      .setDesc(
+        'Let people with the same note open see where your mouse is, with your name beside it. ' +
+          'It is encrypted like your cursor, so the server cannot read it. ' +
+          'Turn this off to keep your pointer to yourself.',
+      )
+      .addToggle((toggle) =>
+        toggle.setValue(this.plugin.settings.sharePointer).onChange(async (value) => {
+          await this.plugin.setSharePointer(value);
+        }),
+      );
+
+    new Setting(containerEl)
+      .setName("Show collaborators' mouse pointers")
+      .setDesc(
+        "Draw where other people's mice are in the note you have open. " +
+          'Turning this off only hides them on this device; it does not stop yours being shared.',
+      )
+      .addToggle((toggle) =>
+        toggle.setValue(this.plugin.settings.showPointers).onChange(async (value) => {
+          await this.plugin.setShowPointers(value);
+        }),
+      );
+
+    new Setting(containerEl)
+      .setName('Show sync status in the file explorer')
+      .setDesc(
+        'Mark each note in a shared folder with whether the server has every change from this device. ' +
+          'Hover a mark to see what it means.',
+      )
+      .addToggle((toggle) =>
+        toggle.setValue(this.plugin.settings.fileStatusIcons).onChange(async (value) => {
+          this.plugin.settings.fileStatusIcons = value;
+          await this.plugin.saveSettings();
+          this.plugin.fileStatus?.apply();
+        }),
+      );
+  }
+
   private displayTroubleshooting(containerEl: HTMLElement): void {
     containerEl.createEl('h3', { text: 'Troubleshooting' });
 
@@ -6642,12 +5515,7 @@ export class NectendaSettingTab extends PluginSettingTab {
           'unless you are chasing something. Capped at 5 MB and never sent anywhere on its own.',
       )
       .addToggle((toggle) =>
-        toggle.setValue(this.plugin.settings.diagnosticLog).onChange(async (value) => {
-          this.plugin.settings.diagnosticLog = value;
-          await this.plugin.saveSettings();
-          this.plugin.applyDiagnosticLogSetting();
-          new Notice(value ? 'Diagnostic log enabled' : 'Diagnostic log disabled');
-        }),
+        toggle.setValue(this.plugin.settings.diagnosticLog).onChange((value) => this.plugin.setDiagnosticLog(value)),
       );
 
     // Only where there is somewhere to send them. Against a self-hosted
@@ -6973,281 +5841,4 @@ export class NectendaSettingTab extends PluginSettingTab {
   }
 }
 
-/**
- * Asked before opening an attachment larger than this device has handled.
- *
- * The wording matters more than the buttons. A user who is told "this might not
- * work" and then watches the app vanish has been dealt with honestly; one who is
- * told nothing concludes the app is broken. And the cost of saying no is stated,
- * because "skip" sounds permanent and is not.
- */
-/**
- * "This cannot be undone" is the whole of it, so the modal says what goes and
- * what stays before it says it.
- */
-class UnshareFolderModal extends Modal {
-  private answered = false;
 
-  constructor(app: App, private readonly folderName: string, private readonly others: number | null, private readonly decide: (proceed: boolean) => void) {
-    super(app);
-  }
-
-  onOpen(): void {
-    const { contentEl } = this;
-    contentEl.createEl('h3', { text: `Unshare "${this.folderName}"?` });
-    contentEl.createEl('p', {
-      text: 'This removes the folder from the server: its copy of every note, the edit history, and every attachment — for everyone.',
-    });
-    if (this.others !== null && this.others > 0) {
-      contentEl.createEl('p', {
-        text: `${this.others} other ${this.others === 1 ? 'person' : 'people'} will stop receiving changes.`,
-      });
-    }
-    contentEl.createEl('p', {
-      text: 'Nothing on disk changes. The notes in this vault stay where they are, and everyone keeps theirs as ordinary files. '
-        + 'This cannot be undone: sharing the folder again makes a new one, with a new history.',
-      cls: 'setting-item-description',
-    });
-
-    new Setting(contentEl)
-      .addButton((b) => b.setButtonText('Keep sharing').onClick(() => this.answer(false)))
-      .addButton((b) => b.setButtonText('Unshare').setDestructive().onClick(() => this.answer(true)));
-  }
-
-  private answer(proceed: boolean): void {
-    this.answered = true;
-    this.decide(proceed);
-    this.close();
-  }
-
-  onClose(): void {
-    this.contentEl.empty();
-    // Dismissing is not consent to something that cannot be undone.
-    if (!this.answered) this.decide(false);
-  }
-}
-
-/**
- * Removing the device you are sitting at, confirmed.
- *
- * `window.confirm` did this until 18 September 2026. Obsidian's review flags it,
- * and it deserved flagging for a reason beyond the rule: a browser dialog blocks
- * the renderer, looks nothing like the app around it, and cannot be answered by
- * a test. This shape can — see `confirmRemoveDevice`, and `unshare-folder.test.ts`
- * for the same seam being used to answer without driving a modal.
- */
-class RemoveDeviceModal extends Modal {
-  private answered = false;
-
-  constructor(app: App, private readonly organisation: string, private readonly decide: (proceed: boolean) => void) {
-    super(app);
-  }
-
-  onOpen(): void {
-    const { contentEl } = this;
-    contentEl.createEl('h3', { text: 'Remove this device?' });
-    contentEl.createEl('p', {
-      text: `This is the device you are using. It stops syncing ${this.organisation} until it is added again.`,
-    });
-    contentEl.createEl('p', {
-      text: 'Nothing on disk changes. Every note in this vault stays exactly where it is — they simply stop receiving changes from other people, and yours stop reaching them.',
-      cls: 'setting-item-description',
-    });
-
-    new Setting(contentEl)
-      .addButton((b) => b.setButtonText('Keep it').onClick(() => this.answer(false)))
-      .addButton((b) => b.setButtonText('Remove').setDestructive().onClick(() => this.answer(true)));
-  }
-
-  private answer(proceed: boolean): void {
-    this.answered = true;
-    this.decide(proceed);
-    this.close();
-  }
-
-  onClose(): void {
-    this.contentEl.empty();
-    // Dismissing is not consent, the same rule UnshareFolderModal keeps.
-    if (!this.answered) this.decide(false);
-  }
-}
-
-class LargeAttachmentModal extends Modal {
-  private relativePath: string;
-  private bytes: number;
-  private decide: (proceed: boolean) => void;
-  private answered = false;
-
-  constructor(app: App, relativePath: string, bytes: number, decide: (proceed: boolean) => void) {
-    super(app);
-    this.relativePath = relativePath;
-    this.bytes = bytes;
-    this.decide = decide;
-  }
-
-  onOpen(): void {
-    const { contentEl } = this;
-    contentEl.createEl('h3', { text: 'Large attachment' });
-    contentEl.createEl('p', {
-      text: `"${this.relativePath}" is ${formatBytes(this.bytes)}, which is larger than this `
-        + 'device has opened before.',
-    });
-    contentEl.createEl('p', {
-      text: 'Opening it may make Obsidian close and reopen on this device. If that happens, '
-        + 'nothing is lost — the file stays on the server and this device will skip it next '
-        + 'time, with a button to try again.',
-      cls: 'setting-item-description',
-    });
-
-    new Setting(contentEl)
-      .addButton((b) => b.setButtonText('Skip on this device').onClick(() => this.answer(false)))
-      .addButton((b) => b.setButtonText('Download anyway').setCta().onClick(() => this.answer(true)));
-  }
-
-  private answer(proceed: boolean): void {
-    this.answered = true;
-    this.decide(proceed);
-    this.close();
-  }
-
-  onClose(): void {
-    this.contentEl.empty();
-    // Dismissing without choosing is not consent to attempt something that
-    // might kill the app.
-    if (!this.answered) this.decide(false);
-  }
-}
-
-/**
- * Offered when a folder is shared while Obsidian is set to drop attachments
- * somewhere that will not sync.
- *
- * Phrased as what will happen rather than what is misconfigured. The setting is
- * Obsidian's default and perfectly reasonable until the moment a folder is
- * shared, so there is nothing for the user to feel they got wrong.
- */
-class AttachmentLocationModal extends Modal {
-  private accept: () => void;
-
-  constructor(app: App, accept: () => void) {
-    super(app);
-    this.accept = accept;
-  }
-
-  onOpen(): void {
-    const { contentEl } = this;
-    contentEl.createEl('h3', { text: 'Where should attachments be saved?' });
-    contentEl.createEl('p', {
-      text: 'Obsidian currently saves files you drop into a note to the vault root, which '
-        + 'is not inside a shared folder. Attachments added to shared notes would not be '
-        + 'uploaded, and everyone else would see a broken link.',
-    });
-    contentEl.createEl('p', {
-      text: 'Saving them next to the note keeps them inside the shared folder, so they sync '
-        + 'with it. This changes an Obsidian setting and affects every vault folder, not '
-        + 'only shared ones.',
-      cls: 'setting-item-description',
-    });
-
-    new Setting(contentEl)
-      .addButton((b) => b.setButtonText('Leave it as it is').onClick(() => this.close()))
-      .addButton((b) =>
-        b.setButtonText('Save beside the note').setCta().onClick(() => {
-          this.accept();
-          this.close();
-        }),
-      );
-  }
-
-  onClose(): void {
-    this.contentEl.empty();
-  }
-}
-
-/**
- * What is taking up space, and a way to remove it.
- *
- * Lists only folders this vault has mapped, and says why. The owner of a folder
- * pays for it, but the server stores ciphertext under opaque ids and cannot
- * name a single file in it — so a folder the owner has not mapped can be
- * reported as a total and nothing more. That is not a gap to apologise for; it
- * is the guarantee working, and the honest thing is to say so rather than
- * present an empty list.
- */
-class ManageStorageModal extends Modal {
-  private plugin: NectendaPlugin;
-  private onChange: () => void;
-
-  constructor(app: App, plugin: NectendaPlugin, onChange: () => void) {
-    super(app);
-    this.plugin = plugin;
-    this.onChange = onChange;
-  }
-
-  onOpen(): void {
-    this.render();
-  }
-
-  private render(): void {
-    const { contentEl } = this;
-    contentEl.empty();
-    contentEl.createEl('h3', { text: 'Manage storage' });
-
-    const mappings = this.plugin.settings.folderMappings;
-    if (mappings.length === 0) {
-      contentEl.createEl('p', { text: 'No shared folders are mapped in this vault.' });
-      return;
-    }
-
-    let anything = false;
-    for (const mapping of mappings) {
-      const items = this.plugin.storedAttachments(mapping.sharedFolderId);
-      if (items.length === 0) continue;
-      anything = true;
-
-      const total = items.reduce((n, i) => n + i.bytes, 0);
-      contentEl.createEl('h4', {
-        text: `${mapping.localPath} — ${formatBytes(total)} in ${items.length} file(s)`,
-      });
-
-      // Largest first: the only ordering that helps somebody trying to free
-      // space in as few decisions as possible.
-      for (const item of items) {
-        new Setting(contentEl)
-          .setName(item.relativePath)
-          .setDesc(formatBytes(item.bytes))
-          .addButton((b) =>
-            b.setButtonText('Delete').setDestructive().onClick(async () => {
-              const ok = await this.plugin.deleteAttachment(
-                mapping.sharedFolderId, item.relativePath,
-              );
-              if (ok) {
-                new Notice(
-                  `Nectenda: "${item.relativePath}" moved to the vault trash and removed `
-                    + 'from the server.',
-                );
-                this.onChange();
-                this.render();
-              }
-            }),
-          );
-      }
-    }
-
-    if (!anything) {
-      contentEl.createEl('p', { text: 'No attachments are stored in your mapped folders.' });
-    }
-
-    contentEl.createEl('p', {
-      text: 'Only folders mapped in this vault can be listed. The server stores your '
-        + 'attachments encrypted under names it cannot read, so it cannot tell you what is '
-        + 'in a folder you have not mapped here — map it to manage it, or delete the whole '
-        + 'folder from the folder list.',
-      cls: 'setting-item-description',
-    });
-  }
-
-  onClose(): void {
-    this.contentEl.empty();
-  }
-}

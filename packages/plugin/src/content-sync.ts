@@ -2,21 +2,14 @@ import { IndexeddbPersistence } from 'y-indexeddb';
 import { loadSeqCheckpoint, saveSeqCheckpoint } from './seq-checkpoint';
 import * as Y from 'yjs';
 import type { Awareness } from 'y-protocols/awareness';
-import type NectendaPlugin from './main';
+import type { DocIndex } from './doc-index';
+import type { FolderMapping } from './folder-mapping';
+import type { TimerHandle } from './timers';
 import type { VaultAdapter } from './vault-adapter';
 import type { SyncProvider } from './provider-router';
 import { idbStoreName } from './idb-name';
 import { log } from './logger';
-
-/** A `window.setTimeout`/`setInterval` handle: a number.
- *
- * Spelled out rather than `ReturnType<typeof window.setTimeout>`, which looks
- * tidier and is wrong here. `@types/node` is a devDependency, so the global is
- * overloaded, and `ReturnType<>` resolves the *last* overload — Node's
- * `Timeout` — while the call itself resolves the DOM one and returns a number.
- * The two disagree and nothing says so until an assignment fails.
- */
-type TimerHandle = number;
+import { seedDocument } from './seed-update';
 
 const WRITE_DEBOUNCE = 500;
 /** Dot-prefixed so Obsidian hides it from the file explorer by default. */
@@ -66,7 +59,18 @@ function applyMinimalDiff(ydoc: Y.Doc, ytext: Y.Text, oldStr: string, newStr: st
   });
 }
 
-interface FileDocState {
+/**
+ * One document's sync state.
+ *
+ * Exported for the data-safety tests, which drive the private write paths with
+ * a state they build themselves. They were building it by hand through
+ * `as unknown as`, so the compiler never checked it and two of them had already
+ * drifted — see file-doc-state.test.ts, which now owns the only construction.
+ * A type costs nothing at runtime; the alternative was four hand-written
+ * literals silently disagreeing about the flags that decide whether a file is
+ * overwritten.
+ */
+export interface FileDocState {
   docName: string;
   sharedFolderId: string;
   relativePath: string;
@@ -110,8 +114,64 @@ interface FileDocState {
   observer: ((event: Y.YTextEvent, transaction: Y.Transaction) => void) | null;
 }
 
+/**
+ * What content sync needs from the plugin around it.
+ *
+ * Four things. The parameter used to be typed as the plugin itself — a class
+ * of a hundred and twenty members — which said nothing about which four, and
+ * meant every test had to fake the lot. Three of the data-safety suites did it
+ * by casting an empty object to it and telling the compiler to look away.
+ * Any reach this class grew into the plugin would have
+ * surfaced as a TypeError inside a test written to defend against losing
+ * somebody's writing, rather than as a compile error before it ran.
+ */
+export interface ContentSyncDeps {
+  /**
+   * Whether this device holds the folder's keys. Without them its documents
+   * cannot be addressed at all, because the id is derived from the name key.
+   */
+  hasKeys(sharedFolderId: string): boolean;
+  /**
+   * Path to document id and back. A document name is an HMAC and cannot be
+   * taken apart, so this is the only route from one to the other.
+   */
+  docIndex: DocIndex;
+  /**
+   * Which vault this is, for naming its IndexedDB stores. A function because
+   * the plugin computes it from Obsidian's app id on each read.
+   */
+  vaultKey(): string;
+  /** The shared folders mapped into this vault. Read live; mappings change. */
+  mappings(): FolderMapping[];
+  /**
+   * Told a note's size on disk whenever it is connected or modified, so one too
+   * large to sync is named before anyone relies on it (SAFE-A12). Advisory: it
+   * cannot stop or delay the connect.
+   */
+  checkNoteSize?(sharedFolderId: string, relativePath: string, bytes: number): void;
+  /** A note renamed within its folder, so a size record follows it. */
+  noteMoved?(sharedFolderId: string, fromPath: string, toPath: string): void;
+  /** A note deleted or moved out, so a size record goes with it. */
+  noteGone?(sharedFolderId: string, relativePath: string): void;
+}
+
+/** One document as `ContentSync.trackedDocs` reports it. */
+export interface TrackedDoc {
+  docName: string;
+  sharedFolderId: string;
+  relativePath: string;
+  localPath: string;
+  /** False when the subscribe was refused for want of a connection. */
+  placed: boolean;
+  editorActive: boolean;
+  hasSyncedOnce: boolean;
+  firstSyncChecked: boolean;
+  idbHadData: boolean;
+  diskWritePending: boolean;
+}
+
 export class ContentSync {
-  private plugin: NectendaPlugin;
+  private deps: ContentSyncDeps;
   private provider: SyncProvider;
   private vault: VaultAdapter;
   private fileDocs: Map<string, FileDocState> = new Map();
@@ -135,10 +195,84 @@ export class ContentSync {
    */
   private scannedFolders: Set<string> = new Set();
 
-  constructor(plugin: NectendaPlugin, provider: SyncProvider, vault: VaultAdapter) {
-    this.plugin = plugin;
+  /**
+   * Told when a document is attached, detached, placed, or bound to an editor,
+   * so the status icons can redraw. Only a signal: listeners read the state
+   * back through `trackedDocs`, never from an argument that could be stale.
+   */
+  onStateChange: (() => void) | null = null;
+
+  constructor(deps: ContentSyncDeps, provider: SyncProvider, vault: VaultAdapter) {
+    this.deps = deps;
     this.provider = provider;
     this.vault = vault;
+  }
+
+  private changed(): void {
+    try {
+      this.onStateChange?.();
+    } catch (err) {
+      // A redraw that throws must not take a connect or a teardown with it.
+      log.warn('A sync-state listener threw', { error: String(err) });
+    }
+  }
+
+  /**
+   * What this engine believes about every document it holds, for the status
+   * icons and the inspector. Copies, so nothing a reader keeps can move.
+   *
+   * Unplaced files are included with `placed: false`: they are in a shared
+   * folder and are not syncing, which is exactly what an icon should say.
+   */
+  trackedDocs(): TrackedDoc[] {
+    const out: TrackedDoc[] = [];
+    for (const s of this.fileDocs.values()) {
+      out.push({
+        docName: s.docName,
+        sharedFolderId: s.sharedFolderId,
+        relativePath: s.relativePath,
+        localPath: s.localPath,
+        placed: true,
+        editorActive: s.editorActive,
+        hasSyncedOnce: s.hasSyncedOnce,
+        firstSyncChecked: s.firstSyncChecked,
+        idbHadData: s.idbHadData,
+        diskWritePending: s.writeTimer !== null,
+      });
+    }
+    for (const [docName, u] of this.unplaced) {
+      out.push({
+        docName,
+        sharedFolderId: u.sharedFolderId,
+        relativePath: u.relativePath,
+        localPath: `${u.folderLocalPath}/${u.relativePath}`,
+        placed: false,
+        editorActive: false,
+        hasSyncedOnce: false,
+        firstSyncChecked: false,
+        idbHadData: false,
+        diskWritePending: false,
+      });
+    }
+    return out;
+  }
+
+  /**
+   * Whether the file on disk says what the document says, read from disk now.
+   *
+   * For the inspector, which must check its claims against something that can
+   * observe the thing rather than against cached state. Null when there is no
+   * such document or the file cannot be read. Read-only: it never writes.
+   */
+  async diskMatchesDocument(docName: string): Promise<boolean | null> {
+    const state = this.fileDocs.get(docName);
+    if (!state) return null;
+    try {
+      const disk = await this.vault.read(state.localPath);
+      return disk === state.ytext.toString();
+    } catch {
+      return null;
+    }
   }
 
   connectFolder(sharedFolderId: string, localPath: string): void {
@@ -152,7 +286,7 @@ export class ContentSync {
     // Without keys the folder's documents cannot be addressed at all. Refuse
     // it whole rather than connecting part of it — see FileSync.connectFolder
     // for why a half-connected folder is dangerous rather than merely useless.
-    if (!this.plugin.folderCrypto.hasKeys(sharedFolderId)) {
+    if (!this.deps.hasKeys(sharedFolderId)) {
       log.warn('Folder has no encryption keys — background sync not started', {
         sharedFolderId,
       });
@@ -179,7 +313,7 @@ export class ContentSync {
 
     // Derive every local path's document id up front, so the lookups below —
     // and in EditorBridge, which cannot await — are synchronous.
-    await this.plugin.docIndex.warm(sharedFolderId, files.map((f) => f.relPath));
+    await this.deps.docIndex.warm(sharedFolderId, files.map((f) => f.relPath));
 
     log.info('Background sync starting', { localPath, files: files.length });
 
@@ -206,6 +340,13 @@ export class ContentSync {
   }
 
   connectFile(sharedFolderId: string, localPath: string, relativePath: string): void {
+    // Here rather than in each caller: sharing, joining, launch, create, a
+    // move into the folder and a rename within it all arrive through this one
+    // method. Before the gate below, which returns early for a note already
+    // connected. A renamed note's record has been moved ahead of this
+    // (`moveFile`), so it is not announced twice.
+    this.checkNoteSize(sharedFolderId, `${localPath}/${relativePath}`, relativePath);
+
     // Gate on the path, synchronously, before anything can await.
     //
     // The old guard was `fileDocs.has(docName)`, which was only correct while
@@ -215,11 +356,26 @@ export class ContentSync {
     // server document.
     const gate = `${sharedFolderId}\n${relativePath}`;
     if (this.connecting.has(gate)) return;
-    const known = this.plugin.docIndex.refSync(sharedFolderId, relativePath);
+    const known = this.deps.docIndex.refSync(sharedFolderId, relativePath);
     if (known && this.fileDocs.has(known)) return;
 
     this.connecting.add(gate);
     void this.doConnectFile(sharedFolderId, localPath, relativePath, gate);
+  }
+
+  /**
+   * Report a note's size, if anyone is listening. A `stat` rather than a read,
+   * so a 16 MiB file is not loaded twice to learn how long it is. Contained:
+   * a throw from here must not take a connect or a modify down with it.
+   */
+  private checkNoteSize(sharedFolderId: string, fullPath: string, relativePath: string): void {
+    if (!this.deps.checkNoteSize) return;
+    try {
+      const stat = this.vault.stat(fullPath);
+      if (stat) this.deps.checkNoteSize(sharedFolderId, relativePath, stat.size);
+    } catch (err) {
+      log.warn('Could not check a note\'s size', { path: fullPath, error: String(err) });
+    }
   }
 
   private async doConnectFile(
@@ -230,7 +386,7 @@ export class ContentSync {
   ): Promise<void> {
     let docName: string;
     try {
-      docName = await this.plugin.docIndex.ref(sharedFolderId, relativePath);
+      docName = await this.deps.docIndex.ref(sharedFolderId, relativePath);
     } catch (err) {
       // No key for the folder: its documents cannot even be addressed. Leaving
       // the file alone is the only safe answer — see connectFolder.
@@ -251,7 +407,7 @@ export class ContentSync {
     const ytext = ydoc.getText('content');
 
     // Load IDB cache first
-    const idbProvider = new IndexeddbPersistence(idbStoreName(this.plugin.vaultKey, docName), ydoc);
+    const idbProvider = new IndexeddbPersistence(idbStoreName(this.deps.vaultKey(), docName), ydoc);
 
     const state: FileDocState = {
       docName,
@@ -274,6 +430,7 @@ export class ContentSync {
 
     this.fileDocs.set(docName, state);
     this.connecting.delete(gate);
+    this.changed();
     // May be absent when acquireDoc connects a file on demand before
     // connectFolder has run; without this the doc would escape disconnectFolder.
     let tracked = this.folderFiles.get(sharedFolderId);
@@ -380,6 +537,7 @@ export class ContentSync {
         this.provider.off(`synced:${docName}`, onFirstSync);
         await this.seedIfEmpty(state);
         state.hasSyncedOnce = true;
+        this.changed();
         if (!state.editorActive) this.scheduleDiskWrite(state);
       };
       const onFirstSync = (): void => {
@@ -416,7 +574,21 @@ export class ContentSync {
     reason = 'First sync found different content on both sides — backed up the local copy',
   ): Promise<void> {
     const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-    const backupPath = `${BACKUP_FOLDER}/${stamp}/${localPath}`;
+    // A backup that overwrites a backup is a lost version, which is the exact
+    // thing this function exists to prevent. `toISOString` is millisecond
+    // granular, so two backups of one path inside the same millisecond produced
+    // the same path and the second silently replaced the first — and that is
+    // not hypothetical: it happens on every run of the test below, which is why
+    // "checks once per connection" could not fail. Suffix rather than a finer
+    // clock: the guarantee wanted here is "never overwrite", and asking the
+    // vault is the only thing that actually promises it.
+    let backupPath = `${BACKUP_FOLDER}/${stamp}/${localPath}`;
+    for (let n = 2; this.vault.exists(backupPath); n++) {
+      const dot = localPath.lastIndexOf('.');
+      const slash = localPath.lastIndexOf('/');
+      const [stem, ext] = dot > slash ? [localPath.slice(0, dot), localPath.slice(dot)] : [localPath, ''];
+      backupPath = `${BACKUP_FOLDER}/${stamp}/${stem} (${n})${ext}`;
+    }
 
     try {
       const dir = backupPath.slice(0, backupPath.lastIndexOf('/'));
@@ -482,16 +654,41 @@ export class ContentSync {
    * to the provider, and only then is the local subscription torn down.
    */
   deleteRemote(sharedFolderId: string, relativePath: string): void {
-    const docName = this.plugin.docIndex.refSync(sharedFolderId, relativePath);
+    this.noteSizeHook(() => this.deps.noteGone?.(sharedFolderId, relativePath));
+    const docName = this.deps.docIndex.refSync(sharedFolderId, relativePath);
     if (!docName) return;
     this.provider.deleteDoc(docName);
     this.disconnectDoc(docName);
   }
 
+  /**
+   * A note that has left its folder: deleted, here or by a peer, or moved out.
+   * A rename within the folder is `moveFile`, which must not come through here
+   * first, or the note's size record would be dropped and the note announced
+   * again under its new name.
+   */
   disconnectFile(sharedFolderId: string, relativePath: string): void {
-    const docName = this.plugin.docIndex.refSync(sharedFolderId, relativePath);
+    this.noteSizeHook(() => this.deps.noteGone?.(sharedFolderId, relativePath));
+    const docName = this.deps.docIndex.refSync(sharedFolderId, relativePath);
     if (!docName) return;
     this.disconnectDoc(docName);
+  }
+
+  /** A note renamed or moved within its folder, locally or by a peer. */
+  moveFile(sharedFolderId: string, folderLocalPath: string, fromPath: string, toPath: string): void {
+    // First: the disconnect below forgets whatever is still under the old name.
+    this.noteSizeHook(() => this.deps.noteMoved?.(sharedFolderId, fromPath, toPath));
+    this.disconnectFile(sharedFolderId, fromPath);
+    this.connectFile(sharedFolderId, folderLocalPath, toPath);
+  }
+
+  /** Contained, like `checkNoteSize`: bookkeeping must not break a delete or a move. */
+  private noteSizeHook(run: () => void): void {
+    try {
+      run();
+    } catch (err) {
+      log.warn('Could not update the large-note record', { error: String(err) });
+    }
   }
 
   /**
@@ -520,6 +717,7 @@ export class ContentSync {
     // the path within it, and deriving one back out of the other would break on
     // the first relative path containing a slash.
     this.unplaced.set(state.docName, { sharedFolderId, folderLocalPath, relativePath: state.relativePath });
+    this.changed();
   }
 
   /**
@@ -558,6 +756,7 @@ export class ContentSync {
 
     this.fileDocs.delete(docName);
     this.folderFiles.get(state.sharedFolderId)?.delete(docName);
+    this.changed();
   }
 
   disconnectFolder(sharedFolderId: string): void {
@@ -587,10 +786,10 @@ export class ContentSync {
       // from the index that derived it rather than from the name itself. A miss
       // means this client has never addressed the document, and connecting it
       // blind would attach the wrong file.
-      const resolved = this.plugin.docIndex.pathOf(docName);
+      const resolved = this.deps.docIndex.pathOf(docName);
       if (!resolved) return null;
 
-      const mapping = this.plugin.settings.folderMappings.find(
+      const mapping = this.deps.mappings().find(
         (m) => m.sharedFolderId === resolved.folderId,
       );
       if (!mapping) return null;
@@ -631,6 +830,7 @@ export class ContentSync {
     const state = this.fileDocs.get(docName);
     if (!state) return;
     state.editorActive = bound;
+    this.changed();
     if (bound && state.writeTimer) {
       window.clearTimeout(state.writeTimer);
       state.writeTimer = null;
@@ -695,9 +895,25 @@ export class ContentSync {
       // than by who is probably newer.
       if (disk.length === 0) return;
 
+      // An empty document filled from a file is a seed, whichever function it
+      // happens to be standing in, so it takes the same derived identity. This
+      // is the path an offline bind reaches — `seedIfEmpty` waits for a `synced`
+      // that cannot arrive, so without this the guaranteed-duplication case is
+      // untouched.
+      if (current.length === 0) {
+        const outcome = await seedDocument(state.ydoc, state.docName, disk);
+        // Only claim the two agree if the content actually landed. On
+        // `already-present` the identity is known but the text is not here —
+        // another vault seeded this and the content was since deleted, and that
+        // deletion wins. Recording a baseline then would tell the write path the
+        // file is safe to blank.
+        if (outcome !== 'already-present') state.lastSyncedContent = disk;
+        return;
+      }
+
       // Everything the document holds is still present in the file, so taking
       // the file cannot discard anything.
-      if (current.length === 0 || disk.includes(current)) {
+      if (disk.includes(current)) {
         adopt();
         return;
       }
@@ -722,10 +938,14 @@ export class ContentSync {
   }
 
   async onLocalModify(sharedFolderId: string, relativePath: string): Promise<void> {
-    const docName = this.plugin.docIndex.refSync(sharedFolderId, relativePath);
+    const docName = this.deps.docIndex.refSync(sharedFolderId, relativePath);
     if (!docName) return;
     const state = this.fileDocs.get(docName);
     if (!state) return;
+
+    // Before either early return below: an edit made in the editor is exactly
+    // how a note grows past the limit, and a trim is how it comes back under.
+    this.checkNoteSize(sharedFolderId, state.localPath, relativePath);
 
     // If we wrote this change ourselves, skip
     if (state.ignoreNextModify) {
@@ -895,9 +1115,10 @@ export class ContentSync {
     try {
       const content = await this.vault.read(state.localPath);
       if (content.length > 0 && state.ytext.length === 0) {
-        state.ydoc.transact(() => {
-          state.ytext.insert(0, content);
-        });
+        // Under an identity derived from the content, so that another vault
+        // doing exactly this at exactly this moment authors the same operation
+        // rather than a second copy of the same words.
+        await seedDocument(state.ydoc, state.docName, content);
       }
     } catch (err) {
       log.error('Failed to seed content', { path: state.localPath, error: String(err) });

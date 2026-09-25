@@ -1,12 +1,18 @@
 import { MarkdownView, TFile } from 'obsidian';
 import type { Extension } from '@codemirror/state';
-import { keymap } from '@codemirror/view';
+import { keymap, type EditorView } from '@codemirror/view';
 import { yCollab, yUndoManagerKeymap } from 'y-codemirror.next';
-import type NectendaPlugin from './main';
+import type { App, EventRef } from 'obsidian';
+import type { DocIndex } from './doc-index';
 import type { ContentSync } from './content-sync';
 import type { SyncProvider } from './provider-router';
+import type { ProviderEvent } from './multiplexed-provider';
+import type { Awareness } from 'y-protocols/awareness';
 import { log } from './logger';
+import { PRESENCE_VERSION } from '@nectenda/shared';
+import { applySeed, buildSeedUpdate, type SeedUpdate } from './seed-update';
 import { seatFor, seatColour, type Person } from './presence';
+import { remotePointers, type RemotePointers } from './remote-pointer';
 import { resolveMapping, type FolderMapping } from './folder-mapping';
 
 /** A `window.setTimeout`/`setInterval` handle: a number.
@@ -73,9 +79,96 @@ function withAlpha(colour: string, alpha: number): string {
 }
 
 /**
- * Given a file path and folder mappings, find which shared folder it belongs to
- * and return the shared folder ID + relative path within it.
+ * The people in a presence list, as one comparable string: who, and in which
+ * colour. Order matters, because the circles are drawn in that order.
  */
+export function peopleKey(people: readonly Person[]): string {
+  return JSON.stringify(people.map((p) => [p.name, p.color]));
+}
+
+/** How often an unchanged set of people is reported again. */
+export const PRESENCE_REFRESH_MS = 1000;
+
+/**
+ * An awareness `change` handler that reports the people present, once per
+ * actual change of who is there.
+ *
+ * Counts distinct people, not awareness entries: awareness is keyed by a
+ * random per-Y.Doc clientID, so the same person with two devices open — or a
+ * tab that has not yet been swept after a reload — would otherwise inflate the
+ * count.
+ *
+ * Every caret move and every pointer move is an awareness change, and the
+ * circles are redrawn wholesale, so an unchanged set of people is reported at
+ * most once per `PRESENCE_REFRESH_MS`. Reporting every change rebuilt the
+ * header twenty times a second while a collaborator moved their mouse, and
+ * wrote the more-entries-than-people line to the diagnostic log at the same
+ * rate. Never reporting an unchanged set was wrong the other way (found in
+ * review): the words version of the count (once "N online" in the status bar,
+ * now the header icon's badge) was overwritten by other paths — a
+ * reconnect sets it to "Connected" — and used to be put right by the next caret
+ * move, as the circles were re-attached to whichever header is active. The
+ * periodic report keeps that repair.
+ */
+export function presenceReporter(
+  awareness: Awareness,
+  docName: string,
+  report: (people: Person[]) => void,
+  now: () => number = Date.now,
+): () => void {
+  let last: string | null = null;
+  let lastAt = -Infinity;
+  return () => {
+    // Deduped by name, not by clientID, for the reason given above — and
+    // the first colour seen for a name wins, so a person with two devices
+    // open does not flicker between two entries.
+    const people = new Map<string, Person>();
+    for (const [clientId, state] of awareness.getStates()) {
+      const user = (state as { user?: { name?: string; color?: string } } | undefined)?.user;
+      const name = user?.name ?? `client:${clientId}`;
+      if (!people.has(name)) {
+        people.set(name, { name, color: user?.color ?? seatColour(seatFor(name), currentTheme()) });
+      }
+    }
+    const key = `${awareness.getStates().size}|${peopleKey([...people.values()])}`;
+    const at = now();
+    const changed = key !== last;
+    if (!changed && at - lastAt < PRESENCE_REFRESH_MS) return;
+    last = key;
+    lastAt = at;
+
+    // Report the raw entries whenever they outnumber the people, which is
+    // the only case worth a line. y-codemirror draws one caret per
+    // awareness entry while the circles and the status count draw one per
+    // person, so this is exactly the gap in which a reader sees a cursor
+    // belonging to nobody — a peer that has gone away and not yet been
+    // swept, or a subscription of ours that was never torn down. The `age`
+    // separates those: a dead peer's entry ages, ours is renewed forever.
+    if (changed && awareness.getStates().size > people.size) {
+      const now = Date.now();
+      log.debug('Presence has more entries than people', {
+        docName,
+        entries: awareness.getStates().size,
+        people: people.size,
+        detail: [...awareness.getStates()].map(([clientId, state]) => {
+          const s = state as { user?: { name?: string }; cursor?: unknown } | undefined;
+          const meta = (awareness as unknown as {
+            meta: Map<number, { lastUpdated: number }>;
+          }).meta.get(clientId);
+          return {
+            clientId,
+            mine: clientId === awareness.clientID,
+            name: s?.user?.name ?? null,
+            hasCursor: s?.cursor != null,
+            ageMs: meta ? now - meta.lastUpdated : null,
+          };
+        }),
+      });
+    }
+
+    report([...people.values()]);
+  };
+}
 
 /**
  * How the bind waits for a subscription that may already have happened, or may
@@ -86,27 +179,59 @@ function withAlpha(colour: string, alpha: number): string {
 const SUBSCRIPTION_WAIT_MS = 500;
 const SUBSCRIPTION_WAIT_TRIES = 10;
 
+/**
+ * What the editor binding needs from the plugin around it.
+ *
+ * `app` and `registerEvent` for the same reasons as the watcher's: the
+ * workspace it follows, and the plugin's event lifetime, which is what stops a
+ * listener outliving an unload.
+ */
+export interface EditorBridgeDeps {
+  app: App;
+  /** Tie a listener to the plugin's lifetime, so unload really unloads it. */
+  registerEvent(ref: EventRef): void;
+  /** Path to document id and back. */
+  docIndex: DocIndex;
+  /** The shared folders mapped into this vault. Read live; mappings change. */
+  mappings(): FolderMapping[];
+  /** "Share my mouse pointer": whether others see where this person's mouse is. Read live. */
+  sharePointer(): boolean;
+  /** "Show collaborators' mouse pointers": whether this person sees theirs. Read live. */
+  showPointers(): boolean;
+}
+
 export class EditorBridge {
-  private plugin: NectendaPlugin;
+  private deps: EditorBridgeDeps;
   private contentSync: ContentSync;
   private provider: SyncProvider;
   private username: string;
+
+  /**
+   * The name this device broadcasts, fixed when the bridge was built. Not the
+   * one in settings: a display name saved since then takes effect on the next
+   * connection, and until it does this is the name other people see.
+   */
+  broadcastName(): string {
+    return this.username;
+  }
   private collabExts: Extension[];
   /** A pending wait for a document's subscription, so it can be cancelled. */
-  private subscriptionWait: { event: string; cb: () => void; timer: TimerHandle } | null = null;
+  private subscriptionWait: { event: ProviderEvent; cb: () => void; timer: TimerHandle } | null = null;
   private currentFile: string | null = null;
   private currentDocName: string | null = null;
   private onPresenceChange: ((people: Person[]) => void) | null = null;
   private awarenessHandler: (() => void) | null = null;
+  /** The bound note's pointer extension, so a settings change can redraw it. */
+  private pointers: RemotePointers | null = null;
 
   constructor(
-    plugin: NectendaPlugin,
+    deps: EditorBridgeDeps,
     contentSync: ContentSync,
     provider: SyncProvider,
     username: string,
     collabExts: Extension[],
   ) {
-    this.plugin = plugin;
+    this.deps = deps;
     this.contentSync = contentSync;
     this.provider = provider;
     this.username = username;
@@ -118,10 +243,10 @@ export class EditorBridge {
   }
 
   start(): void {
-    const ref = this.plugin.app.workspace.on('active-leaf-change', () => {
+    const ref = this.deps.app.workspace.on('active-leaf-change', () => {
       this.onActiveLeafChange();
     });
-    this.plugin.registerEvent(ref);
+    this.deps.registerEvent(ref);
 
     // A rename changes the open file's path without changing the leaf, so
     // 'active-leaf-change' never fires and the editor stays bound to the old
@@ -135,12 +260,12 @@ export class EditorBridge {
     // VaultWatcher is started before EditorBridge, so its own rename handler
     // has already pointed ContentSync at the new document name by the time this
     // runs and acquireDoc finds it connected.
-    const renameRef = this.plugin.app.vault.on('rename', (file, oldPath) => {
+    const renameRef = this.deps.app.vault.on('rename', (file, oldPath) => {
       if (oldPath !== this.currentFile) return;
       if (!(file instanceof TFile)) return;
       this.onActiveLeafChange();
     });
-    this.plugin.registerEvent(renameRef);
+    this.deps.registerEvent(renameRef);
 
     // The broadcast colour is sampled from the theme at the moment presence is
     // announced, so switching light/dark mid-session would leave everyone else
@@ -150,10 +275,10 @@ export class EditorBridge {
     // 'css-change' is Obsidian's signal for exactly this; it also fires for
     // snippet and appearance changes, which is harmless here because
     // re-announcing an unchanged state is a no-op to every reader.
-    const themeRef = this.plugin.app.workspace.on('css-change', () => {
+    const themeRef = this.deps.app.workspace.on('css-change', () => {
       this.reannouncePresence();
     });
-    this.plugin.registerEvent(themeRef);
+    this.deps.registerEvent(themeRef);
 
     this.onActiveLeafChange();
   }
@@ -184,6 +309,28 @@ export class EditorBridge {
     });
   }
 
+  /**
+   * Withdraw this person's pointer from the bound note, after "Share my mouse
+   * pointer" is turned off. Without this the last position they sent would stay
+   * on everyone else's screen until the next time they moved — which, with
+   * sharing off, is never.
+   *
+   * Same guard as `reannouncePresence`: a null local state advertises nobody,
+   * and must stay null.
+   */
+  clearPointer(): void {
+    if (!this.currentDocName) return;
+    const awareness = this.provider.getAwareness(this.currentDocName);
+    const existing = awareness?.getLocalState();
+    if (!awareness || !existing || existing.pointer == null) return;
+    awareness.setLocalState({ ...existing, pointer: null });
+  }
+
+  /** Redraw collaborators' pointers, after "Show collaborators' mouse pointers" changes. */
+  refreshPointers(): void {
+    this.pointers?.refresh();
+  }
+
   stop(): void {
     this.unbindCollab();
   }
@@ -195,7 +342,7 @@ export class EditorBridge {
   }
 
   private onActiveLeafChange(): void {
-    const view = this.plugin.app.workspace.getActiveViewOfType(MarkdownView);
+    const view = this.deps.app.workspace.getActiveViewOfType(MarkdownView);
 
     if (!view?.file) {
       this.unbindCollab();
@@ -209,7 +356,7 @@ export class EditorBridge {
     this.unbindCollab();
 
     // Resolve folder mapping
-    const mappings = this.plugin.settings.folderMappings || [];
+    const mappings = this.deps.mappings();
     const resolved = resolveMapping(filePath, mappings);
 
     if (!resolved) {
@@ -222,9 +369,9 @@ export class EditorBridge {
     // rename produces a path that has never been derived at all. Deriving and
     // retrying is what keeps those cases binding; giving up here silently left
     // the editor unbound, which is the data-loss path.
-    const docName = this.plugin.docIndex.refSync(sharedFolderId, relativePath);
+    const docName = this.deps.docIndex.refSync(sharedFolderId, relativePath);
     if (!docName) {
-      void this.plugin.docIndex
+      void this.deps.docIndex
         .ref(sharedFolderId, relativePath)
         .then(() => {
           // currentFile is still whatever it was, so the guard at the top of
@@ -306,14 +453,33 @@ export class EditorBridge {
       await this.contentSync.reconcileFromDisk(docName);
       if (this.currentFile !== filePath) return;
 
-      const localContent = file ? await this.plugin.app.vault.read(file) : '';
+      const localContent = file ? await this.deps.app.vault.read(file) : '';
+      if (this.currentFile !== filePath) return;
+
+      // Prepared here rather than at the seed below, which must stay
+      // synchronous: an `await` between the emptiness check and installing
+      // `yCollab` would let a re-entrant bind interleave, and the ordering of
+      // that sequence is what keeps binding from truncating a file.
+      //
+      // Built unconditionally when there is content, because whether it is
+      // needed depends on `ytext.length` at the moment of the check, not now.
+      const seed: SeedUpdate | null =
+        localContent.length > 0 ? await buildSeedUpdate(docName, localContent) : null;
       if (this.currentFile !== filePath) return;
 
       // Announce presence. Must be setLocalState, not setLocalStateField:
       // subscriptions start with a null local state so background-synced files
       // do not advertise anyone, and setLocalStateField is a no-op on null.
+      //
+      // Presence format v1 (`@nectenda/shared` presence.ts). The surface
+      // fields start null: a note has no pointer or viewport to share until
+      // NEC-92 and NEC-20 write them, and `cursor` stays y-codemirror's own.
       const colors = userColor(this.username);
       awareness.setLocalState({
+        v: PRESENCE_VERSION,
+        pointer: null,
+        viewport: null,
+        selection: null,
         user: {
           name: this.username,
           // `seat` travels so a reader can tell two collaborators apart even
@@ -326,56 +492,10 @@ export class EditorBridge {
         },
       });
 
-      // Track online users.
-      //
-      // Counts distinct people, not awareness entries: awareness is keyed by a
-      // random per-Y.Doc clientID, so the same person with two devices open —
-      // or a tab that has not yet been swept after a reload — would otherwise
-      // inflate the count.
-      this.awarenessHandler = () => {
-        if (!this.onPresenceChange) return;
-        // Deduped by name, not by clientID, for the reason given above — and
-        // the first colour seen for a name wins, so a person with two devices
-        // open does not flicker between two entries.
-        const people = new Map<string, Person>();
-        for (const [clientId, state] of awareness.getStates()) {
-          const user = (state as { user?: { name?: string; color?: string } } | undefined)?.user;
-          const name = user?.name ?? `client:${clientId}`;
-          if (!people.has(name)) {
-            people.set(name, { name, color: user?.color ?? seatColour(seatFor(name), currentTheme()) });
-          }
-        }
-        // Report the raw entries whenever they outnumber the people, which is
-        // the only case worth a line. y-codemirror draws one caret per
-        // awareness entry while the circles and the status count draw one per
-        // person, so this is exactly the gap in which a reader sees a cursor
-        // belonging to nobody — a peer that has gone away and not yet been
-        // swept, or a subscription of ours that was never torn down. The `age`
-        // separates those: a dead peer's entry ages, ours is renewed forever.
-        if (awareness.getStates().size > people.size) {
-          const now = Date.now();
-          log.debug('Presence has more entries than people', {
-            docName,
-            entries: awareness.getStates().size,
-            people: people.size,
-            detail: [...awareness.getStates()].map(([clientId, state]) => {
-              const s = state as { user?: { name?: string }; cursor?: unknown } | undefined;
-              const meta = (awareness as unknown as {
-                meta: Map<number, { lastUpdated: number }>;
-              }).meta.get(clientId);
-              return {
-                clientId,
-                mine: clientId === awareness.clientID,
-                name: s?.user?.name ?? null,
-                hasCursor: s?.cursor != null,
-                ageMs: meta ? now - meta.lastUpdated : null,
-              };
-            }),
-          });
-        }
-
-        this.onPresenceChange([...people.values()]);
-      };
+      // Track online users — distinct people, reported only when they change.
+      this.awarenessHandler = presenceReporter(awareness, docName, (people) => {
+        this.onPresenceChange?.(people);
+      });
       awareness.on('change', this.awarenessHandler);
       this.awarenessHandler();
 
@@ -392,13 +512,20 @@ export class EditorBridge {
         connected: this.provider.isConnected(),
         synced: this.provider.isSynced(docName),
         willSeed: ytext.length === 0 && localContent.length > 0,
+        // Which identity the seed would carry. Two vaults seeding the same words
+        // must log the same number here; two different numbers for the same text
+        // is the duplication this exists to prevent, caught in a log rather than
+        // in a doubled note.
+        seedClientId: seed?.clientId ?? null,
       });
 
-      // Seed if ytext is empty
-      if (ytext.length === 0 && localContent.length > 0) {
-        ytext.doc!.transact(() => {
-          ytext.insert(0, localContent);
-        });
+      // Seed if ytext is empty, under an identity derived from the content, so
+      // that a second vault doing the same thing authors the same operation
+      // instead of a second copy of the same words. This path is reached while
+      // disconnected, where two vaults duplicate every time rather than
+      // occasionally.
+      if (ytext.length === 0 && seed) {
+        applySeed(ytext.doc!, seed, localContent);
       }
 
       // Set editor to match ytext (source of truth)
@@ -410,11 +537,21 @@ export class EditorBridge {
       // Install yCollab — editor and ytext already match
       const collabExtension = yCollab(ytext, awareness);
       const undoKeymap = keymap.of(yUndoManagerKeymap);
+      // The editor this bind is for. `collabExts` reaches every editor
+      // (SAFE-D5), so without this a background or split pane showing another
+      // note would draw this note's pointers at that note's positions, and
+      // hovering it would send a pointer anchored in the wrong text.
+      const boundView = (view.editor as unknown as { cm?: EditorView }).cm ?? null;
+      this.pointers = remotePointers(ytext, awareness, {
+        sharePointer: () => this.deps.sharePointer(),
+        showPointers: () => this.deps.showPointers(),
+        isBound: (v) => v === boundView,
+      });
 
       this.collabExts.length = 0;
-      this.collabExts.push(collabExtension, undoKeymap);
+      this.collabExts.push(collabExtension, undoKeymap, this.pointers.extension);
 
-      this.plugin.app.workspace.updateOptions();
+      this.deps.app.workspace.updateOptions();
 
       // Only now does CodeMirror own the document. Until this point ContentSync
       // must keep reconciling disk against the CRDT, or edits made before the
@@ -445,12 +582,23 @@ export class EditorBridge {
     // rounds of this work because the file on disk looks correct until the
     // moment it is overwritten.
     //
-    // Binding while disconnected is safe. The document is a CRDT: edits land in
-    // ytext, the provider records the subscription as having unsent work, and
-    // the delta is pushed on the next reconnect. The seeding above only fires
-    // for a genuinely empty document — a previously synced file is restored
-    // from IndexedDB and so is never empty — which is what keeps a disconnected
-    // bind from duplicating content the server is about to deliver.
+    // Binding while disconnected keeps the edit. The document is a CRDT: edits
+    // land in ytext, the provider records the subscription as having unsent
+    // work, and the delta is pushed on the next reconnect.
+    //
+    // This used to claim more than that — that a disconnected bind cannot
+    // duplicate, because the seeding above only fires for a genuinely empty
+    // document and a previously synced file comes back from IndexedDB non-empty.
+    // The premise is true and the conclusion does not follow: it reasons about
+    // one vault. A file *this* device has never synced has nothing in
+    // IndexedDB, so two such vaults both fill the document from their own disk,
+    // both are right, and Yjs concatenates the two inserts because they carry
+    // different client ids. Opening such a note in both vaults while the server
+    // is down duplicated it every time, not occasionally. Binding is still the
+    // right trade — losing an edit is worse than doubling a note — but the
+    // duplication was a defect and not a cost of this decision, and the seed
+    // below now carries an identity derived from its content so that two vaults
+    // author one operation rather than two copies of the same words.
     //
     // Connected but not yet synced still waits, because there the document
     // really is about to arrive and seeding from a stale disk copy would
@@ -549,8 +697,9 @@ export class EditorBridge {
       this.currentDocName = null;
       this.currentFile = null;
 
+      this.pointers = null;
       this.collabExts.length = 0;
-      this.plugin.app.workspace.updateOptions();
+      this.deps.app.workspace.updateOptions();
       if (this.onPresenceChange) {
         this.onPresenceChange([]);
       }

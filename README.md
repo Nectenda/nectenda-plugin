@@ -78,12 +78,9 @@ so none are sent.
 
 ## Installing
 
-**Not in Obsidian's community plugin browser yet.** Listing it starts an
-automated review of every future version, and we would rather take that step
-deliberately than as part of a first release. Two ways to install it meanwhile:
-
-**With [BRAT](https://github.com/TfTHacker/obsidian42-brat)**, which also keeps
-it updated: add `Nectenda/nectenda-plugin` as a beta plugin.
+**[Install it from Obsidian's plugin
+directory](https://community.obsidian.md/plugins/nectenda)**, or find it under
+**Settings → Community plugins → Browse** inside Obsidian.
 
 **By hand**, from the [latest release](../../releases/latest): take
 `main.js`, `manifest.json` and `styles.css`, put all three in
@@ -93,6 +90,8 @@ it updated: add `Nectenda/nectenda-plugin` as a beta plugin.
 Then open **Settings → Nectenda** and sign in. Signing in creates your own
 organisation on the free plan; share a folder from the plugin's pane and anyone
 you invite sees your edits as you type.
+
+What changed in each version is in [CHANGELOG.md](CHANGELOG.md).
 
 ## What it costs
 
@@ -131,11 +130,8 @@ file you just read.
 
 ## Documentation
 
-- [Security model](docs/security-model.md) — what the server can and cannot see
-- [Sync limitations](docs/sync-limitations.md) — every known case two vaults can disagree
-- [Key storage](docs/key-storage.md) — where keys live and what an attacker gets
-- [Accounts](docs/accounts.md) — accounts, plans and devices
-- [Identity](docs/identity.md) — signing in, and what the identity service holds
+- [Security model](docs/security-model.md) — what the server can and cannot see,
+  the exact cryptographic parameters, and what is deliberately **not** claimed
 
 ## Licence
 

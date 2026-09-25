@@ -1,6 +1,6 @@
 {
   "name": "@nectenda/plugin",
-  "version": "0.1.5",
+  "version": "0.2.0",
   "license": "SEE LICENSE IN LICENSE",
   "private": true,
   "type": "module",
@@ -14,15 +14,15 @@
     "@nectenda/shared": "workspace:*",
     "lib0": "^0.2.97",
     "obsidian": "latest",
-    "y-codemirror.next": "^0.3.5",
+    "y-codemirror.next": "^0.3.6",
     "y-indexeddb": "^9.0.12",
     "y-protocols": "^1.0.6",
-    "yjs": "^13.6.30"
+    "yjs": "^13.6.32"
   },
   "devDependencies": {
     "@codemirror/state": "^6.5.0",
     "@codemirror/view": "^6.38.6",
-    "@types/node": "^20.17.50",
+    "@types/node": "^26.0.0",
     "esbuild": "^0.25.5",
     "tslib": "^2.8.1",
     "typescript": "^5.8.3"

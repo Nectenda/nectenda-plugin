@@ -1,5 +1,12 @@
-import type NectendaPlugin from './main';
-import type { FolderMapping } from './editor-bridge';
+import type { FolderMapping } from './folder-mapping';
+
+/** What the file-explorer decoration needs. Two answers, both read live. */
+export interface FolderIndicatorDeps {
+  /** The shared folders mapped into this vault. */
+  mappings(): FolderMapping[];
+  /** Whether the account is out of storage, which the marker shows. */
+  isStorageFull(): boolean;
+}
 
 /**
  * Adds visual indicators to the file explorer for shared folders.
@@ -7,11 +14,11 @@ import type { FolderMapping } from './editor-bridge';
  * and applies CSS classes to shared folder elements.
  */
 export class FolderIndicator {
-  private plugin: NectendaPlugin;
+  private deps: FolderIndicatorDeps;
   private observer: MutationObserver | null = null;
 
-  constructor(plugin: NectendaPlugin) {
-    this.plugin = plugin;
+  constructor(deps: FolderIndicatorDeps) {
+    this.deps = deps;
   }
 
   start(): void {
@@ -40,7 +47,7 @@ export class FolderIndicator {
   }
 
   private applyIndicators(): void {
-    const mappings: FolderMapping[] = this.plugin.settings.folderMappings || [];
+    const mappings: FolderMapping[] = this.deps.mappings();
     if (mappings.length === 0) return;
 
     const sharedPaths = new Set(mappings.map((m) => m.localPath));
@@ -60,7 +67,7 @@ export class FolderIndicator {
         // A blocked attachment upload with an "offline" badge sends people to
         // check their network, which wastes their time and hides the actual
         // cause — the folder is still syncing text perfectly well.
-        el.classList.toggle('nectenda-storage-full', this.plugin.isStorageFull());
+        el.classList.toggle('nectenda-storage-full', this.deps.isStorageFull());
       } else {
         el.classList.remove('nectenda-shared');
         el.classList.remove('nectenda-storage-full');

@@ -1,3 +1,30 @@
 packages:
   - "packages/*"
   - "deploy"
+
+# Which dependencies may run install scripts, stated rather than inferred.
+#
+# pnpm 12 turns an ignored build script from a warning into ERR_PNPM_IGNORED_BUILDS
+# and refuses to install until every one is answered. pnpm 10 decided this by
+# itself and only mentioned the three it had skipped, which meant the three it
+# *ran* — arbitrary code from the registry, at install time — were never written
+# down anywhere. The list below is the same behaviour, now visible.
+#
+# true, because the package is a native module and the script is how its binary
+# arrives. Without it the module resolves and then throws at require time:
+allowBuilds:
+  # prebuilt binaries fetched by prebuild-install; see CLAUDE.md for why the
+  # version matters to the Node line.
+  better-sqlite3: true
+  # node-gyp-build, selecting the bundled NAPI prebuild for this platform.
+  bcrypt: true
+  # places the platform binary the plugin bundle is built with.
+  esbuild: true
+
+  # false, because nothing here needs them and each is a download-and-execute
+  # at install time. All three were already being skipped under pnpm 10 and
+  # nothing has ever failed for want of them — the e2e suite drives Obsidian,
+  # which is Electron, not Firefox or Edge.
+  classic-level: false
+  edgedriver: false
+  geckodriver: false

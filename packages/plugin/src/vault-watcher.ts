@@ -1,5 +1,6 @@
 import type { FileEntry } from '@nectenda/shared';
-import type NectendaPlugin from './main';
+import type { App, EventRef } from 'obsidian';
+import type { FolderMapping } from './folder-mapping';
 import type { FileSync } from './file-sync';
 import type { ContentSync } from './content-sync';
 import type { VaultAdapter } from './vault-adapter';
@@ -21,8 +22,31 @@ const isBlob = (path: string): boolean => kindOf(path) === 'blob';
 
 const LOCAL_ORIGIN = 'local';
 
+/**
+ * What the vault watcher needs from the plugin around it.
+ *
+ * Three things, and two of them are Obsidian rather than Nectenda. `app` is
+ * the vault and workspace it listens to; `registerEvent` is the plugin's event
+ * lifetime, and is here rather than being replaced by a plain `on` because
+ * that lifetime is the thing that matters — a listener not registered through
+ * it outlives the plugin being disabled and fires against a torn-down watcher.
+ */
+export interface VaultWatcherDeps {
+  app: App;
+  /** Tie a listener to the plugin's lifetime, so unload really unloads it. */
+  registerEvent(ref: EventRef): void;
+  /** The shared folders mapped into this vault. Read live; mappings change. */
+  mappings(): FolderMapping[];
+  /**
+   * A mapped folder was renamed in the vault. The watcher recognises it and
+   * hands it on; deciding what that means to the rest of the plugin is not
+   * its business.
+   */
+  onMappedFolderRename(oldPath: string, newPath: string, moved?: FolderMapping): Promise<void>;
+}
+
 export class VaultWatcher {
-  private plugin: NectendaPlugin;
+  private deps: VaultWatcherDeps;
   private vault: VaultAdapter;
   private fileSync: FileSync;
   private contentSync: ContentSync | null;
@@ -47,13 +71,13 @@ export class VaultWatcher {
   private renameInFlight: { from: string; to: string } | null = null;
 
   constructor(
-    plugin: NectendaPlugin,
+    deps: VaultWatcherDeps,
     fileSync: FileSync,
     contentSync: ContentSync | null,
     vault: VaultAdapter,
     blobSync: BlobSync | null = null,
   ) {
-    this.plugin = plugin;
+    this.deps = deps;
     this.vault = vault;
     this.fileSync = fileSync;
     this.contentSync = contentSync;
@@ -91,18 +115,18 @@ export class VaultWatcher {
     this.started = true;
 
     // Register inside onLayoutReady to avoid vault-load events
-    this.plugin.app.workspace.onLayoutReady(() => {
-      this.plugin.registerEvent(
-        this.plugin.app.vault.on('create', (file) => this.handleCreate(file.path))
+    this.deps.app.workspace.onLayoutReady(() => {
+      this.deps.registerEvent(
+        this.deps.app.vault.on('create', (file) => this.handleCreate(file.path))
       );
-      this.plugin.registerEvent(
-        this.plugin.app.vault.on('delete', (file) => this.handleDelete(file.path))
+      this.deps.registerEvent(
+        this.deps.app.vault.on('delete', (file) => this.handleDelete(file.path))
       );
-      this.plugin.registerEvent(
-        this.plugin.app.vault.on('rename', (file, oldPath) => this.handleRename(file.path, oldPath))
+      this.deps.registerEvent(
+        this.deps.app.vault.on('rename', (file, oldPath) => this.handleRename(file.path, oldPath))
       );
-      this.plugin.registerEvent(
-        this.plugin.app.vault.on('modify', (file) => this.handleModify(file.path))
+      this.deps.registerEvent(
+        this.deps.app.vault.on('modify', (file) => this.handleModify(file.path))
       );
     });
   }
@@ -148,7 +172,7 @@ export class VaultWatcher {
     if (!resolved) {
       log.debug('Create ignored — path is in no mapped folder', {
         path,
-        mappings: (this.plugin.settings.folderMappings || []).map((m) => m.localPath),
+        mappings: this.deps.mappings().map((m) => m.localPath),
       });
       return;
     }
@@ -191,7 +215,7 @@ export class VaultWatcher {
     if (this.fileSync.isRemoteCreate(sharedFolderId, relativePath)) {
       this.contentSync?.connectFile(
         sharedFolderId,
-        this.plugin.settings.folderMappings.find((m) => m.sharedFolderId === sharedFolderId)
+        this.deps.mappings().find((m) => m.sharedFolderId === sharedFolderId)
           ?.localPath ?? '',
         relativePath,
       );
@@ -205,7 +229,7 @@ export class VaultWatcher {
 
     // Connect the new file for background sync
     if (this.contentSync) {
-      const mapping = this.plugin.settings.folderMappings.find(m => m.sharedFolderId === sharedFolderId);
+      const mapping = this.deps.mappings().find(m => m.sharedFolderId === sharedFolderId);
       if (mapping) {
         this.contentSync.connectFile(sharedFolderId, mapping.localPath, relativePath);
       }
@@ -252,7 +276,7 @@ export class VaultWatcher {
     // because a directory is neither — `kindOf` calls anything without `.md` a
     // blob, so this used to fall into `handleBlobRename`, match none of its
     // branches, and do nothing at all.
-    const root = mappingRootedAt(oldPath, this.plugin.settings.folderMappings);
+    const root = mappingRootedAt(oldPath, this.deps.mappings());
     if (root) {
       // Moved **here and now**, not inside the async call below. Obsidian
       // follows a folder rename with one event per file inside it, delivered
@@ -265,7 +289,7 @@ export class VaultWatcher {
       // announced every note in it as deleted to every other vault.
       root.localPath = path;
       this.renameInFlight = { from: oldPath, to: path };
-      void this.plugin.handleMappedFolderRename(oldPath, path, root);
+      void this.deps.onMappedFolderRename(oldPath, path, root);
       return;
     }
 
@@ -298,10 +322,11 @@ export class VaultWatcher {
 
       // Disconnect old, connect new for background sync
       if (this.contentSync) {
-        this.contentSync.disconnectFile(oldResolved.sharedFolderId, oldResolved.relativePath);
-        const mapping = this.plugin.settings.folderMappings.find(m => m.sharedFolderId === newResolved.sharedFolderId);
+        const mapping = this.deps.mappings().find(m => m.sharedFolderId === newResolved.sharedFolderId);
         if (mapping) {
-          this.contentSync.connectFile(newResolved.sharedFolderId, mapping.localPath, newResolved.relativePath);
+          this.contentSync.moveFile(newResolved.sharedFolderId, mapping.localPath, oldResolved.relativePath, newResolved.relativePath);
+        } else {
+          this.contentSync.disconnectFile(oldResolved.sharedFolderId, oldResolved.relativePath);
         }
       }
       return;
@@ -332,7 +357,7 @@ export class VaultWatcher {
         }, LOCAL_ORIGIN);
       }
       if (this.contentSync) {
-        const mapping = this.plugin.settings.folderMappings.find(m => m.sharedFolderId === newResolved.sharedFolderId);
+        const mapping = this.deps.mappings().find(m => m.sharedFolderId === newResolved.sharedFolderId);
         if (mapping) {
           this.contentSync.connectFile(newResolved.sharedFolderId, mapping.localPath, newResolved.relativePath);
         }
@@ -436,7 +461,7 @@ export class VaultWatcher {
   }
 
   private resolveFile(filePath: string): { sharedFolderId: string; relativePath: string } | null {
-    const mappings = this.plugin.settings.folderMappings || [];
+    const mappings = this.deps.mappings();
     return resolveMapping(filePath, mappings);
   }
 }

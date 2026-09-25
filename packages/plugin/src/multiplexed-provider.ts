@@ -2,9 +2,10 @@ import * as Y from 'yjs';
 import * as awarenessProtocol from 'y-protocols/awareness';
 import * as encoding from 'lib0/encoding';
 import * as decoding from 'lib0/decoding';
-import { MessageType, COMPACT_AFTER_UPDATES, WS_CLOSE_DEVICE_LIMIT, WS_CLOSE_ACCOUNT_SUSPENDED, WS_CLOSE_ACCOUNT_MOVING, WS_CLOSE_SIGNED_OUT, WS_CLOSE_UPDATE_PLUGIN } from '@nectenda/shared';
+import { MessageType, COMPACT_AFTER_UPDATES, MAX_PUSH_BYTES, WS_CLOSE_DEVICE_LIMIT, WS_CLOSE_ACCOUNT_SUSPENDED, WS_CLOSE_ACCOUNT_MOVING, WS_CLOSE_SIGNED_OUT, WS_CLOSE_UPDATE_PLUGIN } from '@nectenda/shared';
 import { PLUGIN_VERSION } from './client-version.js';
 import { log } from './logger';
+import { sealPresence, openPresence, decodeEntries, encodeEntries, type PresenceEntry } from './presence-seal';
 
 /** A `window.setTimeout`/`setInterval` handle: a number.
  *
@@ -25,11 +26,68 @@ type TimerHandle = number;
  */
 export type ProviderStatus = 'connecting' | 'connected' | 'disconnected' | 'restarting' | 'device-limit' | 'suspended' | 'moving' | 'signed-out' | 'update-required' | 'idle';
 
+/**
+ * One document's progress to the server, as the provider sees it.
+ *
+ * `awaitingAck` is the field that matters most: a push handed to the socket is
+ * not a push the server recorded. See `MultiplexedProvider.unacked`.
+ */
+export interface DocSyncState {
+  connected: boolean;
+  synced: boolean;
+  pending: number;
+  flushing: boolean;
+  hasUnsentWork: boolean;
+  reconciling: boolean;
+  owesReconcile: boolean;
+  awaitingAck: number;
+  lastSeq: number;
+  snapshotSeq: number;
+  decryptGapSeq: number | null;
+  /** Bytes of a change held back for being over `MAX_PUSH_BYTES`, or null. */
+  oversizedPush: number | null;
+}
+
+/**
+ * Every event a provider raises, spelled out.
+ *
+ * This was `on(event: string, ...)` with a runtime `Set` standing in for the
+ * vocabulary, which is a discriminated union's job done by a data structure
+ * nothing can check. A typo subscribed to something nothing would ever raise:
+ * no compile error, no test failure, no log line — the handler simply never
+ * ran, and whatever it was there for quietly did not happen.
+ *
+ * The last two are per-document and so cannot be enumerated, but the template
+ * literals still reject a misspelt prefix. `doc-state` is the exception, one
+ * event carrying the document name as its argument: it fires on every
+ * keystroke, and its listeners want every document rather than one.
+ */
+export type ProviderEvent =
+  | 'status'
+  | 'signed-out'
+  | 'routes-changed'
+  | 'folder-gone'
+  | 'decrypt-failed'
+  | 'doc-state'
+  | `synced:${string}`
+  | `subscribed:${string}`;
+
+
 /** A Yjs update that carries nothing is two bytes. */
 const EMPTY_UPDATE_LENGTH = 2;
 
 /** How long to wait after the sequence moves before writing it down. */
 const SEQ_SAVE_DEBOUNCE_MS = 3000;
+
+/** First retry of a reconnect delta that could not be sent; doubles from here. */
+const DELTA_RETRY_BASE_MS = 2000;
+const DELTA_RETRY_MAX_MS = 60_000;
+
+/**
+ * How long a note holding an oversized change waits after an edit before it
+ * tries again. Each attempt encrypts the whole delta, so not per keystroke.
+ */
+const OVERSIZE_RETRY_DEBOUNCE_MS = 10_000;
 
 /**
  * Somewhere to remember how far this device has read.
@@ -126,6 +184,54 @@ interface DocSubscription {
   /** True while a flush is queued or running. */
   flushing: boolean;
   /**
+   * The catch-up is done and the delta push behind it is queued but has not
+   * run yet. Without this, the moment between `synced` and the delta being
+   * counted would read as nothing outstanding.
+   */
+  reconciling: boolean;
+  /**
+   * The server may lack work this client can no longer point to: a push that
+   * went unacknowledged when its socket closed, or a reconnect delta that
+   * could not be sent. Makes the next Subscribe ask from 0 and push the delta
+   * against everything the server holds.
+   *
+   * Separate from `hasUnsentWork` because that one describes `pending`, and a
+   * flush that drains `pending` rightly clears it. This work is not in
+   * `pending` — it is only in the document — so an edit sent before the
+   * catch-up finished would clear the reconcile along with it, and the
+   * dropped push would never go again. Only `pushLocalDelta` clears this.
+   */
+  owesReconcile: boolean;
+  /**
+   * The state vector the last reconcile diffed against: everything the server
+   * was known to hold then. It can only have gained since, so a delta against
+   * it is a superset of what the server lacks — larger than needed, never
+   * short. Null until a reconcile has run on this subscription.
+   */
+  serverSV: Uint8Array | null;
+  /**
+   * The sequence the last Subscribe asked from. A catch-up from 0 is a cold
+   * start — no trusted read position — and always reconciles: a document
+   * restored from IndexedDB can hold work the server never recorded, and after
+   * a restart nothing in memory says so. See `completeSync`.
+   */
+  catchUpFrom: number;
+  /** A retry of a delta that could not be sent, waiting on its timer. */
+  deltaRetryTimer: TimerHandle | null;
+  /**
+   * Size of a change this client will not send because it is over
+   * `MAX_PUSH_BYTES` (SAFE-A11), or null. The work stays in the document;
+   * `owesReconcile` stays set until a delta that fits goes out.
+   */
+  oversizedPush: number | null;
+  /**
+   * Bumped each time a change is held back. A delta clears the hold only if
+   * none was placed after it was computed: its encrypt runs off the chain, so
+   * a flush can hold back a newer, larger change meanwhile — one this delta
+   * does not contain.
+   */
+  oversizeHolds: number;
+  /**
    * Serialises decrypt-and-apply in the order the socket delivered.
    *
    * Separate from `chain` because sends and receives do not order against each
@@ -143,6 +249,18 @@ interface DocSubscription {
    * very updates that would fill it.
    */
   decryptGapSeq: number | null;
+  /**
+   * Serialise presence sealing and opening, one chain each way.
+   *
+   * The cipher is async and the awareness callback is not, so without these a
+   * slow seal could let a later state leave first, and a slow open could apply
+   * after a removal that arrived behind it. y-protocols' clock check rejects a
+   * stale state either way, so this is order kept rather than order repaired.
+   * Separate from `chain` and `recvChain` so a large content encrypt or a
+   * snapshot decrypt never holds up a caret.
+   */
+  presenceSendChain: Promise<void>;
+  presenceRecvChain: Promise<void>;
   updateHandler: (update: Uint8Array, origin: unknown) => void;
   awarenessHandler: (changes: { added: number[]; updated: number[]; removed: number[] }, origin: unknown) => void;
 }
@@ -155,8 +273,13 @@ interface DocSubscription {
  * one wrote.
  */
 export interface DocCipher {
-  encryptPayload(docName: string, plaintext: Uint8Array): Promise<{ payload: Uint8Array; keyId: string }>;
-  decryptPayload(docName: string, payload: Uint8Array, keyId: string): Promise<Uint8Array>;
+  /**
+   * `aad` is authenticated additional data. Content updates pass none; sealed
+   * presence passes its binding (presence-seal.ts), which is also what keeps a
+   * presence ciphertext from ever opening as a content update, or the reverse.
+   */
+  encryptPayload(docName: string, plaintext: Uint8Array, aad?: Uint8Array): Promise<{ payload: Uint8Array; keyId: string }>;
+  decryptPayload(docName: string, payload: Uint8Array, keyId: string, aad?: Uint8Array): Promise<Uint8Array>;
 }
 
 /**
@@ -209,6 +332,88 @@ export class MultiplexedProvider {
 
   private cipher: DocCipher;
 
+  /**
+   * Bumped whenever the socket closes. A presence open that began on an older
+   * connection must not apply after the close retracted every peer: it would
+   * put back a caret for someone this client can no longer vouch for, and its
+   * clock can be newer than the retraction's, so the clock check does not stop
+   * it.
+   */
+  private connectionEpoch = 0;
+
+  /**
+   * Pushes committed to but not yet acknowledged, per document.
+   *
+   * `hasUnsentWork` goes false the moment a frame is handed to the socket,
+   * which says nothing about whether the server recorded it: it drops a push
+   * without an Ack when it refuses the folder, the payload is oversized, or
+   * the writer fails. Only the Ack says the update is in the log, so only a
+   * count of zero lets anything tell the user a document is synchronised
+   * (SAFE-E3). The reconnect delta is counted from before its encrypt, so it
+   * is never briefly invisible.
+   *
+   * Keyed by document rather than held on the subscription, because the
+   * server acknowledges a document's pushes, not a subscription's: an Ack for
+   * a push made just before an unsubscribe arrives after the resubscribe, and
+   * on a per-subscription count it would pay off the new one's push early.
+   *
+   * Cleared on close: no Ack can arrive on a dead socket. See the close
+   * handler for what an outstanding count means then.
+   */
+  private unacked = new Map<string, number>();
+
+  /**
+   * Documents that owed the server a reconcile while unsubscribed: a push
+   * went unacknowledged and the socket closed after the unsubscribe. Handed
+   * to the next subscription, which is where `owesReconcile` lives.
+   *
+   * In memory only, and a restart loses it. That is safe because the read
+   * position is never stored while a push is outstanding (SAFE-A10): the next
+   * launch finds no checkpoint that matches its document, asks from 0, and a
+   * catch-up from 0 always reconciles.
+   */
+  private owedReconcile = new Set<string>();
+
+  private countPush(docName: string): void {
+    this.unacked.set(docName, (this.unacked.get(docName) ?? 0) + 1);
+  }
+
+  /** One Push per Ack (ws-server.ts), so the count cannot run ahead. */
+  private settleAck(docName: string): void {
+    const left = (this.unacked.get(docName) ?? 0) - 1;
+    if (left > 0) {
+      this.unacked.set(docName, left);
+      return;
+    }
+    this.unacked.delete(docName);
+    // Settled, perhaps for the first time since the read position last moved:
+    // a save skipped while this push was outstanding gets its turn now.
+    const sub = this.docs.get(docName);
+    if (sub?.synced) this.scheduleSeqSave(docName, sub);
+  }
+
+  /**
+   * Whether this document may hold work the server has not confirmed:
+   * queued, being encrypted, unsent, awaiting an Ack, or owed a reconcile.
+   * While it does, the read position must not be stored (SAFE-A10).
+   *
+   * A catch-up still arriving counts too. Content restored from IndexedDB is
+   * in none of the queues, and whether the server lacks any of it is decided
+   * only once the catch-up ends — so a save armed by the first catch-up frame
+   * would record it as accounted for before the reconcile had even begun.
+   * `completeSync` arms the save again, in the same block that sets
+   * `reconciling`.
+   */
+  private owesServer(docName: string, sub: DocSubscription): boolean {
+    return !sub.synced
+      || sub.pending.length > 0
+      || sub.flushing
+      || sub.hasUnsentWork
+      || sub.reconciling
+      || sub.owesReconcile
+      || (this.unacked.get(docName) ?? 0) > 0;
+  }
+
   constructor(url: string, token: string, cipher: DocCipher = passthroughCipher) {
     this.url = url;
     this.token = token;
@@ -250,6 +455,8 @@ export class MultiplexedProvider {
     for (const [, sub] of this.docs) {
       sub.ydoc.off('update', sub.updateHandler);
       sub.awareness.off('update', sub.awarenessHandler);
+      this.clearDeltaRetry(sub);
+      this.clearSeqSave(sub);
     }
     this.docs.clear();
     this.events.clear();
@@ -288,6 +495,7 @@ export class MultiplexedProvider {
       // between Yjs handing it over and the cipher finishing with it.
       sub.pending.push(update);
       sub.hasUnsentWork = true;
+      this.emitDocState(docName);
 
       if (!this.isConnected()) {
         // Offline edit. Yjs keeps it in the document (and y-indexeddb on disk);
@@ -297,25 +505,60 @@ export class MultiplexedProvider {
         return;
       }
       this.scheduleFlush(docName, sub);
+      // A change held back for its size may fit now — the note was trimmed or
+      // split — so try again once the typing stops (SAFE-A11).
+      if (sub.oversizedPush !== null) this.scheduleDeltaRetry(docName, sub, OVERSIZE_RETRY_DEBOUNCE_MS, 0, true);
     };
 
-    // When local awareness changes, send to server
+    // When local awareness changes, seal it and send it to the server.
+    //
+    // What goes out is captured synchronously, here: the state *and* its clock,
+    // read now rather than after the seal. A later change bumps the clock, and
+    // sealing the new state under the old clock would bind it to the wrong
+    // moment (see presenceAad).
     const awarenessHandler = (
       changes: { added: number[]; updated: number[]; removed: number[] },
       origin: unknown,
     ) => {
       if (origin === 'remote') return;
-      if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+      if (!this.isConnected()) return;
+      const sub = this.docs.get(docName);
+      if (!sub) return;
 
-      const changedClients = changes.added.concat(changes.updated).concat(changes.removed);
-      const encoder = encoding.createEncoder();
-      encoding.writeVarString(encoder, docName);
-      encoding.writeVarUint(encoder, MessageType.Awareness);
-      encoding.writeVarUint8Array(
-        encoder,
-        awarenessProtocol.encodeAwarenessUpdate(awareness, changedClients),
-      );
-      this.ws.send(encoding.toUint8Array(encoder));
+      const captured: Array<{ clientID: number; clock: number; state: unknown }> = [];
+      for (const clientID of changes.added.concat(changes.updated).concat(changes.removed)) {
+        const meta = awareness.meta.get(clientID);
+        if (!meta) continue;
+        captured.push({ clientID, clock: meta.clock, state: awareness.getStates().get(clientID) ?? null });
+      }
+      if (captured.length === 0) return;
+
+      sub.presenceSendChain = sub.presenceSendChain
+        .then(async () => {
+          const entries: PresenceEntry[] = [];
+          for (const { clientID, clock, state } of captured) {
+            if (state === null) {
+              entries.push({ clientID, clock, json: 'null' });
+              continue;
+            }
+            try {
+              entries.push({ clientID, clock, json: await sealPresence(this.cipher, docName, clientID, clock, state) });
+            } catch (err) {
+              // Never sent plain instead. A folder without a key has no
+              // presence, which is visible; a readable state is not.
+              log.warn('Could not seal presence; not sent', { docName, error: String(err) });
+            }
+          }
+          // Unsubscribed meanwhile: a frame now would re-register this socket
+          // with a document it has just told the server it closed.
+          if (entries.length === 0 || this.docs.get(docName) !== sub || !this.isConnected()) return;
+          const encoder = encoding.createEncoder();
+          encoding.writeVarString(encoder, docName);
+          encoding.writeVarUint(encoder, MessageType.Awareness);
+          encoding.writeVarUint8Array(encoder, encodeEntries(entries));
+          this.ws!.send(encoding.toUint8Array(encoder));
+        })
+        .catch((err) => log.warn('Presence send failed', { docName, error: String(err) }));
     };
 
     ydoc.on('update', updateHandler);
@@ -344,12 +587,25 @@ export class MultiplexedProvider {
       pending: [],
       chain: Promise.resolve(),
       flushing: false,
+      reconciling: false,
+      owesReconcile: false,
+      serverSV: null,
+      catchUpFrom: 0,
+      deltaRetryTimer: null,
+      oversizedPush: null,
+      oversizeHolds: 0,
       recvChain: Promise.resolve(),
       decryptGapSeq: null,
+      presenceSendChain: Promise.resolve(),
+      presenceRecvChain: Promise.resolve(),
       updateHandler,
       awarenessHandler,
     };
     this.docs.set(docName, sub);
+    if (this.owedReconcile.delete(docName)) {
+      sub.owesReconcile = true;
+      sub.hadUnsyncedWork = true;
+    }
 
     // Restore before the first Subscribe goes out, so a resumable document does
     // not ask for the whole log anyway. `sendSubscribe` waits on this; it
@@ -418,6 +674,8 @@ export class MultiplexedProvider {
     sub.ydoc.off('update', sub.updateHandler);
     sub.awareness.off('update', sub.awarenessHandler);
     sub.awareness.destroy();
+    this.clearDeltaRetry(sub);
+    this.clearSeqSave(sub);
 
     // Tell server we're unsubscribing
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
@@ -497,6 +755,7 @@ export class MultiplexedProvider {
             error: String(err),
           });
           this.emit('decrypt-failed', docName);
+          this.emitDocState(docName);
         }
         return;
       }
@@ -505,7 +764,7 @@ export class MultiplexedProvider {
       if (isSnapshot || !sub.synced) sub.catchUp.push(plaintext);
       if (sub.decryptGapSeq === null) {
         sub.lastSeq = Math.max(sub.lastSeq, seq);
-        this.scheduleSeqSave(sub);
+        this.scheduleSeqSave(docName, sub);
       }
       if (isSnapshot) {
         sub.updatesSinceSnapshot = 0;
@@ -525,6 +784,11 @@ export class MultiplexedProvider {
   }
 
   private async flushUpdates(docName: string, sub: DocSubscription): Promise<void> {
+    // Held outside the loop so the catch can put it back. It left `pending`
+    // before the encrypt, and an encrypt that throws — a folder whose key is
+    // missing — used to take it with it: logged, never sent, and the next
+    // successful flush cleared `hasUnsentWork` as though it had been.
+    let merged: Uint8Array | null = null;
     try {
       while (sub.pending.length > 0) {
         const batch = sub.pending;
@@ -532,7 +796,7 @@ export class MultiplexedProvider {
         // Merging only here is what keeps a lone typist at zero added latency:
         // with one update there is nothing to merge, and a backlog only forms
         // behind an encrypt that is already running.
-        const merged = batch.length === 1 ? batch[0] : Y.mergeUpdates(batch);
+        merged = batch.length === 1 ? batch[0] : Y.mergeUpdates(batch);
 
         if (!this.isConnected()) {
           sub.pending.unshift(merged);
@@ -550,18 +814,33 @@ export class MultiplexedProvider {
           return;
         }
 
+        if (payload.length > MAX_PUSH_BYTES) {
+          // Not put back: it is in the document, and the reconcile this owes
+          // sends a delta that contains it. Back in `pending` it would be
+          // merged into, and encrypted with, every later keystroke.
+          this.holdOversized(docName, sub, payload.length);
+          merged = null;
+          continue;
+        }
+
         const encoder = encoding.createEncoder();
         encoding.writeVarString(encoder, docName);
         encoding.writeVarUint(encoder, MessageType.Push);
         encoding.writeVarUint8Array(encoder, payload);
         encoding.writeVarString(encoder, keyId);
         this.ws!.send(encoding.toUint8Array(encoder));
+        this.countPush(docName);
+        merged = null;
       }
       sub.hasUnsentWork = sub.pending.length > 0;
     } catch (err) {
       log.error('Failed to send an update', { docName, error: String(err) });
+      if (merged) sub.pending.unshift(merged);
+      sub.hasUnsentWork = true;
+      sub.hadUnsyncedWork = true;
     } finally {
       sub.flushing = false;
+      this.emitDocState(docName);
     }
   }
 
@@ -573,17 +852,55 @@ export class MultiplexedProvider {
     return this.docs.get(docName)?.synced ?? false;
   }
 
+  /**
+   * What this connection knows about one document's progress to the server,
+   * for the status icons and the inspector. Null when it is not subscribed.
+   *
+   * A copy, not a view: callers only read it, and nothing they hold on to
+   * should be able to move under them.
+   */
+  docSyncState(docName: string): DocSyncState | null {
+    const sub = this.docs.get(docName);
+    if (!sub) return null;
+    return {
+      connected: this.isConnected(),
+      synced: sub.synced,
+      pending: sub.pending.length,
+      flushing: sub.flushing,
+      hasUnsentWork: sub.hasUnsentWork,
+      reconciling: sub.reconciling,
+      owesReconcile: sub.owesReconcile,
+      awaitingAck: this.unacked.get(docName) ?? 0,
+      lastSeq: sub.lastSeq,
+      snapshotSeq: sub.snapshotSeq,
+      decryptGapSeq: sub.decryptGapSeq,
+      oversizedPush: sub.oversizedPush,
+    };
+  }
+
+  /**
+   * Raised from inside the Yjs update handler, before the flush is scheduled,
+   * so a listener that throws must not be able to stop the flush.
+   */
+  private emitDocState(docName: string): void {
+    try {
+      this.emit('doc-state', docName);
+    } catch (err) {
+      log.warn('A doc-state listener threw', { docName, error: String(err) });
+    }
+  }
+
   // Event emitter
-  on(event: string, cb: EventCallback): void {
+  on(event: ProviderEvent, cb: EventCallback): void {
     if (!this.events.has(event)) this.events.set(event, new Set());
     this.events.get(event)!.add(cb);
   }
 
-  off(event: string, cb: EventCallback): void {
+  off(event: ProviderEvent, cb: EventCallback): void {
     this.events.get(event)?.delete(cb);
   }
 
-  private emit(event: string, ...args: unknown[]): void {
+  private emit(event: ProviderEvent, ...args: unknown[]): void {
     const cbs = this.events.get(event);
     if (cbs) {
       for (const cb of cbs) cb(...args);
@@ -633,8 +950,23 @@ export class MultiplexedProvider {
 
       this.ws.onclose = (event: CloseEvent) => {
         this.ws = null;
-        for (const sub of this.docs.values()) {
+        this.connectionEpoch++;
+        for (const [docName, sub] of this.docs) {
           sub.synced = false;
+          // No Ack can arrive on a dead socket, so whether those pushes landed
+          // is unknown — and the server drops some without a word. Unknown is
+          // treated as unsent: `owesReconcile` makes the next Subscribe ask
+          // from 0 and push the delta against everything the server holds.
+          // Without it a document with a read position caught up from there,
+          // pushed nothing, and a dropped edit was never sent again.
+          if ((this.unacked.get(docName) ?? 0) > 0) {
+            sub.owesReconcile = true;
+            sub.hadUnsyncedWork = true;
+          }
+          sub.reconciling = false;
+          // The next catch-up recomputes the delta; a retry on this socket
+          // would find it gone anyway.
+          this.clearDeltaRetry(sub);
 
           // Forget who else was here, because we can no longer know.
           //
@@ -662,6 +994,13 @@ export class MultiplexedProvider {
             awarenessProtocol.removeAwarenessStates(sub.awareness, peers, 'connection-lost');
           }
         }
+        // Pushes still outstanding for documents nobody holds right now — closed
+        // between the push and this close. Remembered, or the resubscribe asks
+        // from its checkpoint and never sends them again.
+        for (const [docName, n] of this.unacked) {
+          if (n > 0 && !this.docs.has(docName)) this.owedReconcile.add(docName);
+        }
+        this.unacked.clear();
         if (!this.shouldConnect) return;
 
         if (event.code === WS_CLOSE_SIGNED_OUT) {
@@ -750,7 +1089,20 @@ export class MultiplexedProvider {
     }
 
     const sub = this.docs.get(docName);
-    if (!sub) return;
+    if (!sub && messageType === MessageType.Ack) {
+      // An Ack for a push made before an unsubscribe. Nothing to advance, but
+      // it still pays off its push, or a later resubscribe inherits a count
+      // that no Ack will ever bring back to zero.
+      this.settleAck(docName);
+      return;
+    }
+    if (!sub) {
+      // Rare, and invisible until now: a frame for a document this client is
+      // not subscribed to. Logged so a missing update can be told from one
+      // that arrived for a document nobody was holding.
+      log.debug('Dropped a frame for a document not subscribed here', { docName, messageType });
+      return;
+    }
 
     switch (messageType) {
       case MessageType.Snapshot: {
@@ -785,7 +1137,7 @@ export class MultiplexedProvider {
 
       case MessageType.Awareness: {
         const update = decoding.readVarUint8Array(decoder);
-        awarenessProtocol.applyAwarenessUpdate(sub.awareness, update, 'remote');
+        this.receivePresence(docName, sub, update);
         break;
       }
 
@@ -796,14 +1148,34 @@ export class MultiplexedProvider {
         //
         // On the receive chain like everything else, or it could advance
         // lastSeq past updates still waiting to decrypt.
+        //
+        // And only once this connection's catch-up has arrived. An Ack says
+        // which sequence our update got, not that we hold everything below
+        // it: that follows only for a socket that was already receiving the
+        // document. A push can go out before the Subscribe does — the
+        // Subscribe waits for the stored checkpoint to load, the push does
+        // not — and the server registers the socket on the push. Every peer
+        // update appended before that was never sent to us. Taking the Ack as
+        // the floor then made the Subscribe ask from above them, and they
+        // were never asked for again: a guest joining a folder never saw a
+        // file the owner created a moment earlier (NEC-87). Before `synced`,
+        // the SyncStatus that ends the catch-up sets the floor instead.
         const seq = decoding.readVarUint(decoder);
+        const ackEpoch = this.connectionEpoch;
         sub.recvChain = sub.recvChain.then(() => {
-          if (sub.decryptGapSeq === null) {
+          if (sub.synced && sub.decryptGapSeq === null) {
             sub.lastSeq = Math.max(sub.lastSeq, seq);
-            this.scheduleSeqSave(sub);
+            this.scheduleSeqSave(docName, sub);
           }
+          // Counted whether or not the catch-up has arrived: the floor above
+          // needs it, but "the server recorded our push" is true either way.
+          // Only for the socket it arrived on, though: queued behind a slow
+          // decrypt it can run after a close and a reconnect, when the count
+          // it would pay off belongs to a push on the new socket.
+          if (ackEpoch === this.connectionEpoch) this.settleAck(docName);
           sub.updatesSinceSnapshot++;
           this.maybeCompact(docName, sub);
+          this.emitDocState(docName);
         });
         break;
       }
@@ -846,6 +1218,48 @@ export class MultiplexedProvider {
   }
 
   /**
+   * Open a presence frame and apply what opens.
+   *
+   * Each entry is opened on its own and a refused one is dropped, not the
+   * frame: a QueryAwareness reply carries everybody at once, and one peer on a
+   * key generation this device lacks should not hide everyone else. What does
+   * open is re-encoded under its original client id and clock and applied as
+   * y-protocols always applied it, so every rule about staleness and removal
+   * still holds.
+   */
+  private receivePresence(docName: string, sub: DocSubscription, update: Uint8Array): void {
+    let entries: PresenceEntry[];
+    try {
+      entries = decodeEntries(update);
+    } catch (err) {
+      log.debug('Dropped a malformed presence frame', { docName, error: String(err) });
+      return;
+    }
+    const epoch = this.connectionEpoch;
+    sub.presenceRecvChain = sub.presenceRecvChain
+      .then(async () => {
+        const kept: PresenceEntry[] = [];
+        let refused = 0;
+        let reason = '';
+        for (const entry of entries) {
+          try {
+            const state = await openPresence(this.cipher, docName, entry.clientID, entry.clock, entry.json);
+            kept.push({ ...entry, json: JSON.stringify(state) });
+          } catch (err) {
+            refused++;
+            reason ||= String(err);
+          }
+        }
+        // Logged, because a refused state is a caret that silently fails to
+        // draw, and the only way to tell that from a peer who is not there.
+        if (refused > 0) log.debug('Refused presence states', { docName, refused, kept: kept.length, reason });
+        if (this.docs.get(docName) !== sub || epoch !== this.connectionEpoch || kept.length === 0) return;
+        awarenessProtocol.applyAwarenessUpdate(sub.awareness, encodeEntries(kept), 'remote');
+      })
+      .catch((err) => log.warn('Presence receive failed', { docName, error: String(err) }));
+  }
+
+  /**
    * Write the checkpoint, debounced.
    *
    * Not on every update: the sequence moves with every keystroke a peer makes,
@@ -853,14 +1267,29 @@ export class MultiplexedProvider {
    * the tail on the next launch, which is the behaviour this whole mechanism
    * improves on rather than something it can break.
    */
-  private scheduleSeqSave(sub: DocSubscription): void {
+  private scheduleSeqSave(docName: string, sub: DocSubscription): void {
     if (!sub.seqStore || sub.seqSaveTimer) return;
     sub.seqSaveTimer = window.setTimeout(() => {
       sub.seqSaveTimer = null;
+      // No longer this provider's document. Once it is gone, nothing here can
+      // say what it owes: the close that would have marked an outstanding push
+      // as owed finds no subscription to mark.
+      if (this.docs.get(docName) !== sub) return;
       // Skipped while a decrypt gap is open: `lastSeq` deliberately stops
       // advancing there, and recording it would freeze this device at the hole
       // for good.
       if (sub.decryptGapSeq !== null) return;
+      // Skipped while anything is unconfirmed (SAFE-A10). The checkpoint
+      // stores the document's state vector beside the sequence, and that
+      // vector would include the unconfirmed edit — so the next launch would
+      // find it matching, trust it, resume past the reconcile, and the edit
+      // would never be sent again. Not writing leaves the previous checkpoint,
+      // whose vector predates the edit and so is refused on load. The save
+      // comes round again when the last Ack settles (`settleAck`).
+      //
+      // Checked in the same synchronous block as the save captures its
+      // vector, so nothing can become owed in between.
+      if (this.owesServer(docName, sub)) return;
       void sub.seqStore?.save(sub.lastSeq);
     }, SEQ_SAVE_DEBOUNCE_MS);
   }
@@ -869,7 +1298,7 @@ export class MultiplexedProvider {
     {
         if (sub.decryptGapSeq === null) {
           sub.lastSeq = Math.max(sub.lastSeq, highest);
-          this.scheduleSeqSave(sub);
+          this.scheduleSeqSave(docName, sub);
         }
         sub.synced = true;
         // Only when we have work the server may not have seen: offline edits,
@@ -878,15 +1307,22 @@ export class MultiplexedProvider {
         // encryption this is the only visibility into that decision: the
         // server's copy cannot be read back to work out what went missing.
         log.debug('Reconciliation decision', {
-          docName, hasUnsentWork: sub.hasUnsentWork, lastSeq: sub.lastSeq,
-          catchUpFrames: sub.catchUp.length,
+          docName, hasUnsentWork: sub.hasUnsentWork, owesReconcile: sub.owesReconcile,
+          catchUpFrom: sub.catchUpFrom, lastSeq: sub.lastSeq, catchUpFrames: sub.catchUp.length,
         });
-        if (sub.hasUnsentWork || sub.lastSeq === 0) {
+        // A catch-up from 0 always reconciles. Testing `lastSeq === 0` here
+        // meant "the server's log is empty", not "cold start": the catch-up has
+        // already raised `lastSeq` by now, so a restart with no trusted
+        // checkpoint — which is exactly when memory has forgotten what went
+        // unsent — caught up, pushed nothing and read as synced (NEC-105).
+        if (sub.hasUnsentWork || sub.owesReconcile || sub.catchUpFrom === 0) {
+          sub.reconciling = true;
           sub.chain = sub.chain.then(() => this.pushLocalDelta(docName, sub));
         } else {
           sub.catchUp = [];
         }
         this.emit(`synced:${docName}`);
+        this.emitDocState(docName);
 
         // Query awareness after sync is complete
         if (this.ws && this.ws.readyState === WebSocket.OPEN) {
@@ -912,7 +1348,8 @@ export class MultiplexedProvider {
     // pushLocalDelta diffs against what catch-up delivered, so a partial
     // catch-up would make the server look emptier than it is and we would
     // re-upload the entire document.
-    const from = sub.hasUnsentWork ? 0 : sub.lastSeq;
+    const from = sub.hasUnsentWork || sub.owesReconcile ? 0 : sub.lastSeq;
+    sub.catchUpFrom = from;
 
     const encoder = encoding.createEncoder();
     encoding.writeVarString(encoder, docName);
@@ -937,7 +1374,32 @@ export class MultiplexedProvider {
    * costs one merge and no traffic.
    */
   private pushLocalDelta(docName: string, sub: DocSubscription): void {
+    // Settled below in every branch that returns, and by the close handler in
+    // the one where the socket has gone.
+    sub.reconciling = false;
     if (!this.isConnected()) return;
+
+    const serverStateVector = sub.catchUp.length
+      ? Y.encodeStateVectorFromUpdate(Y.mergeUpdates(sub.catchUp))
+      : Y.encodeStateVector(new Y.Doc());
+    sub.catchUp = [];
+    sub.serverSV = serverStateVector;
+    this.sendDelta(docName, sub, serverStateVector, 0);
+  }
+
+  /**
+   * Send the document's delta against `serverSV`, the state the server was
+   * last known to hold.
+   *
+   * Run on `sub.chain`, by the reconcile and by its retries. A retry reuses the
+   * same vector rather than catching up again: the server can only have gained
+   * since, so the delta is a superset of what it lacks, and it includes every
+   * edit made in the meantime.
+   */
+  private sendDelta(docName: string, sub: DocSubscription, serverSV: Uint8Array, attempt: number): void {
+    // Unsubscribed, or the socket went: the reconnect's own catch-up takes it
+    // from here, and `owesReconcile` is still set if anything was owed.
+    if (!this.isConnected() || this.docs.get(docName) !== sub) return;
 
     // Anything queued is already in sub.ydoc — it arrived through Yjs's own
     // update callback — so the delta below is a superset of it. Dropping the
@@ -945,37 +1407,134 @@ export class MultiplexedProvider {
     // chain guarantees no flush is mid-encrypt at this moment.
     sub.pending = [];
 
-    const serverStateVector = sub.catchUp.length
-      ? Y.encodeStateVectorFromUpdate(Y.mergeUpdates(sub.catchUp))
-      : Y.encodeStateVector(new Y.Doc());
-    sub.catchUp = [];
-
     sub.hasUnsentWork = false;
+    sub.owesReconcile = false;
 
-    const delta = Y.encodeStateAsUpdate(sub.ydoc, serverStateVector);
+    const delta = Y.encodeStateAsUpdate(sub.ydoc, serverSV);
+    const holds = sub.oversizeHolds;
     if (delta.length > EMPTY_UPDATE_LENGTH) sub.hadUnsyncedWork = true;
     log.debug('Computed the delta the server is missing', {
-      docName, deltaBytes: delta.length, willPush: delta.length > EMPTY_UPDATE_LENGTH,
+      docName, deltaBytes: delta.length, willPush: delta.length > EMPTY_UPDATE_LENGTH, attempt,
     });
-    if (delta.length <= EMPTY_UPDATE_LENGTH) return;
+    if (delta.length <= EMPTY_UPDATE_LENGTH) {
+      // Nothing the server lacks — including whatever was once too large, if
+      // the document no longer holds it.
+      sub.oversizedPush = null;
+      this.emitDocState(docName);
+      if (sub.synced) this.scheduleSeqSave(docName, sub);
+      return;
+    }
 
+    // Counted now, before the encrypt, so there is no moment in which the
+    // delta is neither pending nor awaiting its Ack.
+    this.countPush(docName);
+    this.emitDocState(docName);
+    const epoch = this.connectionEpoch;
+    const takeBack = (): void => {
+      // Its count is taken back on the socket it was made on — it never went,
+      // so no Ack will — or the note would read "sending" for as long as that
+      // socket lives. `owesReconcile` is what brings it round again, and no
+      // flush can clear it.
+      if (epoch === this.connectionEpoch) this.settleAck(docName);
+      sub.owesReconcile = true;
+      sub.hadUnsyncedWork = true;
+    };
     void (async () => {
       const { payload, keyId } = await this.cipher.encryptPayload(docName, delta);
       if (!this.isConnected()) {
-        // Put it back: the reconnect will compute it again from a fresh
-        // catch-up, but leaving hasUnsentWork set is what makes that happen.
-        sub.hasUnsentWork = true;
-        sub.hadUnsyncedWork = true;
+        takeBack();
+        this.emitDocState(docName);
         return;
       }
+      if (payload.length > MAX_PUSH_BYTES) {
+        // Never sent: the server would drop it without an Ack, or, over the
+        // frame limit, close the socket — and the reconcile that close forces
+        // would send it again, about once a second (SAFE-A11).
+        takeBack();
+        this.holdOversized(docName, sub, payload.length);
+        return;
+      }
+      // A different socket from the one this delta was counted on: its close
+      // zeroed the count. The delta is still a superset of what that server
+      // lacked, so it is sent — but counted again, on this socket, or it would
+      // go out invisible and its Ack would pay off somebody else's push.
+      if (epoch !== this.connectionEpoch) this.countPush(docName);
       const encoder = encoding.createEncoder();
       encoding.writeVarString(encoder, docName);
       encoding.writeVarUint(encoder, MessageType.Push);
       encoding.writeVarUint8Array(encoder, payload);
       encoding.writeVarString(encoder, keyId);
       this.ws!.send(encoding.toUint8Array(encoder));
+      if (sub.oversizeHolds === holds) sub.oversizedPush = null;
+      this.emitDocState(docName);
       log.info('Sent offline changes on reconnect', { docName, bytes: delta.length });
-    })();
+    })().catch((err: unknown) => {
+      // Logged loudly once: a key still missing on the tenth try is the same
+      // fault, and the note already says it is not synced.
+      if (attempt === 0) log.error('Could not send the reconnect delta', { docName, error: String(err) });
+      else log.debug('Retry of the reconnect delta failed', { docName, attempt, error: String(err) });
+      takeBack();
+      this.emitDocState(docName);
+      // Retried on this socket. Waiting for the next reconnect left a note on
+      // "sending" for as long as the connection held, and let later edits
+      // reach peers without the ones they build on.
+      const delay = Math.min(DELTA_RETRY_BASE_MS * 2 ** attempt, DELTA_RETRY_MAX_MS);
+      this.scheduleDeltaRetry(docName, sub, delay, attempt + 1, false);
+    });
+  }
+
+  /**
+   * Hold back a change too large to push (SAFE-A11).
+   *
+   * The work stays where it is — the document, IndexedDB, the file on disk —
+   * and `owesReconcile` keeps the note from reading as synced. Nothing retries
+   * on a timer, because the same document gives the same size. It is tried
+   * again on the next edit, reconnect or launch, so trimming or splitting the
+   * note is all it takes to recover.
+   */
+  private holdOversized(docName: string, sub: DocSubscription, bytes: number): void {
+    sub.oversizedPush = bytes;
+    sub.oversizeHolds++;
+    sub.owesReconcile = true;
+    sub.hadUnsyncedWork = true;
+    log.warn('A change is too large to send; kept on this device', {
+      docName, bytes, limit: MAX_PUSH_BYTES,
+    });
+    this.emitDocState(docName);
+  }
+
+  /**
+   * Queue another `sendDelta` after `delay`. With `restart`, an armed timer is
+   * pushed back (a debounce); without it, an armed timer stands.
+   */
+  private scheduleDeltaRetry(
+    docName: string, sub: DocSubscription, delay: number, attempt: number, restart: boolean,
+  ): void {
+    if (sub.deltaRetryTimer !== null) {
+      if (!restart) return;
+      window.clearTimeout(sub.deltaRetryTimer);
+    }
+    const epoch = this.connectionEpoch;
+    sub.deltaRetryTimer = window.setTimeout(() => {
+      sub.deltaRetryTimer = null;
+      // Only on the socket it was armed for, for the subscription it was armed
+      // for, and only while something is still owed.
+      if (epoch !== this.connectionEpoch || this.docs.get(docName) !== sub || !sub.owesReconcile) return;
+      const serverSV = sub.serverSV ?? Y.encodeStateVector(new Y.Doc());
+      sub.chain = sub.chain.then(() => this.sendDelta(docName, sub, serverSV, attempt));
+    }, delay);
+  }
+
+  private clearSeqSave(sub: DocSubscription): void {
+    if (sub.seqSaveTimer === null) return;
+    window.clearTimeout(sub.seqSaveTimer);
+    sub.seqSaveTimer = null;
+  }
+
+  private clearDeltaRetry(sub: DocSubscription): void {
+    if (sub.deltaRetryTimer === null) return;
+    window.clearTimeout(sub.deltaRetryTimer);
+    sub.deltaRetryTimer = null;
   }
 
   /**

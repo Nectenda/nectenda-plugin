@@ -193,11 +193,21 @@ export async function deriveEncKey(masterKey: Uint8Array): Promise<CryptoKey> {
  * the server can store without understanding its shape.
  *
  * Overhead is 28 bytes: 12-byte IV + 16-byte GCM tag.
+ *
+ * `additionalData` is authenticated but not carried: the opener must supply the
+ * same bytes or the tag fails. Presence uses it to bind a state to one note,
+ * one participant and one clock value, which the server could otherwise move
+ * between them. Omitted, the output is exactly what it always was, so every
+ * existing ciphertext still opens.
  */
-export async function encrypt(key: CryptoKey, plaintext: Uint8Array): Promise<Uint8Array> {
+export async function encrypt(
+  key: CryptoKey,
+  plaintext: Uint8Array,
+  additionalData?: Uint8Array,
+): Promise<Uint8Array> {
   const iv = randomBytes(IV_LENGTH);
   const ct = await crypto.subtle.encrypt(
-    { name: 'AES-GCM', iv: iv as BufferSource },
+    gcmParams(iv, additionalData),
     key,
     plaintext as BufferSource,
   );
@@ -207,18 +217,34 @@ export async function encrypt(key: CryptoKey, plaintext: Uint8Array): Promise<Ui
   return out;
 }
 
-export async function decrypt(key: CryptoKey, blob: Uint8Array): Promise<Uint8Array> {
+export async function decrypt(
+  key: CryptoKey,
+  blob: Uint8Array,
+  additionalData?: Uint8Array,
+): Promise<Uint8Array> {
   if (blob.length < IV_LENGTH + 16) {
     throw new Error('Ciphertext too short to be valid');
   }
   const iv = blob.subarray(0, IV_LENGTH);
   const ct = blob.subarray(IV_LENGTH);
   const pt = await crypto.subtle.decrypt(
-    { name: 'AES-GCM', iv: iv as BufferSource },
+    gcmParams(iv, additionalData),
     key,
     ct as BufferSource,
   );
   return new Uint8Array(pt);
+}
+
+/**
+ * Left out of the parameters entirely when absent, rather than passed as an
+ * empty array. GCM treats the two identically, but "not present" is the form
+ * every ciphertext before presence sealing was made with, and it should stay
+ * visibly the same call.
+ */
+function gcmParams(iv: Uint8Array, additionalData: Uint8Array | undefined): AesGcmParams {
+  return additionalData
+    ? { name: 'AES-GCM', iv: iv as BufferSource, additionalData: additionalData as BufferSource }
+    : { name: 'AES-GCM', iv: iv as BufferSource };
 }
 
 export async function generateFolderContentKey(): Promise<CryptoKey> {

@@ -1,23 +1,23 @@
 import type * as Y from 'yjs';
 import type * as awarenessProtocol from 'y-protocols/awareness';
-import type { ProviderStatus, SeqStore } from './multiplexed-provider';
+import type { DocSyncState, ProviderEvent, ProviderStatus, SeqStore } from './multiplexed-provider';
 import { log } from './logger';
 
 type EventCallback = (...args: unknown[]) => void;
 
 /**
  * Events the router raises itself rather than forwarding from a connection.
+ *
  * `status` is the aggregate; `signed-out` names the one connection whose
  * session the server refused, because the aggregate cannot say which.
- */
-/**
- * Events the router raises itself rather than forwarding from a provider.
+ * `routes-changed` says the set of placeable documents may have grown — a
+ * connection arrived, or the folder table was rewritten — so anything holding
+ * a document it could not place should try again.
  *
- * `routes-changed` says that the set of placeable documents may have grown: a
- * connection arrived, or the folder table was rewritten. Anything holding a
- * document it could not place should try again.
+ * Typed as ProviderEvent rather than plain strings, so this list and the
+ * vocabulary it is drawn from cannot drift apart.
  */
-const ROUTER_EVENTS = new Set(['status', 'signed-out', 'routes-changed']);
+const ROUTER_EVENTS = new Set<ProviderEvent>(['status', 'signed-out', 'routes-changed']);
 
 /**
  * What the sync engine needs from a provider.
@@ -38,8 +38,14 @@ export interface SyncProvider {
   contributedUnsyncedWork(docName: string): boolean;
   isConnected(): boolean;
   isSynced(docName: string): boolean;
-  on(event: string, cb: EventCallback): void;
-  off(event: string, cb: EventCallback): void;
+  /**
+   * Progress to the server, for the status icons and the inspector. Optional
+   * so a test double need not invent one; a provider without it reports
+   * nothing, and nothing is read as not confirmed (SAFE-E3).
+   */
+  docSyncState?(docName: string): DocSyncState | null;
+  on(event: ProviderEvent, cb: EventCallback): void;
+  off(event: ProviderEvent, cb: EventCallback): void;
   /** A fresh token for the next connect. Optional: the router itself has none. */
   setToken?(token: string): void;
 }
@@ -69,7 +75,7 @@ export function folderOfDoc(docName: string): string | null {
  * no routes at all — every document goes to it — which is exactly the
  * self-hosted case and why that path changes nothing.
  *
- * Status is aggregated for the status bar: the worst of the connections wins,
+ * Status is aggregated for the header icon: the worst of the connections wins,
  * because "connected" must mean every mapped folder is syncing, not that one
  * of them is. A document-scoped event (`synced:<doc>`) is only ever emitted by
  * the connection that owns the document, so listeners are attached to every
@@ -78,7 +84,7 @@ export function folderOfDoc(docName: string): string | null {
 export class ProviderRouter implements SyncProvider {
   private connections = new Map<string, ShardConnection>();
   private folderRoutes = new Map<string, string>();
-  private listeners = new Map<string, Set<EventCallback>>();
+  private listeners = new Map<ProviderEvent, Set<EventCallback>>();
   private statuses = new Map<string, ProviderStatus>();
   private aggregate: ProviderStatus = 'disconnected';
   private statusHandlers = new Map<string, EventCallback>();
@@ -265,20 +271,24 @@ export class ProviderRouter implements SyncProvider {
     return this.route(docName)?.provider.isSynced(docName) ?? false;
   }
 
-  on(event: string, cb: EventCallback): void {
+  docSyncState(docName: string): DocSyncState | null {
+    return this.route(docName)?.provider.docSyncState?.(docName) ?? null;
+  }
+
+  on(event: ProviderEvent, cb: EventCallback): void {
     if (!this.listeners.has(event)) this.listeners.set(event, new Set());
     this.listeners.get(event)!.add(cb);
     if (ROUTER_EVENTS.has(event)) return;
     for (const c of this.connections.values()) c.provider.on(event, cb);
   }
 
-  off(event: string, cb: EventCallback): void {
+  off(event: ProviderEvent, cb: EventCallback): void {
     this.listeners.get(event)?.delete(cb);
     if (ROUTER_EVENTS.has(event)) return;
     for (const c of this.connections.values()) c.provider.off(event, cb);
   }
 
-  /** For the status bar and tests. */
+  /** For the header icon and tests. */
   status(): ProviderStatus {
     return this.aggregate;
   }

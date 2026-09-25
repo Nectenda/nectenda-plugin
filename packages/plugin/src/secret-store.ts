@@ -21,8 +21,7 @@ import { log } from './logger';
  * vaults are commonly synced with Dropbox or iCloud. It does **not** isolate
  * them from other plugins: secret ids are global, and a probe of Obsidian
  * 1.13.7 confirmed one plugin can read and enumerate another's. That is by
- * design and no storage choice available to us changes it. See
- * docs/key-storage.md.
+ * design and no storage choice available to us changes it.
  */
 export interface SecretStore {
   /** How secrets are being kept, for the settings UI to state plainly. */
@@ -136,8 +135,8 @@ class VaultFileStore implements SecretStore {
  * `!(adapter instanceof DesktopAdapter) || adapter.isEncryptionAvailable()`,
  * and the mobile adapter is a different class, so it short-circuits to true
  * without checking anything. A phone therefore always takes the keychain
- * branch. Measured, along with what that store actually does there, in
- * docs/key-storage.md.
+ * branch. Measured on a device, along with what that store actually does
+ * there, rather than taken from documentation.
  */
 /**
  * Electron's safeStorage, reached the way Obsidian reaches it.
@@ -226,8 +225,8 @@ class DeviceStore implements SecretStore {
  *
  * Everything else caches nothing. That is deliberate and is the one place this
  * must not fall back to `data.json`: an unwrapped identity private key in a file
- * a vault sync carries off the device is precisely the escalation
- * docs/key-storage.md exists to prevent. A Linux box with no keyring lands here.
+ * a vault sync carries off the device is precisely the escalation this whole
+ * arrangement exists to prevent. A Linux box with no keyring lands here.
  */
 export function createDeviceStore(vaultScoped: SecretStore): SecretStore {
   const safe = safeStorage();

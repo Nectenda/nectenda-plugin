@@ -45,8 +45,11 @@
   white-space: nowrap;
   pointer-events: none;
   z-index: 102;
-  /* Beats the base theme's transition to opacity 0 on mouse-out. */
-  opacity: 1;
+  /* Beats the base theme's transition to opacity 0 on mouse-out. See-through
+     rather than solid, the same 0.72 as a collaborator's mouse pointer and its
+     name, so the text under the label stays readable and the two kinds of
+     label look alike (NEC-92 appearance review). */
+  opacity: 0.72;
   transition: none;
 }
 
@@ -86,6 +89,154 @@
  * always shown, and it collides with the label.
  */
 .markdown-source-view .cm-editor .cm-ySelectionCaretDot { display: none; }
+
+/*
+ * Collaborators' mouse pointers (remote-pointer.ts).
+ *
+ * Drawn in a CodeMirror layer above the text, at the character the other
+ * person is pointing at in *this* layout. The same three-class depth as the
+ * caret rules above, for the same reason, even though these are our own
+ * classes: it keeps the pair consistent if a theme targets `.cm-editor` rules.
+ *
+ * Never interactive: a pointer drawn over a word must not swallow the click
+ * meant for that word.
+ */
+.markdown-source-view .cm-editor .nectenda-pointer-layer {
+  pointer-events: none;
+  z-index: 103;
+}
+
+.markdown-source-view .cm-editor .nectenda-pointer {
+  /* Each marker sets this inline from the person's broadcast colour, the same
+     value their caret and presence circle use; this is only the fallback. */
+  --nectenda-pointer-colour: var(--text-accent);
+  /* How far below the arrow's tip the pointed-at line ends; set per marker. */
+  --nectenda-pointer-drop: 0px;
+  position: absolute;
+  display: flex;
+  align-items: flex-start;
+  pointer-events: none;
+  /* See-through, so the text under the arrow and the name stays readable
+     (second appearance review). The fade below animates from here to 0. */
+  opacity: 0.72;
+  /* Glide between the positions a collaborator sends (at most twenty a
+     second), rather than stepping between them. */
+  transition: left 90ms linear, top 90ms linear;
+  /* Held for 3 s after the last real move, then faded. A pointer left resting
+     on a word is otherwise mistaken for something being pointed at. Mirrored
+     by POINTER_FADE_MS; restarted by the marker on each move. */
+  animation: nectenda-pointer-fade 600ms ease 3s forwards;
+}
+
+@keyframes nectenda-pointer-fade {
+  to { opacity: 0; }
+}
+
+.markdown-source-view .cm-editor .nectenda-pointer-arrow {
+  width: 12px;
+  height: 16px;
+  flex: none;
+  /* The tip of the arrow is the point, so the element's origin is the tip. */
+  margin: -1px 0 0 -1px;
+  overflow: visible;
+}
+
+.markdown-source-view .cm-editor .nectenda-pointer-arrow path,
+.markdown-source-view .cm-editor .nectenda-pointer-chevron path {
+  fill: var(--nectenda-pointer-colour);
+  stroke-width: 1.2px;
+  stroke-linejoin: round;
+}
+
+/* An outline in the page's own ink, so a pale seat colour still reads. */
+.theme-light .markdown-source-view .cm-editor .nectenda-pointer svg path { stroke: #ffffff; }
+.theme-dark .markdown-source-view .cm-editor .nectenda-pointer svg path { stroke: #14201b; }
+
+/*
+ * Off-screen: the text being pointed at (or a caret) is beyond the visible part
+ * of the note, so the marker is pinned to that edge, with a chevron pointing
+ * the way to scroll. It still follows the other coordinate, so it only glides
+ * along that axis — the pinned one changes with every scroll, and animating it
+ * would make the indicator lag behind the edge it is pinned to.
+ */
+.markdown-source-view .cm-editor .nectenda-pointer-chevron {
+  display: none;
+  width: 16px;
+  height: 10px;
+  flex: none;
+  overflow: visible;
+}
+
+.markdown-source-view .cm-editor .nectenda-pointer-edge {
+  align-items: center;
+  gap: 4px;
+}
+.markdown-source-view .cm-editor .nectenda-pointer-edge .nectenda-pointer-arrow { display: none; }
+.markdown-source-view .cm-editor .nectenda-pointer-edge .nectenda-pointer-chevron { display: block; }
+.markdown-source-view .cm-editor .nectenda-pointer-edge .nectenda-pointer-name { margin: 0; }
+
+.markdown-source-view .cm-editor .nectenda-pointer-edge-top {
+  flex-direction: column;
+  transform: translateX(-50%);
+  transition: left 90ms linear;
+}
+.markdown-source-view .cm-editor .nectenda-pointer-edge-bottom {
+  flex-direction: column-reverse;
+  transform: translate(-50%, -100%);
+  transition: left 90ms linear;
+}
+.markdown-source-view .cm-editor .nectenda-pointer-edge-bottom .nectenda-pointer-chevron { transform: rotate(180deg); }
+.markdown-source-view .cm-editor .nectenda-pointer-edge-left {
+  flex-direction: row;
+  transform: translateY(-50%);
+  transition: top 90ms linear;
+}
+.markdown-source-view .cm-editor .nectenda-pointer-edge-left .nectenda-pointer-chevron { transform: rotate(-90deg); }
+.markdown-source-view .cm-editor .nectenda-pointer-edge-right {
+  flex-direction: row-reverse;
+  transform: translate(-100%, -50%);
+  transition: top 90ms linear;
+}
+.markdown-source-view .cm-editor .nectenda-pointer-edge-right .nectenda-pointer-chevron { transform: rotate(90deg); }
+
+/*
+ * A collaborator's text cursor, off-screen. Only ever drawn on an edge (in view,
+ * y-codemirror draws the caret itself), marked with an upright bar so it reads
+ * as a caret and not as their pointer, and never faded, because a caret does
+ * not fade.
+ */
+.markdown-source-view .cm-editor .nectenda-pointer-caret,
+.markdown-source-view .cm-editor .nectenda-pointer-with-caret { animation: none; }
+.markdown-source-view .cm-editor .nectenda-pointer-caret .nectenda-pointer-name::before,
+.markdown-source-view .cm-editor .nectenda-pointer-with-caret .nectenda-pointer-name::before {
+  content: '';
+  display: inline-block;
+  width: 2px;
+  height: 0.95em;
+  margin-right: 4px;
+  vertical-align: -0.12em;
+  background-color: currentColor;
+}
+
+/* The name, in the same voice as the caret label: interface font, filled with
+   the person's colour. */
+.markdown-source-view .cm-editor .nectenda-pointer-name {
+  /* The tip is at the middle of the character; the name starts just right of
+     it and below the line, so it never covers the line being pointed at
+     (second appearance review). */
+  margin: calc(var(--nectenda-pointer-drop) + 2px) 0 0 -3px;
+  padding: 1px 5px;
+  font-family: var(--font-interface);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.4;
+  border-radius: 2px;
+  white-space: nowrap;
+  background-color: var(--nectenda-pointer-colour);
+}
+
+.theme-light .markdown-source-view .cm-editor .nectenda-pointer-name { color: #ffffff; }
+.theme-dark .markdown-source-view .cm-editor .nectenda-pointer-name { color: #14201b; }
 
 /*
  * Selections carry no `opacity` rule, and that absence is the fix.
@@ -151,7 +302,7 @@
  * carries — so a circle and its caret can never disagree.
  *
  * Colour alone never identifies anybody here: every circle carries the full
- * name in `title` and `aria-label`, and the status bar keeps a words version.
+ * name in `title` and `aria-label`, and the header icon keeps a number and words.
  */
 .nectenda-presence {
   display: inline-flex;
@@ -199,6 +350,94 @@
   background-color: var(--background-modifier-border);
   color: var(--text-muted);
 }
+
+/*
+ * Per-note sync status in the file explorer.
+ *
+ * Shape as well as colour, so the state never rests on colour alone: a filled
+ * dot is confirmed, a ring is on its way, a hollow grey ring is offline, a
+ * dashed ring is not syncing, and an exclamation is a problem. Every mark also
+ * carries its meaning in words in `aria-label`, which Obsidian shows on hover.
+ */
+.nectenda-file-status {
+  display: inline-block;
+  flex: none;
+  width: 8px;
+  height: 8px;
+  margin-left: 6px;
+  border-radius: 50%;
+  box-sizing: border-box;
+  align-self: center;
+}
+.nectenda-file-status.nectenda-file-confirmed {
+  background-color: var(--color-green);
+  opacity: 0.8;
+}
+.nectenda-file-status.nectenda-file-sending {
+  border: 2px solid var(--interactive-accent);
+}
+.nectenda-file-status.nectenda-file-offline {
+  border: 2px solid var(--text-faint);
+}
+.nectenda-file-status.nectenda-file-untracked {
+  border: 1px dashed var(--text-faint);
+}
+.nectenda-file-status.nectenda-file-error {
+  width: auto;
+  height: auto;
+  border-radius: 0;
+  color: var(--text-error);
+  font-weight: 700;
+  font-size: 0.8em;
+  line-height: 1;
+}
+.nectenda-file-status.nectenda-file-error::before { content: '!'; }
+
+/*
+ * The Nectenda icon in each note's header: connection, this note's status,
+ * and a badge counting the others here. It replaced the status-bar text, which
+ * mobile never had. The tone colours the mark; the label and the badge say the
+ * same thing without colour.
+ */
+.nectenda-header-status { position: relative; }
+.nectenda-header-status.nectenda-header-ok { color: var(--color-green); }
+.nectenda-header-status.nectenda-header-busy { color: var(--interactive-accent); }
+.nectenda-header-status.nectenda-header-offline { color: var(--text-faint); }
+.nectenda-header-status.nectenda-header-problem { color: var(--text-error); }
+.nectenda-header-status.nectenda-header-idle { color: var(--text-muted); }
+.nectenda-header-badge {
+  position: absolute;
+  right: -2px;
+  bottom: -2px;
+  min-width: 14px;
+  height: 14px;
+  padding: 0 3px;
+  border-radius: 7px;
+  box-sizing: border-box;
+  background-color: var(--interactive-accent);
+  color: var(--text-on-accent);
+  font-family: var(--font-interface);
+  font-size: 9px;
+  font-weight: 600;
+  line-height: 14px;
+  text-align: center;
+  pointer-events: none;
+}
+
+/* The sync-state inspector pane. */
+.nectenda-inspector { font-size: var(--font-ui-small); }
+.nectenda-inspector-bar { display: flex; justify-content: flex-end; margin-bottom: 8px; }
+.nectenda-inspector-summary { color: var(--text-muted); }
+.nectenda-inspector-table { width: 100%; border-collapse: collapse; margin-bottom: 16px; }
+.nectenda-inspector-table th,
+.nectenda-inspector-table td {
+  text-align: left;
+  padding: 2px 6px;
+  border-bottom: 1px solid var(--background-modifier-border);
+  vertical-align: top;
+  word-break: break-all;
+}
+.nectenda-inspector-table th { font-weight: 500; color: var(--text-muted); width: 55%; word-break: normal; }
 
 /* The provider marks, wherever they are drawn. */
 .nectenda-provider-mark { flex: none; }

@@ -3,7 +3,8 @@ import {
   hashChunkStream, exportRawKey, importContentKey, encrypt, decrypt,
   toBase64, fromBase64, BLOB_CHUNK_SIZE, type BlobEntry,
 } from '@nectenda/shared';
-import type NectendaPlugin from './main';
+import type { DeviceStateStore } from './device-state';
+import type { FolderKeys } from './folder-crypto';
 import type { VaultAdapter } from './vault-adapter';
 import { chooseCodec } from './blob-policy';
 import { LEARNING_FLOOR_BYTES } from './device-state';
@@ -61,13 +62,86 @@ interface FolderState {
 /** Local modifications settle before an upload. Image editors write repeatedly. */
 const MODIFY_DEBOUNCE_MS = 2000;
 
+/** Where a folder's attachments live, and with what credential. */
+export interface BlobServer {
+  base: string;
+  token: string;
+}
+
+/**
+ * One of the three keyed lists that outlive a restart.
+ *
+ * Read-modify-write over an array, which is what the settings file holds.
+ * Separated out because the three were six near-identical methods differing
+ * only in which field they touched — and a queue that silently stopped being
+ * written is how an upload gets forgotten across a restart.
+ */
+export interface PersistedKeys {
+  get(): string[];
+  set(keys: string[]): void;
+}
+
+/**
+ * What attachment sync tells the person.
+ *
+ * A sink rather than direct calls, because every one of these is a case where
+ * something did **not** happen — a file too large to send, an account that
+ * cannot store more, a download waiting on a yes. Silence is the failure mode
+ * this codebase cares most about, so the ways of breaking it are named
+ * together and none of them can be dropped without the type noticing.
+ */
+export interface BlobNotifier {
+  /** Ask before spending someone's bandwidth. False means do not download. */
+  confirmLargeDownload(relativePath: string, bytes: number): Promise<boolean>;
+  attachmentTooLarge(relativePath: string, bytes: number, limit: number): void;
+  attachmentsNotIncluded(): void;
+  accountSuspended(): void;
+  storageFull(blobId: string): void;
+}
+
+/** What attachment sync needs from the plugin around it. */
+export interface BlobSyncDeps {
+  /** The folder's keys, or null when this device holds none. */
+  folderKeys(sharedFolderId: string): FolderKeys | null;
+  /** Where to send this folder's bytes. */
+  server(sharedFolderId: string): BlobServer;
+  /** The per-attachment size ceiling, which the account's plan decides. */
+  maxBlobBytes(): number;
+  /** Stamped on an entry, so a collaborator can see who added the file. */
+  username(): string;
+  /**
+   * What this device has already decided about a file — a download it crashed
+   * on, or one the person said no to. Null until the store has opened, which
+   * is why it is a function.
+   */
+  deviceState(): DeviceStateStore | null;
+  /**
+   * The folder listing, once it exists. Attachments are entries in it, and
+   * this is null for part of startup — hence a function, not a value.
+   */
+  listing(): BlobListing | null;
+  oversized: PersistedKeys;
+  pendingUploads: PersistedKeys;
+  pendingDeletes: PersistedKeys;
+  /** Write the three lists above back to disk. */
+  save(): Promise<void>;
+  notify: BlobNotifier;
+}
+
+/** The part of the folder listing that attachment sync reads and writes. */
+export interface BlobListing {
+  getBlobEntry(sharedFolderId: string, relativePath: string): BlobEntry | undefined;
+  setBlobEntry(sharedFolderId: string, relativePath: string, entry: BlobEntry): void;
+  listBlobs(sharedFolderId: string): Array<[string, BlobEntry]>;
+}
+
 export class BlobSync {
-  private plugin: NectendaPlugin;
+  private deps: BlobSyncDeps;
   private vault: VaultAdapter;
   private folders = new Map<string, FolderState>();
 
-  constructor(plugin: NectendaPlugin, vault: VaultAdapter) {
-    this.plugin = plugin;
+  constructor(deps: BlobSyncDeps, vault: VaultAdapter) {
+    this.deps = deps;
     this.vault = vault;
   }
 
@@ -144,7 +218,7 @@ export class BlobSync {
     const fullPath = `${state.localPath}/${relativePath}`;
     if (!this.vault.isFile(fullPath)) return false;
 
-    const keys = this.plugin.folderCrypto.get(sharedFolderId);
+    const keys = this.deps.folderKeys(sharedFolderId);
     if (!keys) {
       log.debug('No keys for folder; deferring attachment upload', { sharedFolderId });
       return false;
@@ -161,7 +235,7 @@ export class BlobSync {
       // to accept it. On a 750MB attachment that is seconds of pointless work
       // and a 750MB Blob; on a phone it is enough to end the app. The server
       // still enforces the limit — this only stops us wasting the trip.
-      const limit = this.plugin.maxBlobBytes();
+      const limit = this.deps.maxBlobBytes();
       if (stat.size > limit) {
         this.refusePermanently(sharedFolderId, relativePath, stat.size, limit);
         return false;
@@ -232,13 +306,13 @@ export class BlobSync {
         hash: sealed.hash,
         codec: sealed.codec,
         chunkSize: sealed.chunkSize,
-        uploadedBy: this.plugin.settings.username,
+        uploadedBy: this.deps.username(),
       };
 
       // A **new** blobId every time, never an overwrite of the old one: a peer
       // part-way through downloading the previous version must not have the
       // bytes change underneath it.
-      this.plugin.fileSync?.setBlobEntry(sharedFolderId, relativePath, entry);
+      this.deps.listing()?.setBlobEntry(sharedFolderId, relativePath, entry);
       state.lastSyncedHash.set(relativePath, hash);
       this.forgetPending(sharedFolderId, relativePath);
       log.info('Uploaded attachment', { relativePath, bytes: sealed.size, codec: sealed.codec });
@@ -266,12 +340,12 @@ export class BlobSync {
     if (!state) return false;
 
     const fullPath = `${state.localPath}/${relativePath}`;
-    const keys = this.plugin.folderCrypto.get(sharedFolderId);
+    const keys = this.deps.folderKeys(sharedFolderId);
     if (!keys) return false;
 
     // A decision this device already made — either it crashed opening this, or
     // the user said no. Either way, not again until they ask for it.
-    const device = this.plugin.deviceState;
+    const device = this.deps.deviceState();
     if (device?.isSkipped(sharedFolderId, relativePath)) return false;
 
     // Already holding exactly these bytes — checked without reading the file
@@ -286,7 +360,7 @@ export class BlobSync {
     // useless, and the budget starts at the account maximum so nothing is asked
     // about until something has actually gone wrong here.
     if (device && entry.size > device.budgetBytes) {
-      const proceed = await this.plugin.confirmLargeDownload(relativePath, entry.size);
+      const proceed = await this.deps.notify.confirmLargeDownload(relativePath, entry.size);
       if (!proceed) {
         await device.decline(sharedFolderId, relativePath, entry.size);
         return false;
@@ -446,12 +520,12 @@ export class BlobSync {
    * folder's, never the plugin's one setting.
    */
   private endpoint(sharedFolderId: string, blobId?: string): string {
-    const { base } = this.plugin.serverFor(sharedFolderId);
+    const { base } = this.deps.server(sharedFolderId);
     return `${base}/folders/${sharedFolderId}/blobs${blobId ? `/${blobId}` : ''}`;
   }
 
   private auth(sharedFolderId: string): string {
-    return `Bearer ${this.plugin.serverFor(sharedFolderId).token}`;
+    return `Bearer ${this.deps.server(sharedFolderId).token}`;
   }
 
   /**
@@ -500,12 +574,12 @@ export class BlobSync {
   ): void {
     this.forgetPending(sharedFolderId, relativePath);
     const key = `${sharedFolderId} ${relativePath}`;
-    const known = this.plugin.settings.oversizedAttachments ?? [];
+    const known = this.deps.oversized.get();
     if (!known.includes(key)) {
-      this.plugin.settings.oversizedAttachments = [...known, key];
-      void this.plugin.saveSettings();
+      this.deps.oversized.set([...known, key]);
+      void this.deps.save();
     }
-    this.plugin.reportAttachmentTooLarge(relativePath, bytes, limit);
+    this.deps.notify.attachmentTooLarge(relativePath, bytes, limit);
   }
 
   private async put(
@@ -544,17 +618,17 @@ export class BlobSync {
         code = '';
       }
       if (code === 'ATTACHMENTS_NOT_INCLUDED') {
-        this.plugin.reportAttachmentsNotIncluded();
+        this.deps.notify.attachmentsNotIncluded();
         return 'too-large';
       }
       if (code === 'ACCOUNT_SUSPENDED') {
-        this.plugin.reportAccountSuspended();
+        this.deps.notify.accountSuspended();
         return 'retry';
       }
     }
     if (res.status === 507) {
       // Storage full is temporary: clearing space makes this work.
-      this.plugin.reportStorageFull(blobId);
+      this.deps.notify.storageFull(blobId);
     } else {
       log.warn('Attachment upload rejected', { blobId, status: res.status });
     }
@@ -634,42 +708,42 @@ export class BlobSync {
   // -------------------------------------------------------------------------
 
   private entry(sharedFolderId: string, relativePath: string): BlobEntry | undefined {
-    return this.plugin.fileSync?.getBlobEntry(sharedFolderId, relativePath);
+    return this.deps.listing()?.getBlobEntry(sharedFolderId, relativePath);
   }
 
   private rememberPending(sharedFolderId: string, relativePath: string): void {
     const key = `${sharedFolderId} ${relativePath}`;
-    const pending = this.plugin.settings.pendingBlobUploads ?? [];
+    const pending = this.deps.pendingUploads.get();
     if (!pending.includes(key)) {
-      this.plugin.settings.pendingBlobUploads = [...pending, key];
-      void this.plugin.saveSettings();
+      this.deps.pendingUploads.set([...pending, key]);
+      void this.deps.save();
     }
   }
 
   private forgetPending(sharedFolderId: string, relativePath: string): void {
     const key = `${sharedFolderId} ${relativePath}`;
-    const pending = this.plugin.settings.pendingBlobUploads ?? [];
+    const pending = this.deps.pendingUploads.get();
     if (pending.includes(key)) {
-      this.plugin.settings.pendingBlobUploads = pending.filter((k) => k !== key);
-      void this.plugin.saveSettings();
+      this.deps.pendingUploads.set(pending.filter((k) => k !== key));
+      void this.deps.save();
     }
   }
 
   private rememberPendingDelete(sharedFolderId: string, blobId: string): void {
     const key = `${sharedFolderId} ${blobId}`;
-    const pending = this.plugin.settings.pendingBlobDeletes ?? [];
+    const pending = this.deps.pendingDeletes.get();
     if (!pending.includes(key)) {
-      this.plugin.settings.pendingBlobDeletes = [...pending, key];
-      void this.plugin.saveSettings();
+      this.deps.pendingDeletes.set([...pending, key]);
+      void this.deps.save();
     }
   }
 
   private forgetPendingDelete(sharedFolderId: string, blobId: string): void {
     const key = `${sharedFolderId} ${blobId}`;
-    const pending = this.plugin.settings.pendingBlobDeletes ?? [];
+    const pending = this.deps.pendingDeletes.get();
     if (pending.includes(key)) {
-      this.plugin.settings.pendingBlobDeletes = pending.filter((k) => k !== key);
-      void this.plugin.saveSettings();
+      this.deps.pendingDeletes.set(pending.filter((k) => k !== key));
+      void this.deps.save();
     }
   }
 
@@ -690,7 +764,7 @@ export class BlobSync {
   async attestFolder(sharedFolderId: string): Promise<void> {
     const state = this.folders.get(sharedFolderId);
     if (!state) return;
-    const listed = this.plugin.fileSync?.listBlobs(sharedFolderId) ?? [];
+    const listed = this.deps.listing()?.listBlobs(sharedFolderId) ?? [];
 
     try {
       const res = await serverFetch(`${this.endpoint(sharedFolderId)}/attest`, {
@@ -725,7 +799,7 @@ export class BlobSync {
 
   /** Retry whatever did not get through last time. Called on reconnect. */
   async flushPending(): Promise<void> {
-    for (const key of [...(this.plugin.settings.pendingBlobUploads ?? [])]) {
+    for (const key of [...this.deps.pendingUploads.get()]) {
       const gap = key.indexOf(' ');
       if (gap < 0) continue;
       const folderId = key.slice(0, gap);
@@ -737,7 +811,7 @@ export class BlobSync {
       // by an older build heals on the first flush for the same reason.
       await this.upload(folderId, relativePath);
     }
-    for (const key of [...(this.plugin.settings.pendingBlobDeletes ?? [])]) {
+    for (const key of [...this.deps.pendingDeletes.get()]) {
       const gap = key.indexOf(' ');
       if (gap < 0) continue;
       await this.deleteRemote(key.slice(0, gap), key.slice(gap + 1));

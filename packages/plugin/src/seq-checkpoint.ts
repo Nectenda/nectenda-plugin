@@ -37,7 +37,19 @@ import { log } from './logger';
  * existed before this file. So the worst case here is the old behaviour, and
  * there is no case where a hole is skipped.
  */
-const KEY = 'nectenda-seq';
+const KEY = 'nectenda-seq-v2';
+
+/**
+ * Where checkpoints were kept before NEC-105, and why they are no longer read.
+ *
+ * Until then a checkpoint could be written while a push was still
+ * unacknowledged, so its state vector included an edit the server may have
+ * dropped. On load it matched, was trusted, and the launch resumed past the
+ * reconcile that would have re-sent the edit. Nothing in the record says
+ * which ones those are, so none of them is read: each document pays one full
+ * catch-up, once, and the old record is removed on the next save.
+ */
+const LEGACY_KEY = 'nectenda-seq';
 
 interface Checkpoint {
   seq: number;
@@ -97,6 +109,7 @@ export async function saveSeqCheckpoint(
   const record: Checkpoint = { seq, sv: toBase64(Y.encodeStateVector(ydoc)) };
   try {
     await idb.set(KEY, JSON.stringify(record));
+    await idb.del(LEGACY_KEY);
   } catch (err) {
     // Losing a checkpoint costs a replay next launch and nothing else.
     log.debug('Could not persist seq checkpoint', { error: String(err) });

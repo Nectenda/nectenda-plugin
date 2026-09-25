@@ -32,6 +32,7 @@ more than it should about where to push on a system nobody has audited yet.
 | Your passphrase | **No** — on the hosted service, never sent in any form; a self-hosted server receives an independent derivation that cannot yield the key |
 | Your private key | **No** — stored wrapped, unwrappable only by your password |
 | Folder display names | **No** — sealed under the folder's content key |
+| Who is where in a note (presence) | **No** — names, colours and caret positions are sealed; that someone has a note open, and how often their presence changes, is visible |
 | Who shares a folder with whom | **Yes** |
 | Sizes, timing, device and account records | **Yes** |
 
@@ -41,9 +42,13 @@ The keys never reach it.
 
 **Your passphrase never leaves the device.** It is stretched with PBKDF2-SHA256
 at 600,000 iterations into a master key. That key is never sent and never
-stored. On the **hosted service nothing derived from it is sent either**: you
+stored. On the **hosted service no hash or verifier of it is sent either**: you
 sign in by a code to your email, a passkey, or a provider account, and the
-passphrase is used only to unwrap your keys locally — see `docs/identity.md`. A
+passphrase is used only to unwrap your keys locally. The one thing the hosted
+service holds that the passphrase bears on is your private key, **wrapped**
+under a key derived from it: ciphertext, the same as the copy in your vault,
+and open to offline guessing by whoever holds a copy (see "Guessing the
+passphrase is limited by the passphrase" below). A
 **self-hosted server** uses the passphrase as its login password too, by split
 derivation: it receives a *second, independent* derivation, which cannot be used
 to derive the encryption key, and bcrypts even that before storing it, because
@@ -133,6 +138,27 @@ marketing.
   opens it; the server has no key for it, and a client that cannot open one
   falls back to the generic label. Reading it needs your passphrase to have
   been entered, because that is what unwraps the identity key.
+- **That someone is present, but not who or where.** While a note is open, each
+  participant's presence (display name, colour, caret, selection and mouse
+  pointer position) is sent to
+  the server and relayed to everyone else with the note open. Its contents are
+  sealed under the folder's content key and bound to that note, that
+  participant and that moment, so the server can neither read a state nor move
+  it to another note. It is padded to a multiple of 512 bytes, so its length
+  does not show whether your editor has focus or what moved (a very long canvas
+  selection does still show that it is long). What the server does see is that a device has the
+  note open (it knows that from the subscription anyway), and when and how
+  often that device's presence changes. That rate can tell typing apart from
+  moving a pointer. Hiding it would need cover traffic, which Nectenda does not
+  send. The mouse pointer is sent only while it is over the note, and
+  "Share my mouse pointer" in settings stops it being sent at all, which
+  withholds it from the other participants as well as from the server's rate
+  observation. Nor is presence authenticated as live: the server cannot read or alter
+  a state, but it can withhold one, retract someone, or replay a departed
+  participant's last state so that they briefly appear present.
+  `packages/plugin/src/presence-seal.ts` seals and opens; the refusal of
+  anything unsealed is in `receivePresence` in
+  `packages/plugin/src/multiplexed-provider.ts`.
 - **Sizes and timing.** Every update's byte length and arrival time, every
   attachment's encrypted size, and per-account usage totals.
 - **Anything the network sees.** IP addresses and connection times, as with any
@@ -144,8 +170,9 @@ marketing.
 - **Your identity record**, on the hosted service. Your verified email address,
   the opaque subject id of each sign-in provider you linked, the public half of
   each passkey, your display name, and which organisations you belong to. Share
-  links and invitations are held as hashes only. What the identity service can
-  and cannot do with this is spelled out in `docs/identity.md`.
+  links and invitations are held as hashes only. It holds **no document data and
+  no folder keys it can open** — the wrapped private key it stores is unwrappable
+  only by your passphrase, which it never receives.
 - **Attachment ciphertext at a storage provider.** On the hosted service sealed
   attachments live with an object-storage provider in your organisation's region
   and are fetched from it directly by your devices. The provider sees ciphertext,
@@ -216,7 +243,8 @@ it is running the server yourself.
 ### Unsharing a folder
 
 An owner can unshare a folder, which deletes the server's copy: the
-ciphertext, the edit history, the attachments. It does not reach into anyone's
+ciphertext, the edit history including every retained earlier version, the
+attachments. It does not reach into anyone's
 vault. Every member still holds the notes as plain files and still holds the
 keys that opened them, so unsharing is not a revocation of anything already
 delivered — the same limit as removing a member, and for the same reason: what
@@ -230,10 +258,14 @@ someone has read, they have.
 - **No forward secrecy for stored history.** The append-only log is encrypted
   under the folder's current content key generation. Someone who obtains a
   content key and a copy of the log can read the history that key covers. Key
-  rotation limits the window; it does not erase the past.
+  rotation limits the window; it does not erase the past. The server also
+  keeps earlier whole-document versions of each note, still as ciphertext
+  under whichever key generation wrote them, so that edit history survives
+  the log being compacted. Those are kept until the note or its folder is
+  deleted, or the account is purged after closing: thinned to one a day after two days, and one a week after ninety
+  days, but not expired.
 - **No protection against a compromised device.** Keys live in the OS keychain
-  where available (`docs/key-storage.md`); malware running as you can read what
-  you can read.
+  where available; malware running as you can read what you can read.
 - **Your passphrase is confirmed when a device signs in.** A new device asks for
   it straight away and checks it really opens your key, rather than waiting
   until a shared folder needs it. Getting it wrong just asks again — a wrong
@@ -269,9 +301,10 @@ someone has read, they have.
   assumed. If you keep vaults apart on a phone for separation, that separation
   is not cryptographic.
 - **Read-only membership does not exist.** A member holding the folder content
-  key can always write, whatever any server-side role says. See
-  `docs/sync-limitations.md` — it is a direct consequence of E2EE, and any role
-  we enforce server-side is a convenience, not a security boundary.
+  key can always write, whatever any server-side role says. It is a direct
+  consequence of end-to-end encryption: a server that cannot read the plaintext
+  cannot judge whether a write was allowed, so any role we enforce server-side
+  is a convenience, not a security boundary.
 
 ## Checking this yourself
 

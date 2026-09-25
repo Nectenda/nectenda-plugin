@@ -2,7 +2,6 @@ import type { KdfParams } from './crypto.js';
 
 // Protocol constants
 export const DEFAULT_PORT = 1234;
-export const WS_PATH = '/';
 export const API_PREFIX = '/api';
 
 /**
@@ -17,8 +16,10 @@ export const API_PREFIX = '/api';
 export const MessageType = {
   /** S->C presence relay. Ephemeral, never logged. */
   Awareness: 1,
-  /** S->C auth result. */
-  Auth: 2,
+  // 2 was `Auth`, inherited from Hocuspocus and never encoded or decoded by
+  // either side. Retired rather than reused: the numbering is a wire format, and
+  // CI runs the previous published plugin against this server, so a number that
+  // once meant something else is not a number to hand to something new.
   /** C->S request the current presence map. */
   QueryAwareness: 3,
   /** C->S stop following a document. */
@@ -86,8 +87,6 @@ export const MessageType = {
   FolderGone: 18,
 } as const;
 
-export type MessageTypeValue = (typeof MessageType)[keyof typeof MessageType];
-
 /** Cap on updates per catch-up frame, to avoid one enormous WebSocket message. */
 export const MAX_UPDATES_PER_BATCH = 200;
 
@@ -115,12 +114,33 @@ export const COMPACT_REQUEST_INTERVAL_MS = 60_000;
  * unbounded input is not accounting, and the fan-out makes it a denial of
  * service against everyone else in the folder.
  *
- * A Yjs update for a text edit is tens of bytes; 4MiB is a very large paste and
- * still four orders of magnitude of headroom. A snapshot is a whole document,
- * so it gets more.
+ * A snapshot is a whole document, so its ceiling is the largest document the
+ * service holds. A push gets the same ceiling, not a smaller one.
+ *
+ * It used to be 4MiB, on the reasoning that a text edit is tens of bytes. But a
+ * push is not always an edit: the first sync of an existing file sends the
+ * whole file, and a reconnect sends everything typed offline. A note between
+ * 4 and 16MiB — one the service can otherwise store and compact — could then
+ * never reach the server at all, and the server drops an oversized push
+ * without a word (WIRE-050), so nothing said so. Raised in NEC-105. Past 16MiB
+ * a document cannot be snapshotted either, and the client holds the change
+ * back and says why (SAFE-A11) rather than sending it.
+ *
+ * The fan-out is bounded by the same number the snapshot already is, and the
+ * push still counts against the account's storage.
  */
-export const MAX_PUSH_BYTES = 4 * 1024 * 1024;
 export const MAX_SNAPSHOT_BYTES = 16 * 1024 * 1024;
+export const MAX_PUSH_BYTES = MAX_SNAPSHOT_BYTES;
+
+/**
+ * Payload bytes one catch-up `Updates` frame may carry, beyond which the
+ * server starts another (WIRE-044). A single update larger than this still
+ * goes, on its own; the push limit keeps that under the frame limit.
+ *
+ * The count cap alone (`MAX_UPDATES_PER_BATCH`) let one frame hold 200 pushes
+ * of any size — already 800MiB at the old push limit.
+ */
+export const MAX_BATCH_BYTES = MAX_SNAPSHOT_BYTES;
 
 /**
  * Hard frame limit for the socket itself, below `ws`'s 100MiB default.
@@ -140,44 +160,18 @@ export const MAX_WS_FRAME_BYTES = MAX_SNAPSHOT_BYTES + 1024 * 1024;
  */
 export const MAX_FOLDER_NAME_LENGTH = 100;
 
-// Yjs document naming
+/** The folder listing document's name within a folder. See plugin/src/file-sync.ts. */
 export const META_DOC_SUFFIX = '__meta__';
-export const metaDocName = (roomId: string): string => `${roomId}/${META_DOC_SUFFIX}`;
-export const fileDocName = (roomId: string, relativePath: string): string =>
-  `${roomId}/${relativePath}`;
 
 // URL helpers
 export const apiBaseUrl = (wsUrl: string): string =>
   wsUrl.replace(/^ws(s?):\/\//, 'http$1://').replace(/\/$/, '') + API_PREFIX;
-
-// Roles (room-level, for Phase 3+)
-export const ROLES = ['owner', 'editor', 'viewer'] as const;
-export type Role = (typeof ROLES)[number];
 
 // User roles (server-level)
 export type UserRole = 'admin' | 'editor';
 
 // JWT
 export const JWT_EXPIRY = '7d';
-
-// Room member info (replicated in Yjs awareness/meta doc)
-export interface MemberInfo {
-  userId: string;
-  displayName: string;
-  role: Role;
-  color: string;
-}
-
-// File operation types (appended to meta doc Y.Array)
-export type FileOpType = 'create' | 'rename' | 'delete';
-
-export interface FileOp {
-  type: FileOpType;
-  path: string;
-  newPath?: string; // only for rename
-  timestamp: number;
-  userId: string;
-}
 
 // File listing entry (stored in meta doc Y.Map)
 export interface FileEntry {
@@ -422,19 +416,6 @@ export interface AccountInfo {
 /**
  * The limits in force for an account. `0` means unlimited, everywhere.
  */
-export interface AccountLimits {
-  /** Flat plus per-seat storage, already summed. */
-  quotaBytes: number;
-  quotaPerUserBytes: number;
-  maxUsers: number;
-  maxDevicesPerUser: number;
-  maxBlobBytes: number;
-  /** False on plans that sell no attachment storage. Text sync is never affected. */
-  attachmentsEnabled: boolean;
-  planId: string;
-  status: AccountStatus;
-}
-
 /**
  * A device on an organisation's roster: a machine that holds one of the
  * member's device slots, from the moment it was added until it is removed.
@@ -627,6 +608,7 @@ export interface CreateFolderRequest {
 export * from './crypto.js';
 export * from './blob-cipher.js';
 export * from './deflate.js';
+export * from './presence.js';
 
 /**
  * SHA-256, lowercase hex, of a credential the directory must be able to look

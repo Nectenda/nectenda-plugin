@@ -256,12 +256,13 @@ export class FolderCryptoRegistry implements DocCipher {
   async encryptPayload(
     docName: string,
     plaintext: Uint8Array,
+    aad?: Uint8Array,
   ): Promise<{ payload: Uint8Array; keyId: string }> {
     const keys = this.forDoc(docName);
     if (!keys) throw new Error(`No encryption key for ${docName}`);
     const key = keys.contentKeys.get(keys.currentKeyId);
     if (!key) throw new Error(`No current content key for ${docName}`);
-    return { payload: await encrypt(key, plaintext), keyId: keys.currentKeyId };
+    return { payload: await encrypt(key, plaintext, aad), keyId: keys.currentKeyId };
   }
 
   /**
@@ -272,12 +273,12 @@ export class FolderCryptoRegistry implements DocCipher {
    * documents are re-shared, and quietly accepting plaintext would leave no
    * signal that a folder had never been encrypted at all.
    */
-  async decryptPayload(docName: string, payload: Uint8Array, keyId: string): Promise<Uint8Array> {
+  async decryptPayload(docName: string, payload: Uint8Array, keyId: string, aad?: Uint8Array): Promise<Uint8Array> {
     const keys = this.forDoc(docName);
     if (!keys) throw new Error(`No decryption key for ${docName}`);
     if (!keyId) throw new Error(`Update for ${docName} predates encryption`);
     const key = keys.contentKeys.get(keyId);
     if (!key) throw new Error(`No key generation ${keyId} for ${docName}`);
-    return decrypt(key, payload);
+    return decrypt(key, payload, aad);
   }
 }

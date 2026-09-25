@@ -7,6 +7,27 @@
  * new one is picked from the organisation's roster.
  */
 
+/**
+ * Membership is editing rights: every member may read and write.
+ *
+ * There is no viewer role and cannot usefully be one — a reader needs the
+ * folder key to decrypt anything, and a key that has been handed over cannot
+ * be taken back. Enforcing read-only would mean the server deciding what you
+ * may see, which is the arrangement this design exists to avoid.
+ */
+export type FolderRole = 'owner' | 'editor';
+
+/** One row of a shared folder's member list, as a shard reports it. */
+export interface FolderMember {
+  userId: string;
+  username: string;
+  /** Sent by shards from 15 September 2026; the username stands in before that. */
+  displayName?: string;
+  email?: string;
+  role: FolderRole;
+  publicKey: string | null;
+}
+
 export interface RosterUser {
   id: string;
   username: string;

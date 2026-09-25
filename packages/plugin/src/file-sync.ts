@@ -7,7 +7,8 @@ import type { FileEntry, BlobEntry } from '@nectenda/shared';
 import { BLOBS_MAP_KEY, LISTING_MAP_KEY, LISTING_VERSION } from '@nectenda/shared';
 import { kindOf } from './blob-policy';
 import { joinWithin } from './vault-path';
-import type NectendaPlugin from './main';
+import type { BlobSync } from './blob-sync';
+import type { DocIndex } from './doc-index';
 import type { SyncProvider } from './provider-router';
 import type { VaultAdapter } from './vault-adapter';
 import type { ContentSync } from './content-sync';
@@ -34,8 +35,30 @@ interface MetaConnection {
   idbProvider: IndexeddbPersistence;
 }
 
+/**
+ * What listing sync needs from the plugin around it.
+ *
+ * The same three as `ContentSyncDeps` — key possession, the path/document-id
+ * index, and this vault's key for naming IndexedDB stores — plus attachments.
+ *
+ * `blobSync` is a function returning null rather than a value, and that is not
+ * tidiness: it is genuinely absent for part of startup, because the meta
+ * document is connected before attachment sync exists. Reading it once at
+ * construction would capture the null and quietly never upload anything.
+ */
+export interface FileSyncDeps {
+  /** Whether this device holds the folder's keys. Without them, no document id. */
+  hasKeys(sharedFolderId: string): boolean;
+  /** Path to document id and back. */
+  docIndex: DocIndex;
+  /** Which vault this is, for naming its IndexedDB stores. */
+  vaultKey(): string;
+  /** Attachment sync, once it exists. Null before then, and callers check. */
+  blobSync(): BlobSync | null;
+}
+
 export class FileSync {
-  private plugin: NectendaPlugin;
+  private deps: FileSyncDeps;
   private vault: VaultAdapter;
   private provider: SyncProvider;
   private contentSync: ContentSync | null = null;
@@ -55,8 +78,8 @@ export class FileSync {
   private connections: Map<string, MetaConnection> = new Map();
   private folderReadyListeners: ((sharedFolderId: string) => void)[] = [];
 
-  constructor(plugin: NectendaPlugin, provider: SyncProvider, vault: VaultAdapter) {
-    this.plugin = plugin;
+  constructor(deps: FileSyncDeps, provider: SyncProvider, vault: VaultAdapter) {
+    this.deps = deps;
     this.vault = vault;
     this.provider = provider;
   }
@@ -95,7 +118,7 @@ export class FileSync {
     // observed — and a half-connected folder that cannot see deletions is one
     // that will happily trash local files on a listing it misread. Nothing local
     // may be touched for a folder this client cannot read.
-    if (!this.plugin.folderCrypto.hasKeys(sharedFolderId)) {
+    if (!this.deps.hasKeys(sharedFolderId)) {
       log.warn('Folder has no encryption keys — not connecting it', { sharedFolderId });
       new Notice('Nectenda: no encryption key for a shared folder. Ask an owner to re-share it.');
       return;
@@ -104,24 +127,46 @@ export class FileSync {
     // The listing's own id is derived like any other document, rather than
     // leaving `__meta__` in clear as a marker telling the server which blob is
     // the folder index.
-    const docName = await this.plugin.docIndex.ref(sharedFolderId, META_DOC_SUFFIX);
+    const docName = await this.deps.docIndex.ref(sharedFolderId, META_DOC_SUFFIX);
     const ydoc = new Y.Doc();
     const ymap = ydoc.getMap<FileEntry>('files');
     const bmap = ydoc.getMap<BlobEntry>(BLOBS_MAP_KEY);
 
-    const idbProvider = new IndexeddbPersistence(idbStoreName(this.plugin.vaultKey, docName), ydoc);
+    const idbProvider = new IndexeddbPersistence(idbStoreName(this.deps.vaultKey(), docName), ydoc);
 
     const startProvider = () => {
       // Subscribe meta doc via multiplexed provider. `startProvider` runs after
       // IndexedDB has loaded, which is what makes the checkpoint's state-vector
       // check meaningful.
-      this.provider.subscribe(docName, ydoc, {
-        load: () => loadSeqCheckpoint(idbProvider, ydoc),
-        save: (seq) => saveSeqCheckpoint(idbProvider, ydoc, seq),
-      });
+      //
+      // A subscribe that throws (the folder has no route to a server yet) used
+      // to escape as an unhandled rejection: no listing, no observer, and no
+      // line anywhere saying so. Logged now; the outcome is unchanged.
+      try {
+        this.provider.subscribe(docName, ydoc, {
+          load: () => loadSeqCheckpoint(idbProvider, ydoc),
+          save: (seq) => saveSeqCheckpoint(idbProvider, ydoc, seq),
+        });
+      } catch (err) {
+        log.warn('Could not subscribe the folder listing', { sharedFolderId, error: String(err) });
+        return;
+      }
 
       const conn: MetaConnection = { sharedFolderId, localPath, ydoc, ymap, bmap, idbProvider };
       this.connections.set(sharedFolderId, conn);
+      log.debug('Folder listing subscribed', { sharedFolderId, listed: ymap.size });
+
+      // Every change to the listing, and where it came from. The document's
+      // name is redacted in this log, so without this a listing update and a
+      // note's update look the same, and "the guest never received the
+      // owner's new file" could not be told from "received and not acted on".
+      //
+      ydoc.on('update', (_update: Uint8Array, origin: unknown) => {
+        log.debug(origin === LOCAL_ORIGIN ? 'Folder listing changed here' : 'Folder listing update received', {
+          sharedFolderId,
+          listed: ymap.size,
+        });
+      });
 
       // Announce it. Everything above this line is asynchronous — the document
       // id is derived, then IndexedDB has to load — and until it completes
@@ -179,7 +224,7 @@ export class FileSync {
     if (!conn) return;
 
     const docName =
-      this.plugin.docIndex.refSync(sharedFolderId, META_DOC_SUFFIX) ??
+      this.deps.docIndex.refSync(sharedFolderId, META_DOC_SUFFIX) ??
       `${sharedFolderId}/${META_DOC_SUFFIX}`;
     this.provider.unsubscribe(docName);
     void conn.idbProvider.destroy().catch((err: unknown) => {
@@ -214,6 +259,11 @@ export class FileSync {
         deleted.push(key);
       }
     }
+    log.debug('Folder listing changed remotely', {
+      sharedFolderId: conn.sharedFolderId,
+      added: added.length,
+      deleted: deleted.length,
+    });
 
     // Detect rename: one delete + one add in the same transaction
     if (deleted.length === 1 && added.length === 1) {
@@ -236,19 +286,25 @@ export class FileSync {
         });
 
         // Reconnect background sync under new name
-        if (this.contentSync) {
-          this.contentSync.disconnectFile(conn.sharedFolderId, oldRelPath);
-          this.contentSync.connectFile(conn.sharedFolderId, conn.localPath, newRelPath);
-        }
+        this.contentSync?.moveFile(conn.sharedFolderId, conn.localPath, oldRelPath, newRelPath);
         return;
       }
     }
 
     // Newly listed paths have to be derivable before they can be connected.
     if (added.length > 0) {
-      void this.plugin.docIndex
+      // Caught: a throw in applyAdditions used to be an unhandled rejection,
+      // so a listed file that never appeared left nothing behind.
+      void this.deps.docIndex
         .warm(conn.sharedFolderId, added)
-        .then(() => this.applyAdditions(conn, added));
+        .then(() => this.applyAdditions(conn, added))
+        .catch((err: unknown) => {
+          log.warn('Could not act on newly listed files', {
+            sharedFolderId: conn.sharedFolderId,
+            count: added.length,
+            error: String(err),
+          });
+        });
     }
 
     // Handle remaining deletions
@@ -274,7 +330,7 @@ export class FileSync {
       const entry = conn.bmap.get(key);
       if (change.action === 'delete') {
         this.sequence(conn.sharedFolderId, key, () =>
-          this.plugin.blobSync?.removeLocal(conn.sharedFolderId, key) ?? Promise.resolve(),
+          this.deps.blobSync()?.removeLocal(conn.sharedFolderId, key) ?? Promise.resolve(),
         );
         continue;
       }
@@ -291,7 +347,7 @@ export class FileSync {
       }
 
       this.sequence(conn.sharedFolderId, key, () =>
-        this.plugin.blobSync?.download(conn.sharedFolderId, key, entry).then(() => undefined)
+        this.deps.blobSync()?.download(conn.sharedFolderId, key, entry).then(() => undefined)
           ?? Promise.resolve(),
       );
     }
@@ -457,7 +513,7 @@ export class FileSync {
   ): Promise<void> {
     if (!this.contentSync) return;
 
-    const docName = this.plugin.docIndex.refSync(sharedFolderId, relativePath);
+    const docName = this.deps.docIndex.refSync(sharedFolderId, relativePath);
     if (!docName) return;
     const unsynced = await this.contentSync.unsyncedLocalContent(docName);
     if (unsynced === null) return; // Disk matched the synced document; nothing at risk.
@@ -525,11 +581,16 @@ export class FileSync {
   }
 
   private async initialSync(conn: MetaConnection): Promise<void> {
+    log.debug('Folder listing synced — reconciling with disk', {
+      sharedFolderId: conn.sharedFolderId,
+      listed: conn.ymap.size,
+      folderExists: this.vault.isFolder(conn.localPath),
+    });
     if (!this.vault.isFolder(conn.localPath)) return;
 
     // The listing is how paths become known for documents this vault has never
     // opened, so its keys are derived before anything acts on them.
-    await this.plugin.docIndex.warm(conn.sharedFolderId, Array.from(conn.ymap.keys()));
+    await this.deps.docIndex.warm(conn.sharedFolderId, Array.from(conn.ymap.keys()));
 
     const localFiles = new Map<string, { size: number; mtime: number }>();
     for (const path of this.vault.listMarkdown(conn.localPath)) {
@@ -571,7 +632,7 @@ export class FileSync {
    * them the moment it is mapped.
    */
   private async initialBlobSync(conn: MetaConnection): Promise<void> {
-    const blobSync = this.plugin.blobSync;
+    const blobSync = this.deps.blobSync();
     if (!blobSync) return;
 
     const listed = new Set(conn.bmap.keys());

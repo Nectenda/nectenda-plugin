@@ -29,7 +29,7 @@ import { serverFetch } from './client-version.js';
  *
  * `identity` is the ECDH keypair that unwraps folder keys, unwrapped in memory
  * for the session. `masterKey` is **not** persisted anywhere — it once was, and
- * that is exactly what `docs/key-storage.md` records removing, because it
+ * that was removed deliberately, because it
  * unwraps the identity key with no password and so reaches every folder ever
  * shared with the account rather than only the notes already on disk.
  *
@@ -41,7 +41,7 @@ import { serverFetch } from './client-version.js';
  *
  * The keypair is no longer memory-only. Where the OS provides a credential
  * store it is held for the device, so the passphrase is asked once per machine
- * rather than once per vault — see docs/key-storage.md.
+ * rather than once per vault.
  */
 export interface SessionKeys {
   masterKey?: Uint8Array;
@@ -286,11 +286,10 @@ export async function fetchUnlockParams(serverUrl: string, username: string): Pr
  * That cost is *not* a brute-force control. `data.json` carries the salt, the
  * iteration count and the wrapped key, so an attacker who has the file grinds
  * offline at whatever rate their hardware allows and never opens the prompt.
- * See docs/key-storage.md.
  *
- * See the same document for why storing the master key was worse: it unwraps
- * the identity key with no password, and so yields every folder ever shared
- * with the account, including ones this vault has never opened.
+ * Storing the master key was worse still, which is why it is not stored: it
+ * unwraps the identity key with no password, and so yields every folder ever
+ * shared with the account, including ones this vault has never opened.
  */
 export async function unlockWith(
   kdfParams: KdfParams,
