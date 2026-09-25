@@ -6,11 +6,6 @@ running is the source you read — see the README.
 
 ## 0.2.1 — 25 September 2026
 
-### Fixed
-- Nothing a user can see. 0.2.1 exists only so that 0.2.0's contents can reach the community directory: its automated review rejected 0.2.0 over *how* one animation is applied in the code, not over anything the plugin does. The pointer fade is unchanged, set the same way through Obsidian's own styling call. **If you are coming from 0.1.5, everything that matters is in 0.2.0's notes below — including two fixes for edits that could be lost.**
-
-## 0.2.0 — 25 September 2026
-
 ### Added
 - Presence — collaborators' names, colours and cursor positions — is now end-to-end encrypted. Until now it travelled in the clear, so the server could see where in a note each person was working; it no longer can.
 - Collaborators' mouse pointers now show in the note you share, labelled with their name. When someone is off-screen, an indicator at the edge of the view points to them and to their cursor. Two new settings let you stop sharing yours, or hide theirs.
@@ -32,6 +27,13 @@ running is the source you read — see the README.
 - On Android, all vaults in the app share one secret store: signing one vault in signs them all in.
 - There is no read-only membership. Everyone in a shared folder can edit it.
 - Not audited. The client ships unminified and the build is reproducible, so the claim is checkable — but no third party has checked it.
+
+> 0.2.0 was published on 25 September 2026 and withdrawn before the community
+> directory listed it: its automated review rejected the release over how one
+> animation was applied in the code, not over anything the plugin does. Nobody
+> was ever offered it, so its contents are listed here as 0.2.1 rather than as
+> a version of their own. The 0.2.0 tag and its release still exist, and this
+> is the note that explains them.
 
 ## 0.1.5 — 18 September 2026 — First public release
 
