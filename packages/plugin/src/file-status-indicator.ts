@@ -124,7 +124,11 @@ export class FileStatusIndicator {
       return;
     }
     const statusOf = buildStatusIndex(this.deps);
-    for (const title of Array.from(document.querySelectorAll('.nav-file-title'))) {
+    // Typed as HTMLElement so `createSpan` is available below: Obsidian's
+    // helpers are augmented onto HTMLElement, and a bare querySelectorAll
+    // yields Element. That typing is the only reason this file used
+    // `document.createElement` where header-status.ts already used createSpan.
+    for (const title of Array.from(document.querySelectorAll<HTMLElement>('.nav-file-title'))) {
       const path = title.getAttribute('data-path');
       const view = path ? statusOf(path) : null;
       const existing = title.querySelector(`.${ICON_CLASS}`);
@@ -134,10 +138,10 @@ export class FileStatusIndicator {
       }
       const wanted = `${ICON_CLASS} ${STATUS_CLASSES[view.status]}`;
       let icon = existing;
-      if (!icon) {
-        icon = document.createElement('span');
-        title.appendChild(icon);
-      }
+      if (!icon) icon = title.createSpan();
+      // Written only when it differs, deliberately: this runs from a
+      // MutationObserver over the file explorer, and an unconditional write
+      // would retrigger it forever.
       if (icon.getAttribute('class') !== wanted) icon.setAttribute('class', wanted);
       if (icon.getAttribute('aria-label') !== view.label) icon.setAttribute('aria-label', view.label);
     }

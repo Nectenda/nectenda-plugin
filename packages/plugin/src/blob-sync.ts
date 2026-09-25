@@ -666,6 +666,7 @@ export class BlobSync {
       const { url } = (await res.json()) as { url?: string };
       if (typeof url === 'string' && /^https?:\/\//.test(url)) {
         try {
+          // eslint-disable-next-line no-restricted-globals -- a presigned third-party URL, sent with no headers on purpose so the bucket sees no preflight; requestUrl offers no AbortSignal
           const direct = await fetch(url, { signal });
           if (direct.ok) return new Uint8Array(await direct.arrayBuffer());
           log.warn('Presigned download failed; falling back to the server', { blobId, status: direct.status });

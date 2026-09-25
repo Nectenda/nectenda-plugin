@@ -4,6 +4,11 @@ Every release of the Nectenda plugin, newest first. Each release on GitHub also
 carries the SHA-256 of its `main.js`, so you can check that the plugin you are
 running is the source you read — see the README.
 
+## 0.2.1 — 25 September 2026
+
+### Fixed
+- Nothing a user can see. 0.2.1 exists only so that 0.2.0's contents can reach the community directory: its automated review rejected 0.2.0 over *how* one animation is applied in the code, not over anything the plugin does. The pointer fade is unchanged, set the same way through Obsidian's own styling call. **If you are coming from 0.1.5, everything that matters is in 0.2.0's notes below — including two fixes for edits that could be lost.**
+
 ## 0.2.0 — 25 September 2026
 
 ### Added

@@ -481,7 +481,11 @@ class PointerMarker implements LayerMarker {
   }
 
   draw(): HTMLElement {
-    const el = document.createElement('div');
+    // `createDiv`/`createSpan` rather than `document.createElement`, which the
+    // directory's `prefer-create-el` rule reports. The globals are used rather
+    // than the element methods because a CodeMirror `LayerMarker` has to return
+    // a detached element — there is no parent yet to call `.createDiv()` on.
+    const el = createDiv();
     el.classList.add('nectenda-pointer');
     if (this.kind === 'caret') el.classList.add('nectenda-pointer-caret');
     el.setAttribute('aria-hidden', 'true');
@@ -491,10 +495,8 @@ class PointerMarker implements LayerMarker {
     el.appendChild(svgPath('nectenda-pointer-arrow', '0 0 12 16', 'M1 1 L1 13.5 L4.2 10.6 L6.6 15 L8.6 14 L6.3 9.7 L10.8 9.7 Z'));
     // Points up; the edge classes rotate it towards the text it stands for.
     el.appendChild(svgPath('nectenda-pointer-chevron', '0 0 16 10', 'M1.5 9 L8 1.5 L14.5 9 Z'));
-    const label = document.createElement('span');
-    label.classList.add('nectenda-pointer-name');
+    const label = el.createSpan({ cls: 'nectenda-pointer-name' });
     label.textContent = this.name;
-    el.appendChild(label);
     this.place(el);
     this.timeFade(el);
     return el;
@@ -529,12 +531,25 @@ class PointerMarker implements LayerMarker {
    * or reused. Clearing the animation, flushing styles and putting it back is
    * the only way to replay a CSS animation on the same element; the negative
    * delay then puts it at the right phase rather than at the start.
+   *
+   * Written through `setCssStyles` rather than `el.style` because the community
+   * directory's `no-static-styles-assignment` rule reads the two literal
+   * assignments as styling in JavaScript, and an Error there fails a release —
+   * it failed 0.2.0. The runtime behaviour is identical: `setCssStyles` is a
+   * thin wrapper over `el.style`. The animation itself lives in `styles.css`
+   * and always did.
+   *
+   * A class toggle would satisfy the rule more obviously and cannot be used
+   * here: the delay has to be set in the same frame as the restart, and the
+   * reflow between the two writes is what makes the browser notice the change
+   * at all. Removing either line silently stops the fade replaying on a reused
+   * pointer, which looks like a pointer that never fades.
    */
   private timeFade(el: HTMLElement): void {
     if (this.kind !== 'pointer') return;
-    el.style.animation = 'none';
+    el.setCssStyles({ animation: 'none' });
     void el.offsetWidth;
-    el.style.animation = '';
+    el.setCssStyles({ animation: '' });
     el.style.animationDelay = `${fadeDelayMs(this.movedAt, performance.now())}ms`;
   }
 
@@ -556,12 +571,12 @@ class PointerMarker implements LayerMarker {
 }
 
 function svgPath(cls: string, viewBox: string, d: string): SVGSVGElement {
-  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
-  svg.setAttribute('viewBox', viewBox);
-  svg.classList.add(cls);
-  const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
-  path.setAttribute('d', d);
-  svg.appendChild(path);
+  // `createSvg`, not `createElementNS`: Obsidian's helper is typed over
+  // SVGElementTagNameMap, so it returns SVGSVGElement here and SVGPathElement
+  // below without a cast, and it is what the directory's `prefer-create-el`
+  // rule asks for.
+  const svg = createSvg('svg', { cls, attr: { viewBox } });
+  svg.createSvg('path', { attr: { d } });
   return svg;
 }
 

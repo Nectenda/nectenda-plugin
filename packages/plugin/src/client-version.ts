@@ -39,6 +39,7 @@ export const PLUGIN_VERSION_HEADER = 'X-Nectenda-Plugin';
 export function serverFetch(input: RequestInfo | URL, init: RequestInit = {}): Promise<Response> {
   const headers = new Headers(init.headers);
   headers.set(PLUGIN_VERSION_HEADER, PLUGIN_VERSION);
+  // eslint-disable-next-line no-restricted-globals -- every caller consumes a real Response (res.ok, headers, arrayBuffer) and forwards init.signal; requestUrl returns neither. Convertible, but it is a refactor across all callers rather than a lint fix.
   return fetch(input, { ...init, headers }).then((res) => {
     // Both services mint a request id per call and expose it, so that a
     // person who hits a server error has one string to quote and we can find

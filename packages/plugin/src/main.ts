@@ -1906,6 +1906,7 @@ export default class NectendaPlugin extends Plugin {
         // setting is "Permanently delete" honouring it would turn a remote
         // action into the destruction of their only copy. The vault's own
         // .trash is the answer that cannot lose anything.
+        // eslint-disable-next-line obsidianmd/prefer-file-manager-trash-file -- see above: sync removing a file on the user's behalf must not honour a "Permanently delete" preference
         await this.app.vault.trash(file, false);
         return true;
       }
