@@ -632,9 +632,6 @@
    primary surface. One per screen — here it is the single filled button, and
    never more than one of those is on screen at a time. */
 .nectenda-cut {
-  /* stylelint-disable-next-line plugin/no-unsupported-browser-features -- polygon() clip-path
-     is unprefixed in every engine Obsidian ships; caniuse marks the feature partial for
-     SVG-reference clip-paths, which this is not. Degrades to a square corner. */
   clip-path: polygon(0 0, 100% 0, 100% calc(100% - var(--nectenda-cut-sm)),
                      calc(100% - var(--nectenda-cut-sm)) 100%, 0 100%);
 }
@@ -832,9 +829,6 @@
    And the failure mode is a person who asked for less motion getting it
    anyway. That is worth more than one line on a scorecard. */
 @media (prefers-reduced-motion: reduce) {
-  /* stylelint-disable-next-line declaration-no-important -- argued directly above: a blanket
-     over rules this file did not author cannot win on specificity, and the failure mode is
-     someone who asked for less motion getting it anyway. */
   .nectenda-signin *, .nectenda-usage-fill { transition: none !important; }
 }
 
@@ -852,9 +846,6 @@
    loose rows in a box of their own, which would put ours inside a second
    one; that wrapper goes, and so do the rules it draws between the rows,
    since a section is divided from the next by its heading. */
-/* stylelint-disable-next-line selector-pseudo-class-disallowed-list -- .setting-group is
-   Obsidian's own markup, not ours. Describing the condition declaratively is self-correcting;
-   reaching up to add a class to an ancestor we do not own goes stale on re-render. */
 .setting-group:has(> .setting-items > .nectenda-plain) > .setting-items {
   background: transparent;
   border: 0;

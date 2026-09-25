@@ -38,7 +38,6 @@ let nativeCompression: boolean | null = null;
  */
 export function canCompress(): boolean {
   if (nativeCompression === null) {
-    // eslint-disable-next-line obsidianmd/no-global-this -- this package also runs under Node in the server and identity services, where `window` throws rather than reporting absence; the probe must be able to answer "no" safely. See the header.
     nativeCompression = typeof globalThis.CompressionStream === 'function';
   }
   return nativeCompression;
@@ -62,7 +61,6 @@ export async function gzipBytes(data: Uint8Array): Promise<Uint8Array> {
  * ran — which is the property that matters.
  */
 export async function gunzipBytes(data: Uint8Array): Promise<Uint8Array> {
-  // eslint-disable-next-line obsidianmd/no-global-this -- this package also runs under Node in the server and identity services, where `window` throws rather than reporting absence; the probe must be able to answer "no" safely. See the header.
   if (typeof globalThis.DecompressionStream === 'function') {
     return through(data, new DecompressionStream('gzip'));
   }

@@ -150,7 +150,6 @@ export class ObsidianVaultAdapter implements VaultAdapter {
     // preferences is the system trash that was already shown not to work, while
     // another is permanent deletion. This path runs for deletions arriving from
     // other vaults, so it has to be the one that keeps the bytes.
-    // eslint-disable-next-line obsidianmd/prefer-file-manager-trash-file -- see above: trashFile() honours a preference whose branches include permanent deletion, on a path driven by another vault's delete
     await this.vault.trash(file, false);
   }
 
@@ -198,7 +197,6 @@ export class ObsidianVaultAdapter implements VaultAdapter {
    */
   async *readBinaryChunks(path: string): AsyncGenerator<Uint8Array> {
     try {
-      // eslint-disable-next-line no-restricted-globals -- requestUrl buffers the whole response; this path exists to stream an app:// resource, which is not a network request at all
       const res = await fetch(this.vault.adapter.getResourcePath(path));
       if (res.ok && res.body) {
         const reader = res.body.getReader();

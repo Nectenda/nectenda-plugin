@@ -312,7 +312,6 @@ export class ErrorReports {
     const ac = new AbortController();
     this.inFlight.add(ac);
     const timer = window.setTimeout(() => ac.abort(), SEND_TIMEOUT_MS);
-    // eslint-disable-next-line no-restricted-globals -- fire-and-forget POST to a third-party tracker, aborted on teardown; requestUrl has no abort, and fetchFn is the test seam
     const send = this.opts.fetchFn ?? fetch;
     void send(envelopeUrl(dsn), {
       method: 'POST',
