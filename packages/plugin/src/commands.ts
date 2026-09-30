@@ -20,8 +20,13 @@ export const COMMAND_IDS = [
   'open-settings',
   'share-folder',
   'show-folder-members',
+  'invite-to-folder',
+  'folder-settings',
+  'add-shared-folder',
+  'join-with-link',
   'copy-share-link',
   'enter-passphrase',
+  'forget-passphrase',
   'toggle-diagnostic-log',
 ] as const;
 export type CommandId = (typeof COMMAND_IDS)[number];
@@ -29,7 +34,12 @@ export type CommandId = (typeof COMMAND_IDS)[number];
 export const COMMAND_NAMES: Record<CommandId, string> = {
   'open-settings': 'Open settings',
   'share-folder': 'Share a folder…',
-  'show-folder-members': 'Show members of a shared folder…',
+  'show-folder-members': 'Show the people in a shared folder…',
+  'invite-to-folder': 'Invite someone to a shared folder…',
+  'folder-settings': 'Open settings for a shared folder…',
+  'add-shared-folder': 'Add a folder shared with you…',
+  'join-with-link': 'Join an organisation with a link…',
+  'forget-passphrase': 'Forget my passphrase on this device',
   'copy-share-link': "Copy an organisation's share link",
   'enter-passphrase': 'Enter passphrase',
   'toggle-diagnostic-log': 'Toggle diagnostic log',
@@ -48,6 +58,10 @@ export interface CommandState {
   hasKeys: boolean;
   mappings: FolderMapping[];
   memberships: Array<Pick<StoredMembership, 'id' | 'role'>>;
+  /** Folders shared with this person, ready to add here. Absent counts as none. */
+  offered?: number;
+  /** The identity key is open on this device now. */
+  unlocked?: boolean;
 }
 
 /** Organisations whose share link this account may reveal. */
@@ -74,15 +88,28 @@ export function commandAvailable(id: CommandId, s: CommandState): boolean {
     case 'share-folder':
       return mayShare(s);
     case 'show-folder-members':
+      // Every member, not only owners: comparing fingerprints takes both people.
+      return s.signedIn && s.mappings.length > 0;
+    case 'invite-to-folder':
       return s.signedIn && ownedMappings(s.mappings).length > 0;
     case 'copy-share-link':
       return s.signedIn && s.mode === 'cloud' && shareLinkMemberships(s.memberships).length > 0;
     case 'enter-passphrase':
       return s.locked;
+    case 'folder-settings':
+      return s.signedIn && s.mappings.length > 0;
+    case 'add-shared-folder':
+      return s.signedIn && (s.offered ?? 0) > 0;
+    case 'join-with-link':
+      return s.signedIn && s.mode === 'cloud';
+    case 'forget-passphrase':
+      // Only when there is something to forget. Not the opposite of "Enter
+      // passphrase": folders already open keep syncing, and the name says so.
+      return s.signedIn && !!s.unlocked;
   }
 }
 
-export type FolderMenuItem = 'share' | 'members';
+export type FolderMenuItem = 'share' | 'invite' | 'members' | 'settings';
 
 /**
  * What each item reads as in the menu. Every one leads with "Nectenda: ", so
@@ -91,7 +118,9 @@ export type FolderMenuItem = 'share' | 'members';
  */
 export const FOLDER_MENU_TITLES: Record<FolderMenuItem, string> = {
   share: 'Nectenda: Share folder…',
-  members: 'Nectenda: Show members…',
+  invite: 'Nectenda: Invite to folder…',
+  settings: 'Nectenda: Folder settings…',
+  members: 'Nectenda: People…',
 };
 
 /**
@@ -100,25 +129,35 @@ export const FOLDER_MENU_TITLES: Record<FolderMenuItem, string> = {
  * Share only where the pane's own share would not refuse: a folder that is
  * shared already, or sits inside or around one, is covered by a mapping, and
  * offering the item only to answer "already shared" would be a trap.
- * Members only on the root of a folder this vault owns, which is where the
- * pane's Members button is.
+ * Invite only on the root of a folder this vault owns, and first, because
+ * inviting someone is what an owner right-clicking a shared folder usually
+ * came to do. People on the root of any shared folder: an editor sees the
+ * same fingerprints, read-only, because comparing them takes both people.
  */
 export function folderMenuItems(path: string, s: CommandState): FolderMenuItem[] {
   if (!path || path === '/') return [];
   const items: FolderMenuItem[] = [];
   if (mayShare(s) && !mappingCovering(path, s.mappings)) items.push('share');
   const rooted = mappingRootedAt(path, s.mappings);
-  if (s.signedIn && rooted?.role === 'owner') items.push('members');
+  if (s.signedIn && rooted?.role === 'owner') items.push('invite');
+  if (s.signedIn && rooted) items.push('members');
+  // Every folder this vault syncs has a settings page, whoever owns it.
+  if (s.signedIn && rooted) items.push('settings');
   return items;
 }
 
 /**
- * The owned folder a note belongs to, so "show members" can skip the picker
- * when the answer is obvious from what is open.
+ * The owned folder a note belongs to, so "invite" can skip the picker when
+ * the answer is obvious from what is open.
  */
 export function ownedMappingFor(filePath: string | null, mappings: FolderMapping[]): FolderMapping | null {
+  return mappingFor(filePath, ownedMappings(mappings));
+}
+
+/** The shared folder a note belongs to, whoever owns it, so "People" can skip the picker. */
+export function mappingFor(filePath: string | null, mappings: FolderMapping[]): FolderMapping | null {
   if (!filePath) return null;
-  return ownedMappings(mappings).find((m) => filePath.startsWith(m.localPath + '/')) ?? null;
+  return mappings.find((m) => filePath.startsWith(m.localPath + '/')) ?? null;
 }
 
 export type ShareLink = { enabled: true; link: string } | { enabled: false };
@@ -139,8 +178,60 @@ export async function shareLinkFor(
   if (!res.ok) throw new Error('The server did not reveal the share key');
   const { shareKey, enabled } = (await res.json()) as { shareKey: string; enabled: boolean };
   if (!enabled) return { enabled: false };
-  return {
-    enabled: true,
-    link: `obsidian://nectenda?key=${encodeURIComponent(shareKey)}&endpoint=${encodeURIComponent(membership.endpoint)}`,
-  };
+  return { enabled: true, link: linkFor(membership, shareKey) };
+}
+
+function linkFor(membership: Pick<StoredMembership, 'endpoint'>, shareKey: string): string {
+  return `obsidian://nectenda?key=${encodeURIComponent(shareKey)}&endpoint=${encodeURIComponent(membership.endpoint)}`;
+}
+
+/**
+ * Turn an organisation's share link off or back on.
+ *
+ * Turning it back on revives the *same* key: anyone who was sent the old link
+ * can use it again. That is why the pane points at "Replace" for a link that
+ * went to the wrong person, not at turning it off and on.
+ */
+export async function setShareLinkEnabled(
+  server: { base: string; token: string },
+  enabled: boolean,
+  fetch: (url: string, init?: RequestInit) => Promise<Response>,
+): Promise<void> {
+  const res = await fetch(`${server.base}/account/share-key`, {
+    method: 'PATCH',
+    headers: { Authorization: `Bearer ${server.token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ enabled }),
+  });
+  if (!res.ok) throw new Error(enabled ? 'The server did not turn the share link on' : 'The server did not turn the share link off');
+}
+
+/**
+ * Replace an organisation's share key and return the new link. The shard checks
+ * the current key at every join, so the old link stops working the moment this
+ * returns, whatever the directory still routes.
+ */
+export async function replaceShareLink(
+  membership: Pick<StoredMembership, 'endpoint'>,
+  server: { base: string; token: string },
+  fetch: (url: string, init?: RequestInit) => Promise<Response>,
+): Promise<string> {
+  const res = await fetch(`${server.base}/account/share-key/rotate`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${server.token}` },
+  });
+  if (!res.ok) throw new Error('The server did not replace the share link');
+  const { shareKey } = (await res.json()) as { shareKey: string };
+  return linkFor(membership, shareKey);
+}
+
+export type ShareLinkAction = 'copy' | 'replace' | 'off' | 'on';
+
+/**
+ * The buttons on an organisation's share-link row. `null` is "not heard from
+ * the server yet": copying is offered, as it always was, but nothing that
+ * assumes a state — turning off a link that is already off, or on one that is on.
+ */
+export function shareLinkActions(enabled: boolean | null): ShareLinkAction[] {
+  if (enabled === null) return ['copy'];
+  return enabled ? ['copy', 'replace', 'off'] : ['on'];
 }

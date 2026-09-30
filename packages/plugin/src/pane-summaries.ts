@@ -156,13 +156,17 @@ export type FolderServer = { base: string; token: string; membershipId: string |
 
 export function pagesKey(
   list: Array<{ id: string; accountName: string; accountStatus: string; role: string; device?: { enrolled: boolean; used: number; max: number } }>,
-  mappings: Array<{ membershipId?: string }> = [],
+  mappings: Array<{ membershipId?: string; sharedFolderId?: string; sharedFolderName?: string; localPath?: string; role?: string }> = [],
 ): string {
-  return JSON.stringify(list.map((m) => [
-    m.id, m.accountName, m.accountStatus, m.role, m.device?.enrolled ?? null, m.device?.used ?? null, m.device?.max ?? null,
-    // The entry counts the folders synced here, so a map or unmap redraws it.
-    foldersSyncedFor(m.id, mappings, list.length),
-  ]));
+  return JSON.stringify([
+    list.map((m) => [
+      m.id, m.accountName, m.accountStatus, m.role, m.device?.enrolled ?? null, m.device?.used ?? null, m.device?.max ?? null,
+      // The entry counts the folders synced here, so a map or unmap redraws it.
+      foldersSyncedFor(m.id, mappings, list.length),
+    ]),
+    // "This vault" has an entry per folder, named and described from these.
+    mappings.map((m) => [m.sharedFolderId ?? null, m.sharedFolderName ?? null, m.localPath ?? null, m.role ?? null]),
+  ]);
 }
 
 export type SentInviteStatus = 'pending' | 'accepted' | 'declined' | 'revoked' | 'expired';
@@ -275,4 +279,26 @@ export function formatMoney(minorUnits: number, currency: string): string {
 /** Plan ids are lowercase and hyphenated; these are the names the site uses. */
 export function planLabel(planId: string): string {
   return { personal: 'Personal', team: 'Team', 'small-business': 'Small Business' }[planId] ?? planId;
+}
+
+/**
+ * "3 folders syncing in this vault · 1 needs your passphrase". One sentence for
+ * the settings status line and the status icon's tooltip, so they agree.
+ */
+export function foldersSyncingLine(folders: number, locked: number): string {
+  const first = folders === 0 ? 'no folders syncing in this vault yet' : `${folders} ${folders === 1 ? 'folder' : 'folders'} syncing in this vault`;
+  return locked ? `${first} · ${locked} need${locked === 1 ? 's' : ''} your passphrase` : first;
+}
+
+/**
+ * Where the status icon shows, from what a vault stored. Before this setting
+ * there was only `statusBar`, on by default in 0.3's first build; someone who
+ * kept it on keeps it, and the header and ribbon are on as they always were.
+ */
+export function migrateStatusPlaces(stored: { statusIn?: unknown; statusBar?: unknown } | null): { header: boolean; ribbon: boolean; statusBar: boolean } {
+  const s = stored?.statusIn as { header?: unknown; ribbon?: unknown; statusBar?: unknown } | undefined;
+  if (s && typeof s === 'object') {
+    return { header: s.header !== false, ribbon: s.ribbon !== false, statusBar: s.statusBar === true };
+  }
+  return { header: true, ribbon: true, statusBar: stored?.statusBar === true };
 }

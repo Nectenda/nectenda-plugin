@@ -5,7 +5,7 @@ import * as decoding from 'lib0/decoding';
 import { MessageType, COMPACT_AFTER_UPDATES, MAX_PUSH_BYTES, WS_CLOSE_DEVICE_LIMIT, WS_CLOSE_ACCOUNT_SUSPENDED, WS_CLOSE_ACCOUNT_MOVING, WS_CLOSE_SIGNED_OUT, WS_CLOSE_UPDATE_PLUGIN } from '@nectenda/shared';
 import { PLUGIN_VERSION } from './client-version.js';
 import { log } from './logger';
-import { sealPresence, openPresence, decodeEntries, encodeEntries, type PresenceEntry } from './presence-seal';
+import { sealPresence, openPresence, decodeEntries, encodeEntries, PRESENCE_PAD_BYTES, type PresenceEntry } from './presence-seal';
 
 /** A `window.setTimeout`/`setInterval` handle: a number.
  *
@@ -102,6 +102,29 @@ export interface SeqStore {
   save(seq: number): Promise<void>;
 }
 
+/**
+ * What a subscriber may learn about remote updates before they land.
+ *
+ * `beforeRemoteUpdate` sees each decrypted update immediately before it is
+ * applied, synchronously, with nothing in between. Structured sync needs the
+ * update's own delete set, which the document cannot tell it afterwards: once
+ * applied, an entry the sender deleted on purpose and one that vanished because
+ * the sender never saw it look the same. The second is someone's edit lost
+ * under a concurrent write, and it has to be kept (see structured-sync.ts).
+ *
+ * Read-only by contract. A hook that throws is contained and logged, so a bug
+ * in one subscriber cannot stop the update reaching the document.
+ */
+/** How a document is subscribed, beyond its content. */
+export interface SubscribeOptions {
+  /** A larger presence padding bucket, for a document whose states are larger — a canvas. */
+  presencePadBytes?: number;
+}
+
+export interface RemoteUpdateHooks {
+  beforeRemoteUpdate(update: Uint8Array): void;
+}
+
 interface DocSubscription {
   ydoc: Y.Doc;
   awareness: awarenessProtocol.Awareness;
@@ -138,6 +161,8 @@ interface DocSubscription {
    * subscription did before, asking from 0 on each launch.
    */
   seqStore: SeqStore | null;
+  /** See `RemoteUpdateHooks`. */
+  hooks: RemoteUpdateHooks | null;
   /** Resolves once any persisted sequence has been restored. */
   seqReady: Promise<void>;
   seqSaveTimer: TimerHandle | null;
@@ -261,6 +286,8 @@ interface DocSubscription {
    */
   presenceSendChain: Promise<void>;
   presenceRecvChain: Promise<void>;
+  /** The padding bucket this document's presence is sealed in (presence-seal.ts). */
+  presencePadBytes: number;
   updateHandler: (update: Uint8Array, origin: unknown) => void;
   awarenessHandler: (changes: { added: number[]; updated: number[]; removed: number[] }, origin: unknown) => void;
 }
@@ -462,7 +489,13 @@ export class MultiplexedProvider {
     this.events.clear();
   }
 
-  subscribe(docName: string, ydoc: Y.Doc, seqStore?: SeqStore): awarenessProtocol.Awareness {
+  subscribe(
+    docName: string,
+    ydoc: Y.Doc,
+    seqStore?: SeqStore,
+    hooks?: RemoteUpdateHooks,
+    options?: SubscribeOptions,
+  ): awarenessProtocol.Awareness {
     const existing = this.docs.get(docName);
     if (existing) {
       // Silently ignoring the new Y.Doc would leave the caller holding a
@@ -542,7 +575,7 @@ export class MultiplexedProvider {
               continue;
             }
             try {
-              entries.push({ clientID, clock, json: await sealPresence(this.cipher, docName, clientID, clock, state) });
+              entries.push({ clientID, clock, json: await sealPresence(this.cipher, docName, clientID, clock, state, sub.presencePadBytes) });
             } catch (err) {
               // Never sent plain instead. A folder without a key has no
               // presence, which is visible; a readable state is not.
@@ -577,6 +610,7 @@ export class MultiplexedProvider {
       synced: false,
       lastSeq: 0,
       seqStore: seqStore ?? null,
+      hooks: hooks ?? null,
       seqReady: Promise.resolve(),
       seqSaveTimer: null,
       updatesSinceSnapshot: 0,
@@ -598,6 +632,7 @@ export class MultiplexedProvider {
       decryptGapSeq: null,
       presenceSendChain: Promise.resolve(),
       presenceRecvChain: Promise.resolve(),
+      presencePadBytes: options?.presencePadBytes ?? PRESENCE_PAD_BYTES,
       updateHandler,
       awarenessHandler,
     };
@@ -760,6 +795,15 @@ export class MultiplexedProvider {
         return;
       }
 
+      if (sub.hooks) {
+        try {
+          sub.hooks.beforeRemoteUpdate(plaintext);
+        } catch (err) {
+          log.warn('A remote-update hook threw; applying the update anyway', {
+            docName, error: String(err),
+          });
+        }
+      }
       Y.applyUpdate(sub.ydoc, plaintext, 'remote');
       if (isSnapshot || !sub.synced) sub.catchUp.push(plaintext);
       if (sub.decryptGapSeq === null) {

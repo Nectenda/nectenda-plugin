@@ -121,7 +121,8 @@ export function newKdfParams(iterations = PBKDF2_ITERATIONS): KdfParams {
  * Derive the master key from the user's password. This is the expensive step;
  * everything else is cheap derivation from its output.
  *
- * The master key itself is never sent anywhere and never stored.
+ * The master key itself is never sent or stored in the clear. It is kept
+ * only sealed under the recovery key, as the recovery blob.
  */
 export async function deriveMasterKey(password: string, params: KdfParams): Promise<Uint8Array> {
   if (params.algorithm !== 'PBKDF2-SHA256') {

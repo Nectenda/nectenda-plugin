@@ -4,6 +4,49 @@ Every release of the Nectenda plugin, newest first. Each release on GitHub also
 carries the SHA-256 of its `main.js`, so you can check that the plugin you are
 running is the source you read — see the README.
 
+## 0.3.0 — 30 September 2026
+
+### Added
+- **Canvases are collaborative.** Two people moving different cards, or typing in the same card, both keep their changes instead of getting a conflict copy.
+- Open canvases are live: you see other people's moves, edits and typing as they happen. Their mouse pointers show with their names, and stick to the edge of the canvas when they are off-screen. Text they select inside a card is highlighted in their colour. Undo steps back only your own changes.
+- On a live canvas you see a collaborator's caret, with their name, inside the card they are typing in. A card someone is typing in is outlined with their name even when you are only looking at it.
+- Click a person's circle in the header to jump to them: in a note, to their cursor, or to their pointer if they have no cursor there; on a canvas, to their pointer or to the card they are typing in.
+- Invite someone to a shared folder by email in one step, from the folder's right-click menu, the command palette or the folder's people list. They get the folder as soon as they join.
+- Your vault now shares a folder's key with new members automatically. It refuses if a collaborator's key has changed since you last shared with them.
+- A folder someone shares with you is offered once its key arrives: "shared a folder with you — Add to this vault".
+- The people list shows whether you have compared each collaborator's key fingerprint, with a "Mark as compared" button, and lists pending invitations. Editors can open it too, not only owners.
+- Settings are reorganised. There is a "This vault" list with a page per shared folder, "Shared with you" for invitations and folders waiting to be added, a short "Get started" list, and Security, Editing and Advanced pages. Names are clearer throughout ("Stop syncing here", "Add to vault", "People").
+- Choose where Nectenda's status appears: each note's header, the ribbon (now the Nectenda logo) or, on desktop, the status bar. Each shows the same icon and opens the same menu, which lists who is in the note, anything waiting for you, and the folder's settings.
+- New commands: open a shared folder's settings, add a folder shared with you, join an organisation with a link, and forget your passphrase on this device.
+- Right-click a synced folder, or a note in one, for "Nectenda: Folder settings…". Owners also get "Invite to folder…" on notes.
+- Shared folders have an accent-coloured indentation guide in the file explorer, and a note a collaborator changes briefly pulses there.
+- User guides are published at nectenda.com/docs. A new install shows one notice pointing to Nectenda's settings.
+- Owners and admins can turn their organisation's share link off, or replace it with a new one, from the organisation page. The old link stops working at once.
+- If you have lost both your passphrase and your recovery key, you can start over with a new, empty account under the same email address. The reset waits seven days, and any device still signed in can cancel it. A vault left open notices such a request within the hour, or when you return to the window.
+
+### Fixed
+- **A note's text could be copied into a different note** when two notes were open in split panes.
+- **A key typed the moment a shared note's pane became active could be erased.**
+- A collaborator's cursor and name no longer flash while they type.
+- Deleting or renaming a canvas that was shared before canvases merged no longer brings the old file back on the next restart.
+- A phone or computer that was already signed in when you joined an organisation on another device now syncs that organisation's folders, instead of adding them and staying empty.
+- Adding a shared folder no longer reuses an existing folder of the same name that already holds notes. It goes to "<name> (shared)" instead, so those notes are not shared by accident.
+- The dot and number on the Nectenda status icon now scale with the icon and sit evenly at its corners.
+- The recovery dialogs consistently say "passphrase".
+
+### Known
+- **Everyone sharing a canvas should update to 0.3.0.** A collaborator on an earlier version still syncs canvases as whole files. Their edits reach you as conflict copies beside the canvas, and yours do not reach them. Nothing is lost, but the canvas does not merge until they update.
+- When two people change the same thing on a canvas at once, such as the same card's position or colour, one change is kept and the other person gets a conflict copy of the canvas beside it, with a notice. A card someone deletes can come back if another person was editing it at the same time.
+- If a collaborator moves a card while you are dragging it, your drop wins its position.
+- Live canvases rely on parts of Obsidian that it does not document. If an Obsidian update changes them, the canvas stops being live, with a notice, and syncs through the file instead, as it does before its document is ready. Then it reloads when someone else changes it: you can lose your place in a card you are typing in, undo can undo other people's changes, and a keystroke or change made in the same instant as a remote one can be overwritten.
+- A collaborator's caret shows only while their Obsidian window has focus. Inside an embed in a canvas card, the card is outlined with their name but no caret is drawn.
+- Live canvases have not been run on a phone.
+- Collaborators still on 0.1.5 or earlier will appear to have no cursor. Their edits sync normally.
+- iOS is untested on a device. It should work — it is the same JavaScript as Android — but nobody has run it on an iPhone, so it is not claimed.
+- On Android, all vaults in the app share one secret store: signing one vault in signs them all in.
+- There is no read-only membership. Everyone in a shared folder can edit it.
+- Not audited. The client ships unminified and the build is reproducible, so the claim is checkable — but no third party has checked it.
+
 ## 0.2.1 — 25 September 2026
 
 ### Added

@@ -1,6 +1,6 @@
 import type * as Y from 'yjs';
 import type * as awarenessProtocol from 'y-protocols/awareness';
-import type { DocSyncState, ProviderEvent, ProviderStatus, SeqStore } from './multiplexed-provider';
+import type { DocSyncState, ProviderEvent, ProviderStatus, RemoteUpdateHooks, SeqStore, SubscribeOptions } from './multiplexed-provider';
 import { log } from './logger';
 
 type EventCallback = (...args: unknown[]) => void;
@@ -31,7 +31,7 @@ export interface SyncProvider {
   connect(): void;
   disconnect(): void;
   destroy(): void;
-  subscribe(docName: string, ydoc: Y.Doc, seqStore?: SeqStore): awarenessProtocol.Awareness;
+  subscribe(docName: string, ydoc: Y.Doc, seqStore?: SeqStore, hooks?: RemoteUpdateHooks, options?: SubscribeOptions): awarenessProtocol.Awareness;
   unsubscribe(docName: string): void;
   deleteDoc(docName: string): void;
   getAwareness(docName: string): awarenessProtocol.Awareness | null;
@@ -237,10 +237,10 @@ export class ProviderRouter implements SyncProvider {
     this.aggregate = 'disconnected';
   }
 
-  subscribe(docName: string, ydoc: Y.Doc, seqStore?: SeqStore): awarenessProtocol.Awareness {
+  subscribe(docName: string, ydoc: Y.Doc, seqStore?: SeqStore, hooks?: RemoteUpdateHooks, options?: SubscribeOptions): awarenessProtocol.Awareness {
     const conn = this.route(docName);
     if (!conn) throw new Error(`No sync server for ${docName}`);
-    return conn.provider.subscribe(docName, ydoc, seqStore);
+    return conn.provider.subscribe(docName, ydoc, seqStore, hooks, options);
   }
 
   unsubscribe(docName: string): void {

@@ -7,6 +7,7 @@ import type { VaultAdapter } from './vault-adapter';
 import { mappingRootedAt, resolveMapping } from './folder-mapping';
 import { kindOf } from './blob-policy';
 import type { BlobSync } from './blob-sync';
+import type { StructuredSync } from './structured-sync';
 import { log } from './logger';
 
 /**
@@ -51,6 +52,7 @@ export class VaultWatcher {
   private fileSync: FileSync;
   private contentSync: ContentSync | null;
   private blobSync: BlobSync | null;
+  private structuredSync: StructuredSync | null;
   private started = false;
   /**
    * Local creates seen before their folder's listing document existed, by
@@ -76,12 +78,14 @@ export class VaultWatcher {
     contentSync: ContentSync | null,
     vault: VaultAdapter,
     blobSync: BlobSync | null = null,
+    structuredSync: StructuredSync | null = null,
   ) {
     this.deps = deps;
     this.vault = vault;
     this.fileSync = fileSync;
     this.contentSync = contentSync;
     this.blobSync = blobSync;
+    this.structuredSync = structuredSync;
 
     // Subscribed in the constructor rather than in start(), because the gap
     // this closes opens before start() is called.
@@ -157,6 +161,10 @@ export class VaultWatcher {
   handleCreate(path: string): void {
     if (!this.started) {
       log.debug('Create ignored — watcher not started', { path });
+      return;
+    }
+    if (this.isStructured(path)) {
+      this.handleStructuredCreate(path);
       return;
     }
     if (isBlob(path)) {
@@ -239,6 +247,13 @@ export class VaultWatcher {
   handleDelete(path: string): void {
     if (!this.started) return;
 
+    if (this.isStructured(path)) {
+      const resolved = this.resolveFile(path);
+      if (!resolved) return;
+      this.forgetStructured(resolved.sharedFolderId, resolved.relativePath);
+      return;
+    }
+
     if (isBlob(path)) {
       const resolved = this.resolveFile(path);
       if (!resolved || !this.blobSync) return;
@@ -298,6 +313,11 @@ export class VaultWatcher {
     // arrival would re-add what is already listed and re-upload every
     // attachment in the folder.
     if (this.movedWithItsFolder(path, oldPath)) return;
+
+    if (this.isStructured(oldPath) || this.isStructured(path)) {
+      this.handleStructuredRename(path, oldPath);
+      return;
+    }
 
     if (isBlob(path)) {
       this.handleBlobRename(path, oldPath);
@@ -369,6 +389,16 @@ export class VaultWatcher {
   handleModify(path: string): void {
     if (!this.started) return;
 
+    if (this.isStructured(path)) {
+      const resolved = this.resolveFile(path);
+      if (!resolved || !this.structuredSync) return;
+      void this.structuredSync.onLocalModify(resolved.sharedFolderId, resolved.relativePath)
+        .catch((err: unknown) => {
+          log.warn('Local modification did not reach the structured document', { error: String(err) });
+        });
+      return;
+    }
+
     if (isBlob(path)) {
       const resolved = this.resolveFile(path);
       if (!resolved || !this.blobSync) return;
@@ -429,6 +459,115 @@ export class VaultWatcher {
     }
   }
 
+  /**
+   * Whether a path is a structured file: listed as one, or named as one.
+   *
+   * Asked before the text/attachment split, and of the listing first, so a
+   * file shared as structured by a newer member is never re-read here by its
+   * extension and uploaded as an attachment beside itself.
+   */
+  private isStructured(path: string): boolean {
+    const resolved = this.resolveFile(path);
+    // Outside every shared folder nothing is synced, whatever its kind.
+    if (!resolved) return false;
+    return this.fileSync.classify(resolved.sharedFolderId, resolved.relativePath) === 'structured';
+  }
+
+  /** A new structured file, or one arriving from the listing. */
+  private handleStructuredCreate(path: string): void {
+    const resolved = this.resolveFile(path);
+    if (!resolved) return;
+    const { sharedFolderId, relativePath } = resolved;
+    const mapping = this.deps.mappings().find((m) => m.sharedFolderId === sharedFolderId);
+    if (!mapping || !this.structuredSync) return;
+
+    // Before the listing is open there is nowhere to record it; held and
+    // replayed exactly as a note is (SAFE-A7).
+    if (!this.fileSync.getYDoc(sharedFolderId)) {
+      let pending = this.pendingCreates.get(sharedFolderId);
+      if (!pending) {
+        pending = new Set();
+        this.pendingCreates.set(sharedFolderId, pending);
+      }
+      pending.add(path);
+      log.debug('Structured create deferred — folder has no listing document yet', { path, sharedFolderId });
+      return;
+    }
+
+    // Created on the listing's instruction, or already listed: follow it,
+    // announce nothing.
+    const listed = this.fileSync.getStructuredEntry(sharedFolderId, relativePath);
+    if (listed || this.fileSync.isRemoteCreate(sharedFolderId, relativePath)) {
+      this.structuredSync.connectFile(sharedFolderId, mapping.localPath, relativePath, listed?.format);
+      return;
+    }
+
+    const entry = this.fileSync.structuredEntryFor(path, relativePath);
+    if (!entry) return;
+    this.fileSync.setStructuredEntry(sharedFolderId, relativePath, entry);
+    this.structuredSync.connectFile(sharedFolderId, mapping.localPath, relativePath, entry.format);
+  }
+
+  /**
+   * A structured file renamed or moved, or a file renamed into or out of a
+   * structured format.
+   *
+   * Within one folder and still structured, the entry moves in one
+   * transaction, which peers see as a rename. Anything else changes what kind
+   * of file this is, and is honestly a removal of the old path and an arrival
+   * of the new one — each then handled by the kind it now has.
+   */
+  private handleStructuredRename(path: string, oldPath: string): void {
+    const oldResolved = this.resolveFile(oldPath);
+    const newResolved = this.resolveFile(path);
+    const oldStructured = oldResolved !== null && this.fileSync.isStructuredListed(
+      oldResolved.sharedFolderId, oldResolved.relativePath,
+    );
+
+    // The echo of a rename the listing asked for: the entry has already moved,
+    // so the old path is unlisted and the new one listed. FileSync has moved
+    // the document too. Treating it as a deletion here would purge the old
+    // document from the server — something the vault that made the rename
+    // deliberately does not do.
+    if (
+      !oldStructured && oldResolved && newResolved &&
+      oldResolved.sharedFolderId === newResolved.sharedFolderId &&
+      this.fileSync.isStructuredListed(newResolved.sharedFolderId, newResolved.relativePath)
+    ) {
+      return;
+    }
+
+    if (
+      oldResolved && newResolved && oldStructured &&
+      oldResolved.sharedFolderId === newResolved.sharedFolderId &&
+      // By name: the new path is not listed yet, and this is the question of
+      // whether it is still a structured file at all.
+      this.fileSync.classify(newResolved.sharedFolderId, newResolved.relativePath) === 'structured'
+    ) {
+      const { sharedFolderId } = newResolved;
+      const kept = this.fileSync.getStructuredEntry(sharedFolderId, oldResolved.relativePath)?.blobHash;
+      if (this.fileSync.renameStructuredEntry(sharedFolderId, oldResolved.relativePath, newResolved.relativePath)) {
+        this.forgetAttachmentEntry(sharedFolderId, oldResolved.relativePath, kept);
+        const mapping = this.deps.mappings().find((m) => m.sharedFolderId === sharedFolderId);
+        const format = this.fileSync.getStructuredEntry(sharedFolderId, newResolved.relativePath)?.format;
+        if (mapping) {
+          this.structuredSync?.moveFile(
+            sharedFolderId, mapping.localPath, oldResolved.relativePath, newResolved.relativePath, format,
+          );
+        }
+        return;
+      }
+    }
+
+    if (oldStructured && oldResolved) {
+      this.forgetStructured(oldResolved.sharedFolderId, oldResolved.relativePath);
+    } else if (oldResolved) {
+      // It was text or an attachment; its own path forgets it.
+      this.handleDelete(oldPath);
+    }
+    if (newResolved) this.handleCreate(path);
+  }
+
   /** A new attachment in a shared folder. */
   private handleBlobCreate(path: string): void {
     const resolved = this.resolveFile(path);
@@ -458,6 +597,41 @@ export class VaultWatcher {
   /** The folder rename is finished; later events are ordinary again. */
   renameSettled(): void {
     this.renameInFlight = null;
+  }
+
+  /** A structured file gone from this path: unlist it, and whatever it was adopted from. */
+  private forgetStructured(sharedFolderId: string, relativePath: string): void {
+    const kept = this.fileSync.getStructuredEntry(sharedFolderId, relativePath)?.blobHash;
+    this.fileSync.removeStructuredEntry(sharedFolderId, relativePath);
+    this.forgetAttachmentEntry(sharedFolderId, relativePath, kept);
+    this.structuredSync?.deleteRemote(sharedFolderId, relativePath);
+  }
+
+  /**
+   * Remove the attachment entry a structured file was adopted from, once the
+   * file has left that path.
+   *
+   * Adoption leaves the entry in place so an older client keeps the file
+   * (SAFE-A17). Once the file is deleted or renamed here, that entry is all
+   * that is left of it, and the next connect adopts it again — downloading the
+   * old attachment bytes back to the path the user just emptied. So it goes,
+   * and an older client sees the deletion it would have seen anyway.
+   *
+   * Only a version already kept: its hash is the one the structured entry
+   * records as carried across or kept beside the file. An older client's
+   * version nobody has kept yet stays listed, and coming back on the next
+   * connect is how it stays visible.
+   */
+  private forgetAttachmentEntry(sharedFolderId: string, relativePath: string, kept: string | undefined): void {
+    const entry = this.fileSync.getBlobEntry(sharedFolderId, relativePath);
+    if (!entry) return;
+    if (entry.hash !== kept) {
+      log.info('Leaving an attachment version nobody has kept listed', { relativePath });
+      return;
+    }
+    this.fileSync.removeBlobEntry(sharedFolderId, relativePath);
+    // As for an attachment: only the client that noticed can reclaim the bytes.
+    if (this.blobSync) void this.blobSync.deleteRemote(sharedFolderId, entry.blobId);
   }
 
   private resolveFile(filePath: string): { sharedFolderId: string; relativePath: string } | null {

@@ -1,12 +1,11 @@
-import { Notice, Plugin, PluginSettingTab, App, Setting, MarkdownView, SettingPage, TFile, TFolder, apiVersion, type SettingDefinitionItem, type SettingGroupItem } from 'obsidian';
-import type { Extension } from '@codemirror/state';
+import { Notice, Platform, Plugin, PluginSettingTab, App, Setting, MarkdownView, SettingPage, TextFileView, TFile, TFolder, apiVersion, editorInfoField, type SettingDefinitionItem, type SettingGroupItem } from 'obsidian';
 import { DEFAULT_PORT, MAX_PUSH_BYTES, apiBaseUrl } from '@nectenda/shared';
 import type { UserInfo, InviteTokenInfo, SharedFolderInfo, KeyMaterial, KdfParams } from '@nectenda/shared';
 import { hashCredential } from '@nectenda/shared';
 import { ProviderRouter, type ShardConnection } from './provider-router';
-import { IdentityClient, IdentityError, ShardClient, type SentInvite, type ShardSession } from './identity-client';
+import { IdentityClient, IdentityError, ShardClient, type MeResponse, type SentInvite, type ShardSession } from './identity-client';
 import { recoverSignedOutConnection } from './signed-out';
-import { SingleFlight } from './single-flight';
+import { RefreshGate, type RefreshKind } from './single-flight';
 import { partitionFolders, mappingBelongsTo, mayUnshare, foldersSyncedFor, unclaimedMappings } from './folder-sections';
 import type { FolderRole } from './folder-members';
 import { sessionIdFromToken } from './jwt-claims';
@@ -19,12 +18,17 @@ import {
   ErrorReportConsentModal,
   FolderPickerModal,
   InviteByEmailModal,
+  InviteToFolderModal,
+  FolderSettingsModal,
+  TextPromptModal,
+  ConfirmModal,
   LargeAttachmentModal,
   NameOrganisationModal,
   PasswordPromptModal,
   PlanPickerModal,
   RecoveryKeyModal,
   RecoveryModal,
+  StartOverModal,
   RemoveDeviceModal,
   SetPassphraseModal,
   UnshareFolderModal,
@@ -32,11 +36,15 @@ import {
 } from './modals';
 import type { TimerHandle } from './timers';
 import { IdentitySession, type VerifyOutcome } from './identity-session';
+import {
+  RELEASE_CHECK_TICK_MS, type ReleaseCheckOutcome, type ReleaseCheckTrigger,
+  dueDate, pendingAfterCheck, pendingReleaseText, releaseCheckDue, releaseCheckMayRotate, shouldAnnounce,
+} from './start-over';
 import { DEFAULT_SETTINGS, DEFAULT_IDENTITY_URL, type NectendaSettings } from './settings-type';
 import { type ChangeReason, type PaneSection, sectionsFor, REFRESH_COALESCE_MS, PANE_POLL_MS, ChangeFanout, SectionGenerations } from './pane-refresh';
-import { formatBytes, describeAge, ambiguousNames, storageSummary, forgetUnmappedRecords, membershipShape, organisationSummary, organisationWarning, pageName, type FolderServer, pagesKey, type SentInviteStatus, sentInviteStatus, sentInviteDescription, shouldCreateFirstOrganisation } from './pane-summaries';
+import { foldersSyncingLine, migrateStatusPlaces, formatBytes, describeAge, ambiguousNames, storageSummary, forgetUnmappedRecords, membershipShape, organisationSummary, organisationWarning, pageName, type FolderServer, pagesKey, type SentInviteStatus, sentInviteStatus, sentInviteDescription, shouldCreateFirstOrganisation } from './pane-summaries';
 import { newPkce, pollForResult, type SignInResult } from './auth-flow';
-import { establishMemberships, membershipId, type StoredMembership, syncsHere, deviceOf } from './cloud-session';
+import { establishMemberships, enrolNewSeats, membershipId, type StoredMembership, syncsHere, deviceOf } from './cloud-session';
 import { ObsidianVaultAdapter } from './obsidian-vault';
 import { PROVIDER_LABELS, PROVIDER_ORDER, providerMark, providerStartUrl, type ProviderName } from './provider-marks';
 import { nectendaMark, nectendaWordmark } from './brand-marks';
@@ -62,16 +70,33 @@ import {
 import type { SessionKeys, SessionResult } from './session';
 import { MultiplexedProvider } from './multiplexed-provider';
 import { ContentSync } from './content-sync';
+import { StructuredSync } from './structured-sync';
+import { STRUCTURED_FORMATS } from './structured-formats';
+import { CanvasViewGuard } from './canvas-view-guard';
+import { CanvasLiveManager, bindingForCanvas, type CanvasLiveBinding } from './canvas-live';
+import type { CanvasViewInternal } from './canvas-internals';
+import { canvasCardBinding } from './canvas-card-binding';
+import { PendingEdits } from './pending-edits';
+import { EditorWiring } from './editor-wiring';
+import { CanvasPresence } from './canvas-presence';
 import { OversizedNotes, describeOversizedNotes, type OversizedNote } from './oversized-notes';
 import { mib } from './sync-status';
-import { EditorBridge } from './editor-bridge';
+import { EditorBridge, presenceReporter, userColor } from './editor-bridge';
 import type { FolderMapping } from './editor-bridge';
 import { basenameOf, mappingCovering } from './folder-mapping';
 import { FolderIndicator } from './folder-indicator';
 import { FileStatusIndicator, buildStatusIndex } from './file-status-indicator';
-import { HeaderStatus, countOthers, registerHeaderIcon, type ConnectionStatus } from './header-status';
+import { CONNECTION_LABELS, HEADER_ICON, HeaderStatus, PROBLEM_CONNECTIONS, countOthers, mayHide, registerHeaderIcon, type ConnectionStatus, type StatusPlaces } from './header-status';
 import { INSPECTOR_VIEW, createInspectorView, isInspector, type InspectorDeps } from './sync-inspector';
-import { COMMAND_IDS, COMMAND_NAMES, FOLDER_MENU_TITLES, commandAvailable, folderMenuItems, ownedMappingFor, ownedMappings, shareLinkFor, shareLinkMemberships, type CommandId, type CommandState } from './commands';
+import { KeyGrantService, nextGrantDelayMs, waitingKey } from './key-grants';
+import { JustChanged } from './just-changed';
+import { AwaitingFolders, type OfferedFolder } from './awaiting-folders';
+import { addExistingMember, inviteNewAddress, routeInvite, type KeyTrust } from './folder-invite';
+import { checkKey, knownKey, markCompared, rememberKey } from './known-keys';
+import { defaultAddLocation, pathState } from './add-location';
+import type { RosterUser, FolderMember } from './folder-members';
+import { LABELS } from './labels';
+import { COMMAND_IDS, COMMAND_NAMES, FOLDER_MENU_TITLES, commandAvailable, folderMenuItems, mappingFor, ownedMappingFor, ownedMappings, replaceShareLink, setShareLinkEnabled, shareLinkActions, shareLinkFor, shareLinkMemberships, type CommandId, type CommandState } from './commands';
 import { FileSync } from './file-sync';
 import { BlobSync } from './blob-sync';
 import { DeviceStateStore, type StateFile } from './device-state';
@@ -210,6 +235,15 @@ interface AccountSlots {
 }
 
 
+/**
+ * A section heading, as Obsidian draws its own: a heading row, not a bare
+ * h3/h4. The pane had both, and the difference showed as uneven spacing and
+ * weights between sections that were meant to be peers.
+ */
+function heading(parent: HTMLElement, text: string): Setting {
+  return new Setting(parent).setName(text).setHeading();
+}
+
 function noteRow(parent: HTMLElement, text: string | DocumentFragment, cls?: string): Setting {
   const row = new Setting(parent).setDesc(text);
   if (cls) row.descEl.addClass(cls);
@@ -299,6 +333,14 @@ export default class NectendaPlugin extends Plugin {
    */
   provider: ProviderRouter | null = null;
   contentSync: ContentSync | null = null;
+  structuredSync: StructuredSync | null = null;
+  private canvasViewGuard: CanvasViewGuard | null = null;
+  /** Open canvases bound live to their documents (canvas-live.ts). */
+  private canvasLive: CanvasLiveManager | null = null;
+  /** Header reports for live canvases, by view, for the active one to repaint. */
+  private canvasReporters = new Map<unknown, () => void>();
+  /** Each live canvas view's presence, for "go to" from the presence circles. */
+  private canvasPresences = new Map<unknown, CanvasPresence>();
   editorBridge: EditorBridge | null = null;
   folderIndicator: FolderIndicator | null = null;
   fileSync: FileSync | null = null;
@@ -325,13 +367,32 @@ export default class NectendaPlugin extends Plugin {
   connectionStatus: ConnectionStatus = 'disconnected';
   /** People other than this device in the active note. */
   presenceOthers = 0;
+  /** Their names, for the status menu's "Go to …". */
+  presentPeople: string[] = [];
   headerStatus: HeaderStatus | null = null;
+  /** Wraps folder keys for members waiting on one; runs on owner devices only (see key-grants.ts). */
+  keyGrants: KeyGrantService | null = null;
+  /** Notices folders newly shared with this person and offers them once. */
+  awaitingFolders: AwaitingFolders | null = null;
+  private collaborationTimer: number | null = null;
+  /**
+   * Offers still on screen, by folder. An offer is kept until dismissed, so a
+   * folder added some other way — the pane, another offer — would leave its
+   * notice asking for something already done.
+   */
+  private offerNotices = new Map<string, Notice>();
+  /** The first-run notice, closed once the person has signed in. */
+  welcomeNotice: Notice | null = null;
   fileStatus: FileStatusIndicator | null = null;
   private statusUiTimer: TimerHandle | null = null;
   /** The most recent note to have focus, for the inspector. */
   private lastNotePath: string | null = null;
-  // Registered ONCE in onload — EditorBridge mutates this array
-  private collabExts: Extension[] = [];
+  /** Where EditorBridge installs a note's binding, one editor at a time (SAFE-D5). Registered once. */
+  private editorWiring = new EditorWiring();
+  /** Edits made while an editor binds (NEC-159). Registered once, on its own. */
+  private pendingEdits = new PendingEdits(
+    (state) => (state.field(editorInfoField, false) as unknown as { file?: { path?: string } } | undefined)?.file?.path ?? null,
+  );
 
   /**
    * Measure what sealing a large attachment costs, from inside the app.
@@ -420,10 +481,15 @@ export default class NectendaPlugin extends Plugin {
     // Kept: the pane is rendered from definitions that depend on whether
     // this vault is signed in, and Obsidian reads them when the tab is added
     // and when told to. A sign-in or sign-out tells it (`refreshSettingsPane`).
+    // Before anything draws the mark: the ribbon, the note header, the status bar.
+    registerHeaderIcon();
     this.settingTab = new NectendaSettingTab(this.app, this);
     this.addSettingTab(this.settingTab);
     this.registerSkippedAttachmentMarkers();
     this.registerCommands();
+    this.createCollaborationServices();
+    this.startJustChanged();
+    this.welcomeOnce();
 
     // obsidian://nectenda?invite=<id> from an invitation email, or
     // obsidian://nectenda?key=nk_… from a share link. Navigation only: no
@@ -433,30 +499,58 @@ export default class NectendaPlugin extends Plugin {
       void this.handleDeepLink(params);
     });
 
-    // The header icon replaced the status-bar text. Obsidian on a phone has no
-    // status bar, so the text never reached anyone there; a note's header is
-    // on every platform.
-    registerHeaderIcon();
+    // The status icon, in whichever of three places the person keeps it: each
+    // note's header, the ribbon, the status bar. The same icon and the same
+    // menu in all three; see header-status.ts. The mark is registered with
+    // Obsidian's icons above, before the ribbon asks for it.
     this.headerStatus = new HeaderStatus({
       app: this.app,
       connection: () => this.connectionStatus,
       statusIndex: () => this.statusIndex(),
-      othersInActiveNote: () => this.presenceOthers,
+      peopleInActiveNote: () => this.presentPeople,
       invites: () => this.settings.pendingInvites?.length ?? 0,
+      readyFolders: () => this.awaitingFolders?.report.ready.length ?? 0,
+      foldersLine: () => (this.isSignedIn() ? foldersSyncingLine(this.settings.folderMappings.length, this.lockedFolderCount()) : null),
+      folderFor: (path) => {
+        const m = this.settings.folderMappings.find((x) => path.startsWith(x.localPath + '/'));
+        return m ? { owner: m.role === 'owner' } : null;
+      },
+      places: () => this.statusPlaces(),
       pointers: () => ({ share: this.settings.sharePointer, show: this.settings.showPointers }),
       setSharePointer: (on) => this.setSharePointer(on),
       setShowPointers: (on) => this.setShowPointers(on),
       inspect: (path) => this.openInspector(path),
+      goToPerson: (name) => this.goToPerson(name),
+      openFolderSettings: (path) => {
+        const m = this.settings.folderMappings.find((x) => path.startsWith(x.localPath + '/'));
+        if (m) this.openFolderSettings(m);
+      },
+      inviteToFolder: (path) => {
+        const m = this.settings.folderMappings.find((x) => path.startsWith(x.localPath + '/'));
+        if (m) this.inviteToFolder(m);
+      },
+      openSharedWithYou: () => this.openSettingsTab(),
       openSettings: () => this.openSettingsTab(),
+      addRibbon: (onClick) => this.addRibbonIcon(HEADER_ICON, 'Nectenda', onClick),
+      addStatusBar: () => this.addStatusBarItem(),
     });
-    this.registerEvent(this.app.workspace.on('layout-change', () => this.refreshStatusUi()));
+    this.headerStatus.apply();
+    this.registerEvent(this.app.workspace.on('layout-change', () => {
+      this.refreshStatusUi();
+      this.canvasLive?.refresh();
+    }));
     this.registerEvent(this.app.workspace.on('active-leaf-change', (leaf) => {
       // Remembered because the inspector takes focus when it opens, and from
       // then on the active view is the inspector, not the note it is about.
       if (leaf?.view instanceof MarkdownView && leaf.view.file) this.lastNotePath = leaf.view.file.path;
       this.refreshStatusUi();
+      this.canvasLive?.refresh();
+      if (leaf?.view) this.canvasReporters.get(leaf.view)?.();
     }));
-    this.registerEvent(this.app.workspace.on('file-open', () => this.refreshStatusUi()));
+    this.registerEvent(this.app.workspace.on('file-open', () => {
+      this.refreshStatusUi();
+      this.canvasLive?.refresh();
+    }));
     this.registerView(INSPECTOR_VIEW, (leaf) => createInspectorView(
       leaf,
       this.inspectorDeps(),
@@ -479,8 +573,30 @@ export default class NectendaPlugin extends Plugin {
     });
     this.updateStatus('disconnected');
 
-    // Register extension array exactly once
-    this.registerEditorExtension(this.collabExts);
+    // Keep asking whether this account is set to start over, for as long as the
+    // vault is open (start-over.ts). Registered whatever the sign-in state:
+    // the check itself returns at once unless this is a signed-in cloud vault.
+    this.registerInterval(window.setInterval(() => void this.checkPendingRelease('tick'), RELEASE_CHECK_TICK_MS));
+    this.registerDomEvent(window, 'focus', () => void this.checkPendingRelease('focus'));
+
+    // Registered exactly once, empty; EditorBridge fills it in the one editor
+    // it binds, and every other editor keeps it empty (SAFE-D5).
+    this.registerEditorExtension(this.editorWiring.extension);
+    // What the user types while an editor is being bound, so the bind can
+    // replay it rather than erase it (NEC-159). On its own: the wiring holds
+    // only the bound editor's binding, and this must watch every editor.
+    this.registerEditorExtension(this.pendingEdits.extension);
+    // The editor inside a canvas card, bound to the card's text while its
+    // canvas is live. Installed for every editor and inert outside those:
+    // registered on its own, not in the wiring above, which holds only the
+    // bound note's editor.
+    this.registerEditorExtension(canvasCardBinding((state) => {
+      const info = state.field(editorInfoField, false) as unknown as { node?: { id?: unknown; canvas?: unknown } } | undefined;
+      const node = info?.node;
+      if (!node || typeof node.id !== 'string') return null;
+      const binding = bindingForCanvas(node.canvas);
+      return binding?.isBound() ? { binding, id: node.id } : null;
+    }));
 
     if (this.isSignedIn()) {
       // The identity keypair comes back from the device store where the OS
@@ -513,6 +629,9 @@ export default class NectendaPlugin extends Plugin {
       // real name or as the anonymous fallback. A rename of the vault lands
       // here on the next start.
       void this.publishVaultLabel().catch(() => undefined);
+      // Self-hosted has no membership refresh to hang this on, so it starts here;
+      // on the cloud the refresh above triggers it again once sessions are fresh.
+      this.scheduleCollaborationChecks(0);
     }
   }
 
@@ -529,6 +648,8 @@ export default class NectendaPlugin extends Plugin {
       hasKeys: !!this.settings.keyMaterial?.publicKey,
       mappings: this.settings.folderMappings,
       memberships: this.settings.memberships,
+      offered: this.awaitingFolders?.report.ready.length ?? 0,
+      unlocked: !!this.sessionKeys?.identity,
     };
   }
 
@@ -538,7 +659,6 @@ export default class NectendaPlugin extends Plugin {
    * the button it stands in for.
    */
   private registerCommands(): void {
-    this.addRibbonIcon('folder-sync', 'Open Nectenda settings', () => this.openSettings());
 
     for (const id of COMMAND_IDS) {
       this.addCommand({
@@ -556,6 +676,18 @@ export default class NectendaPlugin extends Plugin {
 
     this.registerEvent(
       this.app.workspace.on('file-menu', (menu, file) => {
+        if (file instanceof TFile) {
+          // A note in a shared folder: its folder's settings, and for an
+          // owner, inviting someone — the two things a person looking at a
+          // shared note most often came to do.
+          const m = this.settings.folderMappings.find((x) => file.path.startsWith(x.localPath + '/'));
+          if (!m || !this.isSignedIn()) return;
+          menu.addItem((mi) => mi.setTitle(FOLDER_MENU_TITLES.settings).setIcon('settings').onClick(() => this.openFolderSettings(m)));
+          if (m.role === 'owner') {
+            menu.addItem((mi) => mi.setTitle(FOLDER_MENU_TITLES.invite).setIcon('user-plus').onClick(() => this.inviteToFolder(m)));
+          }
+          return;
+        }
         if (!(file instanceof TFolder)) return;
         for (const item of folderMenuItems(file.path, this.commandState())) {
           if (item === 'share') {
@@ -565,7 +697,13 @@ export default class NectendaPlugin extends Plugin {
           } else {
             const mapping = this.settings.folderMappings.find((m) => m.localPath === file.path);
             if (!mapping) continue;
-            menu.addItem((mi) => mi.setTitle(FOLDER_MENU_TITLES.members).setIcon('users').onClick(() => this.showMembers(mapping)));
+            if (item === 'invite') {
+              menu.addItem((mi) => mi.setTitle(FOLDER_MENU_TITLES.invite).setIcon('user-plus').onClick(() => this.inviteToFolder(mapping)));
+            } else if (item === 'settings') {
+              menu.addItem((mi) => mi.setTitle(FOLDER_MENU_TITLES.settings).setIcon('settings').onClick(() => this.openFolderSettings(mapping)));
+            } else {
+              menu.addItem((mi) => mi.setTitle(FOLDER_MENU_TITLES.members).setIcon('users').onClick(() => this.showMembers(mapping)));
+            }
           }
         }
       }),
@@ -599,6 +737,23 @@ export default class NectendaPlugin extends Plugin {
         return this.guarded('share the folder', () => this.shareFromCommand(null));
       case 'show-folder-members':
         return this.guarded('show the members', () => this.showMembersFromCommand());
+      case 'invite-to-folder':
+        return this.guarded('invite to the folder', () => this.inviteFromCommand());
+      case 'folder-settings':
+        return this.guarded('open the folder\'s settings', () => this.folderSettingsFromCommand());
+      case 'add-shared-folder':
+        return this.guarded('add the folder', () => this.addSharedFromCommand());
+      case 'join-with-link':
+        return this.guarded('join', () => {
+          new TextPromptModal(this.app, {
+            title: 'Join with a link',
+            placeholder: 'obsidian://nectenda?key=nk_… or nk_…',
+            cta: 'Join',
+            submit: async (v) => { await this.settingTab?.joinWithLink(v); this.refreshSettingsPane(); },
+          }).open();
+        });
+      case 'forget-passphrase':
+        return this.guarded('forget the passphrase', () => this.forgetPassphraseHere());
       case 'copy-share-link':
         return this.guarded('copy the share link', () => this.copyShareLinkFromCommand());
       case 'enter-passphrase':
@@ -623,7 +778,7 @@ export default class NectendaPlugin extends Plugin {
    * from the palette. On the cloud the organisation is chosen first, because
    * a vault folder belongs to exactly one.
    */
-  private async shareFromCommand(folder: TFolder | null): Promise<void> {
+  async shareFromCommand(folder: TFolder | null): Promise<void> {
     const tab = this.settingTab;
     if (!tab) return;
     const share = (server: FolderServer): void => {
@@ -641,24 +796,328 @@ export default class NectendaPlugin extends Plugin {
     this.pick(this.settings.memberships, (m) => m.accountName, 'Share into which organisation?', (m) => share(this.serverForMembership(m.id)));
   }
 
-  /** The existing members dialog, for a folder this vault owns. */
+  /** The people dialog: managed by an owner, read-only with "Mark as compared" for an editor. */
   private showMembers(mapping: FolderMapping): void {
     const folderId = mapping.sharedFolderId;
-    new FolderMembersModal(this.app, {
+    new FolderMembersModal(this.app, this.membersDeps(mapping), folderId, mapping.sharedFolderName).open();
+  }
+
+  /** What the people dialog needs, for one mapped folder. Shared with the settings pane's button. */
+  membersDeps(mapping: FolderMapping): ConstructorParameters<typeof FolderMembersModal>[1] {
+    const folderId = mapping.sharedFolderId;
+    return {
       server: () => this.serverFor(folderId),
       ownPublicKey: () => this.settings.keyMaterial?.publicKey ?? null,
       folderKeys: () => this.folderCrypto.get(folderId),
-    }, folderId, mapping.sharedFolderName).open();
+      trust: this.keyTrust(),
+      known: (email) => knownKey(this.settings.knownKeys ?? {}, email),
+      markCompared: async (email, fingerprint) => {
+        this.settings.knownKeys = markCompared(this.settings.knownKeys ?? {}, email, fingerprint, Date.now());
+        await this.saveSettings();
+        // A key that was refused because it changed may now be shared.
+        this.scheduleCollaborationChecks(0);
+      },
+      waiting: (userId) => this.keyGrants?.report.states.get(waitingKey(folderId, userId)),
+      invite: () => this.inviteToFolder(mapping),
+      canManage: mapping.role === 'owner',
+    };
   }
 
-  /** The folder of the open note when this vault owns it; otherwise asked. */
-  private showMembersFromCommand(): void {
+  /** The remembered-keys rule, over this vault's settings. */
+  private keyTrust(): KeyTrust {
+    return {
+      check: async (email, publicKey) => {
+        const fingerprint = await publicKeyFingerprint(publicKey);
+        const known = this.settings.knownKeys ?? {};
+        return { status: checkKey(known, email, fingerprint), fingerprint, knownFingerprint: knownKey(known, email)?.fingerprint };
+      },
+      remember: async (email, fingerprint) => {
+        this.settings.knownKeys = rememberKey(this.settings.knownKeys ?? {}, email, fingerprint, Date.now());
+        await this.saveSettings();
+      },
+    };
+  }
+
+  /**
+   * Invite someone to a folder this vault owns: one action, whoever they are.
+   * `folder-invite.ts` has the rules; this gathers what they need and says
+   * how it went.
+   */
+  inviteToFolder(mapping: FolderMapping): void {
+    new InviteToFolderModal(this.app, mapping.sharedFolderName, async (email, role) => {
+      try {
+        return await this.sendFolderInvite(mapping, email, role);
+      } catch (err) {
+        new Notice(err instanceof Error ? err.message : 'Could not send the invitation');
+        return false;
+      }
+    }).open();
+  }
+
+  private async sendFolderInvite(mapping: FolderMapping, email: string, role: FolderRole): Promise<boolean> {
+    const folderId = mapping.sharedFolderId;
+    const server = this.serverFor(folderId);
+    const auth = { headers: { Authorization: `Bearer ${server.token}` } };
+    const [rosterRes, membersRes] = await Promise.all([
+      serverFetch(`${server.base}/account`, auth),
+      serverFetch(`${server.base}/folders/${folderId}/members`, auth),
+    ]);
+    const roster = rosterRes.ok ? ((await rosterRes.json()) as { users?: RosterUser[] }).users ?? [] : [];
+    const members = membersRes.ok ? ((await membersRes.json()) as { members: FolderMember[] }).members : [];
+    const membership = this.settings.mode === 'cloud'
+      ? this.settings.memberships.find((m) => m.id === (mapping.membershipId ?? server.membershipId))
+      : undefined;
+    const route = routeInvite(email, { roster, members, hosted: this.settings.mode === 'cloud', orgRole: membership?.role ?? null });
+    const share = { server, folderId, keys: this.folderCrypto.get(folderId), trust: this.keyTrust(), fetch: serverFetch, wrap: wrapKeysFor };
+    const addExisting = async (userId: string, who: string): Promise<boolean> => {
+      const outcome = await addExistingMember(share, { userId, who, role });
+      new Notice(outcome.ok ? `${who} can now open "${mapping.sharedFolderName}". ${outcome.message}` : outcome.message, outcome.ok ? 8000 : 12000);
+      this.scheduleCollaborationChecks(0);
+      return true;
+    };
+    switch (route.kind) {
+      case 'already-member':
+        new Notice(`${route.label} is already in "${mapping.sharedFolderName}".`);
+        return true;
+      case 'existing':
+        return addExisting(route.userId, route.label);
+      case 'self-hosted':
+        new Notice('Only people with an account on this server can be added. Ask whoever runs it for an invite token for them, then add them here.', 12000);
+        return false;
+      case 'not-admin':
+        new Notice(`Only an owner or admin of ${membership?.accountName ?? 'the organisation'} can invite someone new. Ask one of them, or add someone already in it.`, 12000);
+        return false;
+      case 'new': {
+        if (!membership) throw new Error('That folder belongs to no organisation this vault knows');
+        const outcome = await inviteNewAddress(
+          {
+            server, folderId, fetch: serverFetch,
+            inviteToOrganisation: async (address) => {
+              await this.identityClient().createInvite(this.settings.identityAccessToken, { accountId: membership.accountId, email: address, role: 'member' });
+            },
+          },
+          { email, role },
+        );
+        if ('already' in outcome) return addExisting(email, email).then(() => true);
+        new Notice(outcome.message, outcome.ok ? 10000 : 12000);
+        if (outcome.ok) {
+          this.notifyChange('memberships');
+          this.scheduleCollaborationChecks(0);
+        }
+        return outcome.ok;
+      }
+    }
+  }
+
+  /**
+   * A folder's settings as a dialog. The pane's folder pages cannot be opened
+   * from code — Obsidian's settings API has no call for it — so the palette,
+   * the folder menu and the note menu open the same page drawn in a modal.
+   */
+  openFolderSettings(mapping: FolderMapping): void {
+    const tab = this.settingTab;
+    if (!tab) return;
+    new FolderSettingsModal(this.app, mapping.sharedFolderName, (el) => tab.displayFolderPage(el, mapping)).open();
+  }
+
+  /** The folder of the open note, or one picked from those this vault syncs. */
+  private folderSettingsFromCommand(): void {
+    const path = this.app.workspace.getActiveFile()?.path ?? null;
+    const here = path ? this.settings.folderMappings.find((m) => path.startsWith(m.localPath + '/')) : undefined;
+    if (here) {
+      this.openFolderSettings(here);
+      return;
+    }
+    this.pick(this.settings.folderMappings, (m) => m.localPath, 'Settings for which shared folder?', (m) => this.openFolderSettings(m));
+  }
+
+  /** A folder already shared with this person, not yet in this vault. */
+  private addSharedFromCommand(): void {
+    const ready = this.awaitingFolders?.report.ready ?? [];
+    this.pick(
+      ready,
+      (f) => `A folder from ${f.folder.createdByDisplayName ?? f.folder.createdByUsername ?? 'someone'}`,
+      'Add which shared folder?',
+      (f) => this.settingTab?.addSharedFolder(f.folder, f.membershipId),
+    );
+  }
+
+  /**
+   * Take the identity key off this device: out of memory and out of the
+   * device's credential store. Folders already open keep syncing on the keys
+   * they hold — that is what lets them sync with no network at start — so this
+   * is not a lock on what is already here, and the notice says so. What it
+   * stops is anything new being opened until the passphrase is entered again.
+   */
+  private async forgetPassphraseHere(): Promise<void> {
+    await this.forgetIdentity();
+    this.sessionKeys = null;
+    new Notice(
+      'Nectenda: your passphrase is forgotten on this device. Folders already open here keep syncing; '
+        + 'opening another, or a new invitation, will ask for it again.',
+      10000,
+    );
+    this.refreshSettingsPane();
+  }
+
+  /** The command: the folder of the open note when this vault owns it, otherwise asked. */
+  private inviteFromCommand(): void {
     const here = ownedMappingFor(this.app.workspace.getActiveFile()?.path ?? null, this.settings.folderMappings);
+    if (here) {
+      this.inviteToFolder(here);
+      return;
+    }
+    this.pick(ownedMappings(this.settings.folderMappings), (m) => m.localPath, 'Invite to which shared folder?', (m) => this.inviteToFolder(m));
+  }
+
+  // -------------------------------------------------------------------------
+  // Finishing a share, and noticing one: key-grants.ts and awaiting-folders.ts
+  // -------------------------------------------------------------------------
+
+  /** The explorer pulse for notes changed in the background; desktop only. See just-changed.ts. */
+  private startJustChanged(): void {
+    if (Platform.isMobile) return;
+    const pulse = new JustChanged({
+      isShared: (path) => this.settings.folderMappings.some((m) => path.startsWith(m.localPath + '/')),
+      activePath: () => this.app.workspace.getActiveViewOfType(MarkdownView)?.file?.path ?? null,
+      rowsFor: (path) => Array.from(document.querySelectorAll(`.nav-file-title[data-path="${CSS.escape(path)}"]`)),
+      frame: (cb) => window.requestAnimationFrame(cb),
+    });
+    this.registerEvent(this.app.vault.on('modify', (file) => pulse.changed(file.path)));
+  }
+
+  /**
+   * The first time the plugin loads in a vault that is not signed in, say
+   * where to start. A notice with a button rather than opening settings
+   * unasked: a window appearing by itself reads as a bug, and on a phone it
+   * would take the whole screen. Once only, whatever the person does with it.
+   */
+  private welcomeOnce(): void {
+    if (this.settings.welcomed || this.isSignedIn()) return;
+    this.settings.welcomed = true;
+    void this.saveSettings();
+    this.app.workspace.onLayoutReady(() => {
+      const frag = createFragment();
+      frag.appendText('Nectenda is installed. Sign in to share a folder and edit it together, end-to-end encrypted.');
+      const btn = frag.createEl('button', { text: 'Open Nectenda settings', cls: 'mod-cta nectenda-notice-action' });
+      const notice = new Notice(frag, 15000);
+      this.welcomeNotice = notice;
+      btn.addEventListener('click', () => {
+        notice.hide();
+        this.openSettings();
+      });
+    });
+  }
+
+  private createCollaborationServices(): void {
+    const servers = () => (this.isSignedIn() ? this.servers().filter((x) => x.token && x.status !== 'moved') : []);
+    this.keyGrants = new KeyGrantService({
+      servers,
+      folderKeys: (id) => this.folderCrypto.get(id),
+      folderName: (id) => this.settings.folderMappings.find((m) => m.sharedFolderId === id)?.sharedFolderName ?? 'a shared folder',
+      knownKeys: () => this.settings.knownKeys ?? {},
+      saveKnownKeys: async (next) => {
+        this.settings.knownKeys = next;
+        await this.saveSettings();
+      },
+      fingerprint: (pk) => publicKeyFingerprint(pk),
+      wrap: wrapKeysFor,
+      fetch: serverFetch,
+      shared: (e) => {
+        new Notice(
+          e.firstSighting
+            ? `Nectenda: shared "${e.folderName}" with ${e.who}. Their key is ${e.fingerprint} — compare it with them outside Nectenda when you can.`
+            : `Nectenda: shared "${e.folderName}" with ${e.who}.`,
+          10000,
+        );
+        this.notifyChange('memberships');
+      },
+      refused: (e) => {
+        // Kept on screen until dismissed: this is the one case where the
+        // automatic path stops and a person has to decide.
+        new Notice(
+          `Nectenda: ${e.who}'s encryption key has changed since you last shared with them, so "${e.folderName}" was not shared. ` +
+            `Was ${e.knownFingerprint}, now ${e.fingerprint}. Compare it with them outside Nectenda, then use "Mark as compared" in the folder's people list.`,
+          0,
+        );
+        log.warn('A collaborator key changed; no folder key was shared', { folderId: e.folderId });
+      },
+      now: () => Date.now(),
+    });
+    this.awaitingFolders = new AwaitingFolders({
+      servers,
+      mapped: () => new Set(this.settings.folderMappings.map((m) => m.sharedFolderId)),
+      seen: () => this.settings.offeredFolders ?? null,
+      saveSeen: async (ids) => {
+        this.settings.offeredFolders = ids;
+        await this.saveSettings();
+      },
+      fetch: serverFetch,
+      offer: (folders) => this.offerSharedFolders(folders),
+    });
+  }
+
+  /**
+   * Run both passes soon, then again on the schedule their results ask for.
+   * One timer: a request for "now" replaces a later one rather than adding to it.
+   */
+  scheduleCollaborationChecks(delayMs: number): void {
+    if (this.collaborationTimer) window.clearTimeout(this.collaborationTimer);
+    this.collaborationTimer = window.setTimeout(() => {
+      this.collaborationTimer = null;
+      void this.runCollaborationChecks();
+    }, delayMs);
+  }
+
+  private async runCollaborationChecks(): Promise<void> {
+    let delay = 15 * 60_000;
+    try {
+      if (this.isSignedIn() && this.keyGrants && this.awaitingFolders) {
+        const grants = await this.keyGrants.run();
+        await this.awaitingFolders.run();
+        delay = nextGrantDelayMs(grants);
+        if (this.awaitingFolders.report.waiting.length) delay = Math.min(delay, 60_000);
+      }
+    } catch (err) {
+      log.warn('Collaboration checks failed; retrying later', { error: String(err) });
+    } finally {
+      if (this.isSignedIn()) this.scheduleCollaborationChecks(delay);
+    }
+  }
+
+  /** A notice with a button: the one prompt for a folder somebody shared. */
+  private offerSharedFolders(folders: OfferedFolder[]): void {
+    const frag = createFragment();
+    if (folders.length === 1) {
+      const [only] = folders;
+      const who = only.folder.createdByDisplayName ?? only.folder.createdByUsername ?? 'Someone';
+      frag.appendText(`${who} shared a folder with you.`);
+      const btn = frag.createEl('button', { text: 'Add to this vault', cls: 'mod-cta nectenda-notice-action' });
+      const notice = new Notice(frag, 0);
+      this.offerNotices.set(only.folder.id, notice);
+      btn.addEventListener('click', () => {
+        notice.hide();
+        void this.guarded('add the folder', () => this.settingTab?.addSharedFolder(only.folder, only.membershipId));
+      });
+      return;
+    }
+    frag.appendText(`${folders.length} folders were shared with you.`);
+    const btn = frag.createEl('button', { text: 'Show them', cls: 'mod-cta nectenda-notice-action' });
+    const notice = new Notice(frag, 0);
+    btn.addEventListener('click', () => {
+      notice.hide();
+      this.openSettings();
+    });
+  }
+
+  /** The shared folder of the open note, owned or not; otherwise asked. */
+  private showMembersFromCommand(): void {
+    const here = mappingFor(this.app.workspace.getActiveFile()?.path ?? null, this.settings.folderMappings);
     if (here) {
       this.showMembers(here);
       return;
     }
-    this.pick(ownedMappings(this.settings.folderMappings), (m) => m.localPath, 'Members of which shared folder?', (m) => this.showMembers(m));
+    this.pick(this.settings.folderMappings, (m) => m.localPath, 'People in which shared folder?', (m) => this.showMembers(m));
   }
 
   private copyShareLinkFromCommand(): void {
@@ -807,7 +1266,13 @@ export default class NectendaPlugin extends Plugin {
     };
     this.settings.identityAccessToken = result.accessToken;
     this.settings.refreshToken = result.refreshToken;
+    this.tokenOnlySinceFull = false;
     this.settings.pendingInvites = result.invites ?? [];
+    // See applySession in the settings tab: a sign-in offers what is shared
+    // from now on; only an upgraded, already-signed-in vault starts from null.
+    if (via === 'sign-in') this.settings.offeredFolders ??= [];
+    this.welcomeNotice?.hide();
+    this.welcomeNotice = null;
     this.settings.keyMaterial = {
       publicKey: result.keyMaterial.publicKey,
       wrappedPrivateKey: result.keyMaterial.wrappedPrivateKey,
@@ -859,7 +1324,13 @@ export default class NectendaPlugin extends Plugin {
    * refused in the same moment used to present the same token three times
    * and sign the vault out of its own accord (14 September 2026).
    */
-  private readonly refreshGate = new SingleFlight<boolean>();
+  private readonly refreshGate = new RefreshGate();
+
+  /**
+   * True from a token-only rotation until the next full refresh or sign-in:
+   * the stored tokens are fresh, but nothing was re-established with them.
+   */
+  private tokenOnlySinceFull = false;
 
   /**
    * True when the session is usable again; false when the identity service
@@ -867,15 +1338,56 @@ export default class NectendaPlugin extends Plugin {
    *
    * `refusedAccessToken` is the token the caller was refused with. If it is
    * no longer the stored one, a refresh already landed between the refusal
-   * and this call, and there is nothing to do.
+   * and this call, and there is nothing to do — unless that refresh only
+   * rotated the tokens and this caller came for a full one.
+   *
+   * `kind: 'token'` rotates the tokens and stores them, nothing more: for the
+   * pending-reset check, which needs a live access token and must not restart
+   * sync to get one (NEC-148). Everything else wants the full refresh.
    */
-  async refreshCloudSession(opts: { caller: string; refusedAccessToken?: string } = { caller: 'unknown' }): Promise<boolean> {
-    if (opts.refusedAccessToken !== undefined && opts.refusedAccessToken !== this.settings.identityAccessToken) {
+  async refreshCloudSession(
+    opts: { caller: string; refusedAccessToken?: string; kind?: RefreshKind } = { caller: 'unknown' },
+  ): Promise<boolean> {
+    const kind = opts.kind ?? 'full';
+    const superseded = opts.refusedAccessToken !== undefined && opts.refusedAccessToken !== this.settings.identityAccessToken;
+    if (superseded && (kind === 'token' || !this.tokenOnlySinceFull)) {
       log.info('Cloud session already refreshed', { caller: opts.caller });
       return true;
     }
-    if (this.refreshGate.pending) log.info('Joined the in-flight Cloud session refresh', { caller: opts.caller });
-    return this.refreshGate.run(() => this.doRefreshCloudSession(opts.caller));
+    if (this.refreshGate.pending) log.info('Joined the in-flight Cloud session refresh', { caller: opts.caller, kind });
+    return this.refreshGate.run(kind, () => (kind === 'token' ? this.doRotateCloudTokens(opts.caller) : this.doRefreshCloudSession(opts.caller)));
+  }
+
+  /**
+   * Rotate the session's tokens and store them. Nothing else: no membership
+   * work, no sync restart, which is what makes it cheap enough to run from a
+   * timer. Same answers as the full refresh — false when refused, a throw on
+   * the network.
+   */
+  private async doRotateCloudTokens(caller: string): Promise<boolean> {
+    if (!this.settings.refreshToken) return false;
+    const gen = this.sessionGeneration;
+    try {
+      const result = await this.identityClient().refresh(this.settings.refreshToken, describeInstall(this.app, this.secrets));
+      // Signed out, or out and back in, while the request was out: the
+      // sign-out retired this session, so these tokens are dead. Storing them
+      // would put a signed-out vault back into a signed-in shape, or overwrite
+      // the new session's tokens and have it signed out at its next refresh.
+      if (gen !== this.sessionGeneration || !this.settings.identity) return false;
+      this.settings.identityAccessToken = result.accessToken;
+      this.settings.refreshToken = result.refreshToken;
+      this.tokenOnlySinceFull = true;
+      await this.saveSettings();
+      log.info('Cloud session tokens rotated', { caller, sid: sessionIdFromToken(result.accessToken) });
+      return true;
+    } catch (err) {
+      if (err instanceof IdentityError && err.status === 401) {
+        log.warn('Cloud session token rotation refused', { caller, status: err.status, code: err.code ?? null });
+        return false;
+      }
+      log.warn('Cloud session token rotation failed', { caller, error: String(err) });
+      throw err;
+    }
   }
 
   private async doRefreshCloudSession(caller: string): Promise<boolean> {
@@ -963,6 +1475,7 @@ export default class NectendaPlugin extends Plugin {
     log.info('A shared folder was unshared on the server', { folderId, localPath: mapping.localPath });
     this.fileSync?.disconnectFolder(folderId);
     this.contentSync?.disconnectFolder(folderId);
+    this.structuredSync?.disconnectFolder(folderId);
     this.blobSync?.disconnectFolder(folderId);
     this.editorBridge?.reconnectActiveFile();
     this.folderIndicator?.refresh();
@@ -973,6 +1486,113 @@ export default class NectendaPlugin extends Plugin {
     // The pane redraws and lists it under "No longer shared", where unmapping
     // is the last step.
     this.notifyChange('structure');
+  }
+
+  /**
+   * Say once, loudly, that this account is set to start over. A notice that
+   * stays until dismissed, because the likeliest reader who did not ask for
+   * it is the owner of a mailbox someone else has got into, and this device
+   * is how they stop it (start-over.ts).
+   */
+  private announcePendingRelease(): void {
+    const p = this.settings.pendingRelease;
+    if (!shouldAnnounce(p, this.settings.announcedReleaseAt)) return;
+    const { title, detail } = pendingReleaseText(p);
+    new Notice(`Nectenda: ${title}. ${detail} "Cancel reset" is in Nectenda's settings.`, 0);
+    this.settings.announcedReleaseAt = p.requestedAt;
+    void this.saveSettings();
+  }
+
+  /** When `/api/me` last answered, from either this check or a full refresh. */
+  private releaseCheckedAt = 0;
+  private releaseCheckInFlight = false;
+  /** Bumped by every other writer of `pendingRelease`, so a check that raced one of them drops its answer. */
+  private releaseWrites = 0;
+
+  /**
+   * Ask only whether this account is set to start over, so that a vault left
+   * open for days still raises the notice and shows Cancel reset. Only
+   * `/api/me`: the full refresh also makes a session call to every
+   * organisation's server, which is too much to do hourly for one field.
+   *
+   * It never signs the vault out. A refused token is refreshed for next time;
+   * deciding that the session has ended belongs to the full refresh, which
+   * runs on its own occasions.
+   */
+  async checkPendingRelease(trigger: ReleaseCheckTrigger): Promise<void> {
+    if (this.settings.mode !== 'cloud' || !this.settings.identity) return;
+    if (!releaseCheckDue(trigger, Date.now(), this.releaseCheckedAt, this.releaseCheckInFlight)) return;
+    this.releaseCheckInFlight = true;
+    // Stamped on the attempt, not on success: a vault offline, or refused,
+    // would otherwise ask on every focus and every tick until it got through.
+    this.releaseCheckedAt = Date.now();
+    const writesBefore = this.releaseWrites;
+    try {
+      let outcome: ReleaseCheckOutcome;
+      try {
+        outcome = { ok: true, pendingRelease: (await this.meForReleaseCheck(releaseCheckMayRotate(trigger))).pendingRelease };
+      } catch (err) {
+        log.info('Could not check for a pending reset', { trigger, error: String(err) });
+        outcome = { ok: false };
+      }
+      // Anything that wrote the field while this was out knows better: a
+      // Cancel pressed here, a full refresh, a sign-out. An answer given
+      // before a cancel would otherwise put the row back.
+      if (this.releaseWrites !== writesBefore) return;
+      if (this.settings.mode !== 'cloud' || !this.settings.identity) return;
+      const before = this.settings.pendingRelease ?? null;
+      const after = pendingAfterCheck(before, outcome);
+      if (JSON.stringify(after) !== JSON.stringify(before)) {
+        this.settings.pendingRelease = after;
+        await this.saveSettings();
+        // The row sits in the home pane's Account group, which no poll
+        // redraws: an open pane would otherwise keep showing, or keep
+        // lacking, Cancel reset until it was closed and reopened.
+        this.refreshSettingsPane();
+      }
+      this.announcePendingRelease();
+    } finally {
+      this.releaseCheckInFlight = false;
+    }
+  }
+
+  /**
+   * `/api/me`, and on a refused token — when `mayRotate` — one token-only
+   * rotation and a second ask. The access token lives ten minutes, so most
+   * checks meet an expired one; the full refresh would answer that by
+   * restarting sync (NEC-148). Throws when there is no answer, and never
+   * signs out: a session that has really ended is the full refresh's to find.
+   */
+  private async meForReleaseCheck(mayRotate: boolean): Promise<MeResponse> {
+    const token = this.settings.identityAccessToken;
+    try {
+      return await this.identityClient().me(token);
+    } catch (err) {
+      if (!(err instanceof IdentityError && err.status === 401) || !mayRotate) throw err;
+      if (!(await this.refreshCloudSession({ caller: 'release-check', refusedAccessToken: token, kind: 'token' }))) throw err;
+      return this.identityClient().me(this.settings.identityAccessToken);
+    }
+  }
+
+  /** Ask for this account to start over. The server waits before it does anything. */
+  async requestStartOver(): Promise<void> {
+    const email = this.settings.identity?.email;
+    if (!email) return;
+    const { pendingRelease } = await this.identityClient().requestRelease(this.settings.identityAccessToken, email);
+    this.settings.pendingRelease = pendingRelease;
+    this.releaseWrites++;
+    // This device asked; it does not need the alarm meant for the others.
+    this.settings.announcedReleaseAt = pendingRelease.requestedAt;
+    await this.saveSettings();
+    new Notice(`Nectenda: this account will start over on ${dueDate(pendingRelease)}. You can cancel it until then in Nectenda's settings.`, 0);
+  }
+
+  async cancelStartOver(): Promise<void> {
+    await this.identityClient().cancelRelease(this.settings.identityAccessToken);
+    this.settings.pendingRelease = null;
+    this.releaseWrites++;
+    await this.saveSettings();
+    new Notice('Nectenda: the reset was cancelled. Nothing has changed.');
   }
 
   /** Ask the identity service what changed: memberships, invitations, names. */
@@ -990,6 +1610,8 @@ export default class NectendaPlugin extends Plugin {
       }
       return;
     }
+    // This answered the pending-reset question too, so the lighter check waits its full gap from here.
+    this.releaseCheckedAt = Date.now();
     this.settings.identity = { ...this.settings.identity, email: me.user.email, displayName: me.user.displayName };
     // Where this server wants crash reports. Cached so that a later start
     // with no network can still report, and cleared at sign-out beside the
@@ -999,6 +1621,9 @@ export default class NectendaPlugin extends Plugin {
     this.settings.errorReportDsn = me.errorReporting?.dsn ?? '';
     this.maybeAskAboutErrorReports();
     this.settings.pendingInvites = me.invites ?? [];
+    this.settings.pendingRelease = me.pendingRelease ?? null;
+    this.releaseWrites++;
+    this.announcePendingRelease();
     this.settings.keyMaterial = {
       publicKey: me.keyMaterial.publicKey, wrappedPrivateKey: me.keyMaterial.wrappedPrivateKey, recoveryBlob: me.keyMaterial.recoveryBlob,
       recoveryParams: (me.keyMaterial.recoveryParams as KdfParams | null) ?? null, kdfParams: (me.keyMaterial.kdfParams as KdfParams | null) ?? null,
@@ -1031,7 +1656,12 @@ export default class NectendaPlugin extends Plugin {
         accountId: m.accountId, accountName: m.accountName, accountStatus: m.accountStatus, role: m.role, userId: m.localUserId ?? '',
         shardId: m.shardId, endpoint: m.endpoint, region: m.region, displayName: this.settings.identity?.displayName ?? '',
       }));
-    const { memberships } = await establishMemberships(me.identityToken, [...me.memberships, ...unlisted], this.settings.memberships, this.deviceFields(), undefined, { enrol });
+    const established = await establishMemberships(me.identityToken, [...me.memberships, ...unlisted], this.settings.memberships, this.deviceFields(), undefined, { enrol });
+    // A seat that appeared since the last refresh has never been offered to
+    // this device, so it is offered now; see enrolNewSeats for why the rule
+    // above does not cover it.
+    const { memberships, refused } = await enrolNewSeats(established.memberships, this.settings.memberships, this.deviceFields());
+    this.reportRefusedDevice(refused);
     this.settings.memberships = memberships;
     await this.saveSettings();
     const after = shape(memberships);
@@ -1050,6 +1680,9 @@ export default class NectendaPlugin extends Plugin {
     else this.updateStatus('disconnected');
     if (enrol) this.reportRefusedDevice(memberships);
     this.notifyChange('memberships');
+    // A seat taken or an invitation claimed shows up here first, so this is
+    // when somebody new is most likely to be waiting for a key.
+    this.scheduleCollaborationChecks(0);
   }
 
   /** Bring the live connections into line with the stored memberships. */
@@ -1295,6 +1928,8 @@ export default class NectendaPlugin extends Plugin {
     this.settings.refreshToken = '';
     this.settings.memberships = [];
     this.settings.pendingInvites = [];
+    this.settings.pendingRelease = null;
+    this.releaseWrites++;
     // A sign-out the person asked for takes the folder mappings with it. One
     // forced by a refused session keeps them: they hold no secret, and the
     // next sign-in then finds its folders waiting under Locked, to be opened
@@ -1311,6 +1946,9 @@ export default class NectendaPlugin extends Plugin {
     this.settings.keyMaterial = null;
     for (const folderId of Object.keys(this.settings.folderKeys ?? {})) this.folderCrypto.remove(folderId);
     this.settings.folderKeys = {};
+    // Which folders were already offered is about this account's listing; the
+    // next account starts with a fresh first look rather than a flood of offers.
+    this.settings.offeredFolders = null;
     // The crash-report endpoint belongs to the server that named it.
     this.settings.errorReportDsn = '';
     this.sessionKeys = null;
@@ -1339,6 +1977,18 @@ export default class NectendaPlugin extends Plugin {
       } catch (err) {
         new Notice(`Could not accept the invitation: ${err instanceof Error ? err.message : String(err)}`);
       }
+      open();
+      return;
+    }
+    // obsidian://nectenda?open=folder&path=<vault path>: a folder's settings,
+    // for a guide or an email to link straight to. Navigation only, like the rest.
+    if (params.open === 'folder') {
+      const m = this.settings.folderMappings.find((x) => x.localPath === params.path);
+      if (m) {
+        this.openFolderSettings(m);
+        return;
+      }
+      new Notice(params.path ? `"${params.path}" is not a shared folder in this vault.` : 'That link names no folder.');
       open();
       return;
     }
@@ -2077,6 +2727,8 @@ export default class NectendaPlugin extends Plugin {
     this.statusUiTimer = null;
     this.headerStatus?.stop();
     this.headerStatus = null;
+    if (this.collaborationTimer) window.clearTimeout(this.collaborationTimer);
+    this.collaborationTimer = null;
   }
 
   startSync(): void {
@@ -2178,7 +2830,50 @@ export default class NectendaPlugin extends Plugin {
     // when one appears, rather than waiting for something to touch it again.
     // Without this it stayed unconnected — looking healthy, syncing nothing —
     // until the person happened to reopen the note.
-    this.provider.on('routes-changed', () => this.contentSync?.retryUnplaced());
+    this.provider.on('routes-changed', () => {
+      this.fileSync?.retryUnplaced();
+      this.contentSync?.retryUnplaced();
+      this.structuredSync?.retryUnplaced();
+    });
+
+    // Files merged key by key: `.canvas` today (canvas-codec.ts). An open
+    // canvas is asked to save before its file is replaced, and checked for
+    // having loaded the write (canvas-view-guard.ts, SAFE-A19).
+    this.canvasViewGuard?.dispose();
+    this.canvasViewGuard = new CanvasViewGuard(() => this.app.workspace.getLeavesOfType('canvas')
+      .map((leaf) => leaf.view)
+      .filter((view): view is TextFileView => view instanceof TextFileView));
+    this.structuredSync = new StructuredSync({
+      hasKeys: (id) => this.folderCrypto.hasKeys(id),
+      docIndex: this.docIndex,
+      vaultKey: () => this.vaultKey,
+      formats: STRUCTURED_FORMATS,
+      notify: (message) => new Notice(message, 10000),
+      surface: this.canvasViewGuard,
+    }, this.provider, vaultAdapter);
+
+    // An open canvas of a shared file is bound live (canvas-live.ts): the
+    // view writes the file, and changes travel both ways as they happen. The
+    // guard above is its fallback whenever a binding cannot hold.
+    this.canvasLive?.dispose();
+    const structured = this.structuredSync;
+    this.canvasLive = new CanvasLiveManager({
+      structured,
+      readFile: async (path) => {
+        const file = this.app.vault.getAbstractFileByPath(path);
+        return file instanceof TFile ? await this.app.vault.read(file) : null;
+      },
+      fellBack: () => undefined,
+      notify: (message) => new Notice(message, 10000),
+      views: () => this.app.workspace.getLeavesOfType('canvas')
+        .map((leaf) => leaf.view)
+        .filter((view) => view instanceof TextFileView) as unknown as CanvasViewInternal[],
+      obsidianVersion: apiVersion,
+    });
+    this.canvasLive.onBound((binding) => this.startCanvasPresence(binding));
+    // Canvases already open: no workspace event will say so. It keeps trying
+    // until each one's document has connected.
+    this.canvasLive.refresh();
 
     // File operations sync (meta docs)
     this.fileSync = new FileSync({
@@ -2189,6 +2884,7 @@ export default class NectendaPlugin extends Plugin {
       blobSync: () => this.blobSync ?? null,
     }, this.provider, vaultAdapter);
     this.fileSync.setContentSync(this.contentSync);
+    this.fileSync.setStructuredSync(this.structuredSync);
 
     // Attachments
     this.blobSync = new BlobSync({
@@ -2222,6 +2918,13 @@ export default class NectendaPlugin extends Plugin {
         attachmentsNotIncluded: () => this.reportAttachmentsNotIncluded(),
         accountSuspended: () => this.reportAccountSuspended(),
         storageFull: (blobId) => this.reportStorageFull(blobId),
+        keptOlderClientVersion: (path) => {
+          new Notice(
+            `Nectenda: "${path}" was changed by someone on an older version of Nectenda. `
+              + 'Their version was kept as a conflict copy beside it.',
+            10000,
+          );
+        },
       },
     }, vaultAdapter);
 
@@ -2232,7 +2935,7 @@ export default class NectendaPlugin extends Plugin {
       mappings: () => this.settings.folderMappings,
       onMappedFolderRename: (oldPath, newPath, moved) =>
         this.handleMappedFolderRename(oldPath, newPath, moved),
-    }, this.fileSync, this.contentSync, vaultAdapter, this.blobSync);
+    }, this.fileSync, this.contentSync, vaultAdapter, this.blobSync, this.structuredSync);
     this.vaultWatcher.start();
 
     // Editor bridge for live collaborative editing
@@ -2246,7 +2949,9 @@ export default class NectendaPlugin extends Plugin {
       mappings: () => this.settings.folderMappings,
       sharePointer: () => this.settings.sharePointer,
       showPointers: () => this.settings.showPointers,
-    }, this.contentSync, this.provider, presenceName, this.collabExts);
+      pendingEdits: this.pendingEdits,
+    }, this.contentSync, this.provider, presenceName, this.editorWiring);
+    this.contentSync.setOnAdopted((path, text) => this.pendingEdits.adopted(path, text));
     this.editorBridge.setPresenceCallback((people) => {
       this.updatePresence(people);
     });
@@ -2371,6 +3076,13 @@ export default class NectendaPlugin extends Plugin {
     this.fileStatus = null;
     this.contentSync?.disconnectAll();
     this.contentSync = null;
+    // Live canvases let go first: they hold documents about to be destroyed.
+    this.canvasLive?.dispose();
+    this.canvasLive = null;
+    this.structuredSync?.disconnectAll();
+    this.structuredSync = null;
+    this.canvasViewGuard?.dispose();
+    this.canvasViewGuard = null;
     // Before the provider goes, so every in-flight transfer is aborted while
     // the state it would write into still exists. void-fired teardown racing
     // async work has caused at least four bugs in this codebase.
@@ -2436,6 +3148,17 @@ export default class NectendaPlugin extends Plugin {
   }
 
   refreshSync(): void {
+    for (const [folderId, notice] of this.offerNotices) {
+      if (this.settings.folderMappings.some((m) => m.sharedFolderId === folderId)) {
+        notice.hide();
+        this.offerNotices.delete(folderId);
+      }
+    }
+    // Every change to the folder mappings comes through here, and the pane's
+    // "This vault" entries are definitions Obsidian re-reads only when told. A
+    // folder added from the notice or the folder menu, with settings closed,
+    // was missing from the list when they next opened.
+    this.settingTab?.pagesChanged();
     this.pruneAttachmentRecords();
     // A folder the server no longer has is not reconnected: the sockets would
     // be refused in silence and the header icon would claim it still syncs.
@@ -2447,13 +3170,19 @@ export default class NectendaPlugin extends Plugin {
     this.editorBridge?.reconnectActiveFile();
     this.folderIndicator?.refresh();
 
-    // Reconnect meta docs and content sync for new/removed mappings
+    // Reconnect meta docs and content sync for new/removed mappings.
+    // Structured files are placed by FileSync's reconcile when each listing
+    // opens, so they are only torn down here, before it runs.
+    this.canvasLive?.reset();
+    this.structuredSync?.disconnectAll();
     if (this.fileSync) {
       this.fileSync.disconnectAll();
       for (const mapping of live) {
         this.fileSync.connectFolder(mapping.sharedFolderId, mapping.localPath);
       }
     }
+    // Open canvases bind again once their documents reconnect.
+    this.canvasLive?.refresh();
     if (this.contentSync) {
       this.contentSync.disconnectAll();
       for (const mapping of live) {
@@ -2493,6 +3222,17 @@ export default class NectendaPlugin extends Plugin {
         if (isInspector(leaf.view)) leaf.view.refresh();
       }
     }, 250);
+  }
+
+  /** Where the status icon shows, as this platform can show it: a phone has no status bar. */
+  statusPlaces(): { header: boolean; ribbon: boolean; statusBar: boolean } {
+    const p = this.settings.statusIn ?? DEFAULT_SETTINGS.statusIn;
+    return { header: p.header, ribbon: p.ribbon, statusBar: p.statusBar && !Platform.isMobile };
+  }
+
+  /** Folders this vault syncs whose key is not open here. */
+  lockedFolderCount(): number {
+    return this.settings.folderMappings.filter((m) => !this.folderCrypto.hasKeys(m.sharedFolderId)).length;
   }
 
   private inspectorDeps(): InspectorDeps {
@@ -2732,6 +3472,46 @@ export default class NectendaPlugin extends Plugin {
    * which also covered a hidden note header; it moved because mobile has no
    * status bar at all, which left nobody there with a count.
    */
+  /**
+   * Presence for a canvas just bound live: pointers, selections and gestures
+   * (canvas-presence.ts), and who is here in the header while it is the
+   * active view — as for a note. All of it ends when the binding does.
+   */
+  private startCanvasPresence(binding: CanvasLiveBinding): void {
+    const awareness = binding.awareness;
+    const docName = binding.boundDocName();
+    if (!awareness || !docName) return;
+    const presence = new CanvasPresence(binding, {
+      username: () => this.presenceName(),
+      userColor,
+      sharePointer: () => this.settings.sharePointer,
+      showPointers: () => this.settings.showPointers,
+    });
+    presence.start();
+    this.canvasPresences.set(binding.view, presence);
+    const isActive = (): boolean => this.app.workspace.getActiveViewOfType(TextFileView) === (binding.view as unknown);
+    const report = (people: Person[]): void => {
+      if (isActive()) this.updatePresence(people);
+    };
+    const reporter = presenceReporter(awareness, docName, report);
+    awareness.on('change', reporter);
+    // On becoming the active view: a fresh reporter, which always reports,
+    // on the next tick — after the note binding has cleared the header for
+    // the note it left.
+    this.canvasReporters.set(binding.view, () => {
+      window.setTimeout(() => presenceReporter(awareness, docName, report)(), 0);
+    });
+    if (isActive()) reporter();
+    const off = binding.onChange(() => {
+      if (binding.isBound()) return;
+      off();
+      awareness.off('change', reporter);
+      this.canvasReporters.delete(binding.view);
+      if (this.canvasPresences.get(binding.view) === presence) this.canvasPresences.delete(binding.view);
+      presence.stop();
+    });
+  }
+
   updatePresence(people: Person[]): void {
     this.renderPresenceStack(people);
     this.updatePresenceCount(people);
@@ -2750,7 +3530,10 @@ export default class NectendaPlugin extends Plugin {
    * must not do.
    */
   private renderPresenceStack(people: Person[]): void {
-    const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+    // A note, or a live canvas: both report the people in them (canvas people
+    // come from startCanvasPresence, only while that canvas is active).
+    const view = this.app.workspace.getActiveViewOfType(MarkdownView)
+      ?? this.app.workspace.getActiveViewOfType(TextFileView);
     const header = view?.containerEl.querySelector('.view-header');
     // Clear every stack, not just this view's: a leaf that lost focus keeps its
     // header, and a stale set of circles there claims people are somewhere they
@@ -2766,14 +3549,46 @@ export default class NectendaPlugin extends Plugin {
       const dot = stack.createSpan({ cls: 'nectenda-presence-dot', text: initials(person.name) });
       dot.style.backgroundColor = person.color;
       // The name is the true identifier; the colour is only the fast read.
-      dot.setAttr('aria-label', person.name);
+      dot.setAttr('aria-label', `Go to ${person.name}`);
+      // The title stays the bare name: it is what identifies them on hover.
       dot.setAttr('title', person.name);
+      dot.addClass('mod-clickable');
+      dot.addEventListener('click', () => this.goToPerson(person.name));
     }
     if (people.length > shown.length) {
       stack.createSpan({
         cls: 'nectenda-presence-dot nectenda-presence-more',
         text: `+${people.length - shown.length}`,
       });
+    }
+  }
+
+  /**
+   * Take the view to a collaborator. In a note: their caret, where ours is put
+   * too; else their mouse pointer, scrolled to without moving ours, since a
+   * pointer is not an editing position. On a live canvas: their pointer
+   * first, then the card they are typing in (CanvasPresence.goTo).
+   */
+  private goToPerson(name: string): void {
+    const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+    if (!view) {
+      const canvas = this.app.workspace.getActiveViewOfType(TextFileView);
+      const presence = canvas ? this.canvasPresences.get(canvas) : undefined;
+      if (!presence?.goTo(name)) new Notice(`${name} is not pointing or typing on this canvas right now.`);
+      return;
+    }
+    const target = this.editorBridge?.goToOffsetOf(name) ?? null;
+    if (!target) {
+      new Notice(`${name} has no cursor or pointer in this note right now.`);
+      return;
+    }
+    const pos = view.editor.offsetToPos(target.index);
+    if (target.kind === 'caret') {
+      view.editor.setCursor(pos);
+      view.editor.scrollIntoView({ from: pos, to: pos }, true);
+      view.editor.focus();
+    } else {
+      view.editor.scrollIntoView({ from: pos, to: pos }, true);
     }
   }
 
@@ -2789,9 +3604,12 @@ export default class NectendaPlugin extends Plugin {
    * undercount exactly then.
    */
   updatePresenceCount(people: Person[]): void {
-    const others = countOthers(people, this.editorBridge?.broadcastName() ?? this.presenceName());
-    if (others === this.presenceOthers) return;
+    const me = this.editorBridge?.broadcastName() ?? this.presenceName();
+    const others = countOthers(people, me);
+    const names = people.map((p) => p.name).filter((n) => n !== me);
+    if (others === this.presenceOthers && names.join('\n') === this.presentPeople.join('\n')) return;
     this.presenceOthers = others;
+    this.presentPeople = names;
     this.refreshStatusUi();
   }
 
@@ -2835,6 +3653,7 @@ export default class NectendaPlugin extends Plugin {
     // default for most of its life, so an old file cannot tell "set" from
     // "never touched" through it. The token never had one.
     if (stored && !('mode' in stored) && stored.token) this.settings.mode = 'self-hosted';
+    this.settings.statusIn = migrateStatusPlaces(stored);
   }
 
   /**
@@ -2999,7 +3818,7 @@ export class NectendaSettingTab extends PluginSettingTab {
   /** What the organisation pages were last built from; a change rebuilds the pane. */
   private lastPagesKey = '';
   /** The organisation page on screen, if one is. Tests reach it here. */
-  openPage: { containerEl: HTMLElement; membershipId: string } | null = null;
+  openPage: { containerEl: HTMLElement; membershipId?: string } | null = null;
 
   /*
    * There is deliberately no `display()` here.
@@ -3091,8 +3910,8 @@ export class NectendaSettingTab extends PluginSettingTab {
         const server = tab.plugin.servers().find((x) => x.membershipId === m.id);
         if (!server) return;
         this.base = server.base;
-        tab.displayOrganisationActions(c, m);
         tab.displaySharedFolders(c, server);
+        tab.displayOrganisationActions(c, m);
         tab.displayAccount(c, server);
       }
       hide(): void {
@@ -3106,18 +3925,71 @@ export class NectendaSettingTab extends PluginSettingTab {
         tab.release();
       }
     }
+    /**
+     * A page that is not an organisation's: a folder in this vault, Security,
+     * Editing, Advanced. Same lifecycle as the organisation page — it takes
+     * the tab's subscriptions over while it is on screen and hands them back
+     * when it goes — so its sections refresh like the home pane's do.
+     */
+    class PanePage extends SettingPage {
+      constructor(title: string, private readonly draw: (c: HTMLElement) => void) {
+        super();
+        this.title = title;
+      }
+      display(): void {
+        const c = this.containerEl;
+        c.empty();
+        tab.openPage = this;
+        tab.bind();
+        this.draw(c);
+      }
+      hide(): void {
+        if (tab.openPage === this) tab.openPage = null;
+        tab.release();
+      }
+    }
     this.lastPagesKey = pagesKey(settings.memberships, settings.folderMappings);
+    const orgName = (id: string | undefined): string | null =>
+      settings.memberships.find((m) => m.id === id)?.accountName ?? null;
     return [
       brand,
-      { type: 'group', heading: 'Account', items: [host('Account', (el) => this.displayIdentityRows(el), false)] },
+      { type: 'group', heading: LABELS.account, items: [host('Account', (el) => { this.displayPendingRelease(el); this.displayStatusLine(el); this.displayIdentityRows(el); }, false)] },
+      // Above the checklist: an invitation waiting is the one thing on the
+      // pane a new person has to act on, and the checklist points up at it.
+      host(LABELS.sharedWithYou, (el) => this.displaySharedWithYou(el)),
+      ...(this.getStartedSteps().show ? [host(LABELS.getStarted, (el) => this.displayGetStarted(el))] : []),
       {
         type: 'group',
-        heading: 'Organisations',
+        heading: LABELS.thisVault,
+        items: [
+          // One page per folder this vault syncs: what the folder is, who is in
+          // it, and the two ways to stop — here only, or for everyone.
+          ...settings.folderMappings.map((m): SettingGroupItem => ({
+            type: 'page',
+            name: m.sharedFolderName,
+            desc: [m.localPath !== m.sharedFolderName ? m.localPath : null, m.role === 'owner' ? 'owner' : 'editor', orgName(m.membershipId)].filter(Boolean).join(' · '),
+            displayValue: () => this.folderSummary(m),
+            status: () => (this.plugin.folderCrypto.hasKeys(m.sharedFolderId) ? null : 'warning'),
+            page: () => new PanePage(m.sharedFolderName, (c) => this.displayFolderPage(c, m)),
+          })),
+          host('This vault', (el) => this.displayVaultActions(el), false),
+        ],
+      },
+      // A mapping made before mappings named their organisation, in a vault
+      // that now has several, belongs to no page; it stays here to be removed.
+      ...(unclaimedMappings(settings.folderMappings, settings.memberships.length).length > 0
+        ? [host('Folders needing attention', (el) => this.displayUnclaimedMappings(el))]
+        : []),
+      {
+        type: 'group',
+        heading: LABELS.organisations,
         items: [
           ...settings.memberships.map((m, i, all): SettingGroupItem => ({
             type: 'page',
             name: pageName(m, i, all),
-            desc: `${m.role}${m.region ? ` · ${m.region.toUpperCase()}` : ''} · ${m.shardId}`,
+            // Role and region only. Which server holds it is an operator's
+            // detail, and lives under Advanced for anyone reporting a problem.
+            desc: `${m.role}${m.region ? ` · ${m.region.toUpperCase()}` : ''}`,
             displayValue: () => organisationSummary(m, foldersSyncedFor(m.id, this.plugin.settings.folderMappings, this.plugin.settings.memberships.length)),
             status: () => organisationWarning(m),
             page: () => new OrganisationPage(m.id, pageName(m, i, all)),
@@ -3125,17 +3997,15 @@ export class NectendaSettingTab extends PluginSettingTab {
           host('Create or join an organisation', (el) => this.displayOrganisationControls(el), false),
         ],
       },
-      host('Invitations', (el) => this.displayInvitations(el)),
-      // Shared folders live on each organisation's page. A mapping made
-      // before mappings named their organisation, in a vault that now has
-      // several, belongs to no page; it stays here to be unmapped.
-      ...(unclaimedMappings(settings.folderMappings, settings.memberships.length).length > 0
-        ? [host('Folders needing attention', (el) => this.displayUnclaimedMappings(el))]
-        : []),
-      host('Collaboration', (el) => this.displayCollaboration(el)),
-      host('Encryption', (el) => this.displayEncryption(el)),
-      host('Signed-in vaults', (el) => this.displayCloudDevices(el)),
-      host('Troubleshooting', (el) => this.displayTroubleshooting(el)),
+      {
+        type: 'group',
+        heading: LABELS.more,
+        items: [
+          { type: 'page', name: LABELS.security, desc: 'Your passphrase, your key fingerprint, signed-in vaults and passkeys.', page: () => new PanePage(LABELS.security, (c) => { this.displayEncryption(c); this.displayCloudDevices(c); }) },
+          { type: 'page', name: LABELS.editing, desc: 'Mouse pointers, and marks in the file explorer.', page: () => new PanePage(LABELS.editing, (c) => this.displayCollaboration(c)) },
+          { type: 'page', name: LABELS.advanced, desc: 'Diagnostic log, crash reports, and which servers this vault uses.', page: () => new PanePage(LABELS.advanced, (c) => { this.displayTroubleshooting(c); this.displayServers(c); }) },
+        ],
+      },
     ];
   }
 
@@ -3730,10 +4600,10 @@ export class NectendaSettingTab extends PluginSettingTab {
       .setDesc(settings.serverUrl);
 
     new Setting(containerEl)
-      .setName('Logged in as')
+      .setName('Signed in as')
       .setDesc(`${settings.username} (${settings.userRole})`)
       .addButton((btn) =>
-        btn.setButtonText('Logout').setDestructive().onClick(async () => {
+        btn.setButtonText(LABELS.signOut).setDestructive().onClick(async () => {
           await this.doLogout();
         })
       );
@@ -3800,6 +4670,205 @@ export class NectendaSettingTab extends PluginSettingTab {
 
   }
 
+  /**
+   * One line that answers "is this working?" before anything else on the pane:
+   * the connection in words, and how many folders this vault syncs.
+   */
+  private displayStatusLine(containerEl: HTMLElement): void {
+    const folders = this.plugin.settings.folderMappings.length;
+    const locked = this.plugin.settings.folderMappings.filter((m) => !this.plugin.folderCrypto.hasKeys(m.sharedFolderId)).length;
+    const parts = [CONNECTION_LABELS[this.plugin.connectionStatus], foldersSyncingLine(folders, locked)];
+    const row = new Setting(containerEl).setName('Status').setDesc(parts.join(' · '));
+    if (locked || PROBLEM_CONNECTIONS.has(this.plugin.connectionStatus)) row.descEl.addClass('mod-warning');
+  }
+
+  /** The first-run checklist: what is done, what is next. */
+  getStartedSteps(): { show: boolean; steps: Array<{ done: boolean; name: string; desc: string; action?: { label: string; run: () => void } }> } {
+    const { settings } = this.plugin;
+    const steps = [
+      {
+        done: !!settings.keyMaterial?.publicKey,
+        name: 'Choose your encryption passphrase',
+        desc: 'It encrypts everything you share, and never leaves this device.',
+        action: { label: 'Set passphrase', run: () => void this.setCloudPassphrase().then((ok) => ok && this.update()) },
+      },
+      {
+        done: settings.memberships.length > 0,
+        name: 'Have an organisation',
+        desc: 'Somewhere to share from. Accept an invitation above, or create one of your own.',
+      },
+      {
+        done: settings.folderMappings.length > 0,
+        name: 'Share a folder, or add one shared with you',
+        desc: 'Right-click any folder in the file explorer and choose Nectenda: Share folder…',
+        action: { label: LABELS.shareAFolder, run: () => void this.plugin.shareFromCommand(null) },
+      },
+      {
+        done: Object.values(settings.knownKeys ?? {}).some((k) => k.comparedAt),
+        name: 'Compare a collaborator\'s key (optional)',
+        desc: 'Check a fingerprint with them outside Nectenda, then mark it compared. It rules out a server that swaps keys.',
+      },
+    ];
+    const essentialsDone = steps.slice(0, 3).every((s) => s.done);
+    return { show: !settings.getStartedDismissed && !essentialsDone, steps };
+  }
+
+  private displayGetStarted(containerEl: HTMLElement): void {
+    heading(containerEl, LABELS.getStarted).addExtraButton((btn) =>
+      btn.setIcon('x').setTooltip('Hide this list').onClick(async () => {
+        this.plugin.settings.getStartedDismissed = true;
+        await this.plugin.saveSettings();
+        this.update();
+      }),
+    );
+    const group = rowGroup(containerEl);
+    for (const step of this.getStartedSteps().steps) {
+      const row = new Setting(group).setName(`${step.done ? '✓' : '○'} ${step.name}`).setDesc(step.desc);
+      if (step.done) row.settingEl.addClass('nectenda-step-done');
+      else if (step.action) row.addButton((btn) => btn.setButtonText(step.action!.label).onClick(step.action!.run));
+    }
+  }
+
+  /**
+   * Everything waiting for this person: invitations to accept, and folders
+   * already shared with them that this vault has not added. The second used
+   * to be a list inside each organisation's page, which nobody arriving from
+   * an invitation email would think to open.
+   */
+  private displaySharedWithYou(containerEl: HTMLElement): void {
+    const header = heading(containerEl, LABELS.sharedWithYou);
+    header.addButton((btn) =>
+      btn.setButtonText('Refresh').onClick(async () => {
+        try {
+          await this.plugin.refreshMemberships();
+          await this.plugin.awaitingFolders?.run();
+        } catch (err) {
+          new Notice(err instanceof Error ? err.message : 'Could not reach the identity service');
+        }
+        this.update();
+      }),
+    );
+    const slot = containerEl.createDiv();
+    this.slots.invitations = slot;
+    this.renderInvitations(slot);
+    // The folder half is drawn from the last look and refreshed by a new one,
+    // so the pane opens with what is known and corrects itself.
+    void this.plugin.awaitingFolders?.run().then(() => {
+      if (this.alive() && this.slots.invitations === slot) this.renderInvitations(slot);
+    }).catch(() => undefined);
+  }
+
+  /** A folder row's value on the home pane: the one thing to know before opening it. */
+  private folderSummary(m: FolderMapping): string {
+    if (!this.plugin.folderCrypto.hasKeys(m.sharedFolderId)) return LABELS.needsPassphrase;
+    const status = this.plugin.connectionStatus;
+    if (status === 'connected') return 'Syncing';
+    return CONNECTION_LABELS[status];
+  }
+
+  /** One folder in this vault: what it is, who is in it, and how to stop. */
+  displayFolderPage(c: HTMLElement, m: FolderMapping): void {
+    const owner = m.role === 'owner';
+    const org = this.plugin.settings.memberships.find((x) => x.id === m.membershipId)?.accountName;
+    const hasKeys = this.plugin.folderCrypto.hasKeys(m.sharedFolderId);
+    new Setting(c)
+      .setName('Status')
+      .setDesc([hasKeys ? this.folderSummary(m) : `${LABELS.needsPassphrase} — nothing in this folder syncs until it is unlocked.`, org ? `in ${org}` : null, owner ? 'you are an owner' : 'you can edit'].filter(Boolean).join(' · '));
+    if (!hasKeys) {
+      new Setting(c).setName('Unlock this folder').setDesc('Enter your passphrase to open its key on this device.').addButton((btn) =>
+        btn.setButtonText(LABELS.unlock).setCta().onClick(async () => {
+          if (await this.loadFolderKeys(m.sharedFolderId, m.sharedFolderName, m.membershipId ?? null)) {
+            this.plugin.refreshSync();
+            new Notice(`Unlocked "${m.sharedFolderName}"`);
+          }
+          this.update();
+        }),
+      );
+    }
+
+    heading(c, LABELS.people);
+    if (owner) {
+      new Setting(c)
+        .setName('Invite someone')
+        .setDesc('By email. Someone new gets an invitation and has this folder as soon as they join.')
+        .addButton((btn) => btn.setButtonText(LABELS.invite).setCta().onClick(() => this.plugin.inviteToFolder(m)))
+        .addButton((btn) => btn.setButtonText(LABELS.showPeople).onClick(() => {
+          new FolderMembersModal(this.app, this.plugin.membersDeps(m), m.sharedFolderId, m.sharedFolderName).open();
+        }));
+    } else {
+      // Read-only, but there: an editor compares fingerprints too, and this
+      // is where a folder's settings send someone looking for them.
+      new Setting(c)
+        .setName('People and their keys')
+        .setDesc('Only the folder\'s owners can invite or remove people. Compare key fingerprints with them here.')
+        .addButton((btn) => btn.setButtonText(LABELS.showPeople).onClick(() => {
+          new FolderMembersModal(this.app, this.plugin.membersDeps(m), m.sharedFolderId, m.sharedFolderName).open();
+        }));
+    }
+
+    heading(c, LABELS.thisDevice);
+    new Setting(c)
+      .setName('Location')
+      .setDesc(m.localPath)
+      .addButton((btn) => btn.setButtonText(LABELS.showInExplorer).onClick(() => this.revealInExplorer(m.localPath)));
+
+    heading(c, LABELS.dangerZone);
+    new Setting(c)
+      .setName(LABELS.stopSyncingHere)
+      .setDesc('This vault stops syncing the folder. Your notes stay where they are, and nobody else is affected. You can add it again later.')
+      .addButton((btn) => btn.setButtonText(LABELS.stopSyncingHere).setWarning().onClick(async () => {
+        this.plugin.settings.folderMappings = this.plugin.settings.folderMappings.filter((x) => x.sharedFolderId !== m.sharedFolderId);
+        await this.plugin.saveSettings();
+        this.plugin.refreshSync();
+        new Notice(`"${m.sharedFolderName}" no longer syncs in this vault. Your notes are still there.`);
+        this.update();
+      }));
+    if (owner) {
+      new Setting(c)
+        .setName('Stop sharing for everyone')
+        .setDesc('Removes the folder from the server for every member. Everyone keeps their notes as ordinary files.')
+        .addButton((btn) => btn.setButtonText(LABELS.stopSharing).setDestructive().onClick(() => {
+          const server = this.plugin.serverFor(m.sharedFolderId);
+          void this.unshareFolder({ id: m.sharedFolderId, name: m.sharedFolderName }, server, createDiv()).then(() => this.update());
+        }));
+    }
+  }
+
+  /** Select a vault folder in the file explorer, opening the explorer if it is closed. */
+  private revealInExplorer(path: string): void {
+    const target = this.app.vault.getAbstractFileByPath(path);
+    if (!target) {
+      new Notice(`"${path}" is not in this vault any more.`);
+      return;
+    }
+    const leaf = this.app.workspace.getLeavesOfType('file-explorer')[0];
+    const view = leaf?.view as unknown as { revealInFolder?(f: unknown): void } | undefined;
+    if (leaf) void this.app.workspace.revealLeaf(leaf);
+    view?.revealInFolder?.(target);
+  }
+
+  /** Under the folder list: the two ways a folder gets into this vault. */
+  private displayVaultActions(containerEl: HTMLElement): void {
+    if (this.plugin.settings.folderMappings.length === 0) {
+      noteRow(containerEl, 'Nothing in this vault syncs yet. Share a folder of yours, or add one someone shared with you.');
+    }
+    new Setting(containerEl)
+      .setName('Share a folder')
+      .setDesc('Or right-click a folder in the file explorer.')
+      .addButton((btn) => btn.setButtonText(LABELS.shareAFolder).setCta().onClick(() => void this.plugin.shareFromCommand(null)));
+  }
+
+  /** Which server each organisation lives on: for a support request, not for daily use. */
+  private displayServers(containerEl: HTMLElement): void {
+    const { memberships } = this.plugin.settings;
+    if (!memberships.length) return;
+    heading(containerEl, 'Servers');
+    const group = rowGroup(containerEl);
+    for (const m of memberships) {
+      new Setting(group).setName(m.accountName).setDesc(`${m.shardId}${m.region ? ` (${m.region.toUpperCase()})` : ''} — ${m.endpoint}`);
+    }
+  }
+
   /** Invitations addressed to this identity, accepted here without any email. */
   private displayInvitations(containerEl: HTMLElement): void {
     const header = new Setting(containerEl).setName('Invitations').setHeading();
@@ -3823,7 +4892,30 @@ export class NectendaSettingTab extends PluginSettingTab {
   private renderInvitations(slot: HTMLElement): void {
     slot.empty();
     const invites = this.plugin.settings.pendingInvites ?? [];
-    if (invites.length === 0) noteRow(slot, 'No invitations waiting.');
+    const awaiting = this.plugin.awaitingFolders?.report ?? { ready: [], waiting: [] };
+    if (invites.length === 0 && awaiting.ready.length === 0 && awaiting.waiting.length === 0) {
+      noteRow(slot, 'Nothing waiting. Invitations, and folders people share with you, appear here.');
+    }
+    if (awaiting.ready.length || awaiting.waiting.length) {
+      const folders = rowGroup(slot);
+      for (const f of awaiting.ready) {
+        const who = f.folder.createdByDisplayName ?? f.folder.createdByUsername ?? 'Someone';
+        new Setting(folders)
+          .setName(`A folder from ${who}`)
+          .setDesc('Shared with you and ready. Adding it never mixes it with a folder of yours: if the name is taken, it goes beside it.')
+          .addButton((btn) => btn.setButtonText(LABELS.addToVault).setCta().onClick(async () => {
+            await this.addSharedFolder(f.folder, f.membershipId);
+            await this.plugin.awaitingFolders?.run();
+            this.update();
+          }));
+      }
+      for (const f of awaiting.waiting) {
+        const who = f.folder.createdByDisplayName ?? f.folder.createdByUsername ?? 'its owner';
+        new Setting(folders)
+          .setName(`A folder from ${who}`)
+          .setDesc(`Waiting for its key. This finishes by itself the next time ${who} has Obsidian open.`);
+      }
+    }
     const invitesGroup = invites.length ? rowGroup(slot) : null;
     for (const invite of invites) {
       new Setting(invitesGroup!)
@@ -3879,19 +4971,23 @@ export class NectendaSettingTab extends PluginSettingTab {
    * revoked ones, being finished. The rest can still be acted on, and a
    * declined one can be revoked so it stops sitting there.
    */
-  private displaySentInvitations(containerEl: HTMLElement): void {
+  private displaySentInvitations(containerEl: HTMLElement, accountId?: string): void {
     // No nectenda class: it carries no styling of its own and its rows are
     // ordinary Setting rows. Filled in once every organisation has answered.
     const holder = containerEl.createDiv();
     this.slots.sentInvites = holder;
+    this.sentInvitesFor = accountId ?? null;
     void this.loadSentInvitations(holder);
   }
+
+  /** The organisation whose page shows sent invitations, or null for all. */
+  private sentInvitesFor: string | null = null;
 
   private async loadSentInvitations(holder: HTMLElement): Promise<void> {
     const generation = this.generations.next('sentInvites');
     // Read at load time, not at display time, so a membership refresh that
     // made this person an owner somewhere new is reflected without a gesture.
-    const managed = this.plugin.settings.memberships.filter((m) => m.role === 'owner' || m.role === 'admin');
+    const managed = this.plugin.settings.memberships.filter((m) => (m.role === 'owner' || m.role === 'admin') && (!this.sentInvitesFor || m.accountId === this.sentInvitesFor));
     const client = this.plugin.identityClient();
     const token = this.plugin.settings.identityAccessToken;
     const answered: Array<{ m: StoredMembership; rows: Array<{ invite: SentInvite; status: SentInviteStatus }> }> = [];
@@ -3918,7 +5014,7 @@ export class NectendaSettingTab extends PluginSettingTab {
     // the list while it waits.
     holder.empty();
     for (const { m, rows } of answered) {
-      holder.createEl('h4', { text: `Sent from ${m.accountName}` });
+      heading(holder, this.sentInvitesFor ? 'Invitations sent' : `Sent from ${m.accountName}`);
       const group = rowGroup(holder);
       for (const { invite, status } of rows) {
         const row = new Setting(group).setName(invite.email).setDesc(sentInviteDescription(invite, status));
@@ -3943,8 +5039,8 @@ export class NectendaSettingTab extends PluginSettingTab {
   private displayOrganisationActions(containerEl: HTMLElement, m: StoredMembership): void {
     if (m.role !== 'owner' && m.role !== 'admin') return;
     new Setting(containerEl)
-      .setName('Bring people in')
-      .setDesc('An invitation goes to one address; the share link lets anyone holding it take a seat.')
+      .setName('Invite to the organisation')
+      .setDesc('To bring someone into one folder, invite them from the folder instead. An invitation here goes to one address; the share link lets anyone holding it take a seat.')
       .addButton((btn) =>
         btn.setButtonText('Invite…').onClick(() => {
           new InviteByEmailModal(this.app, m, async (email, role) => {
@@ -3957,10 +5053,135 @@ export class NectendaSettingTab extends PluginSettingTab {
             }
           }).open();
         }),
-      )
-      .addButton((btn) =>
-        btn.setButtonText('Share link').onClick(() => this.copyShareLink(m)),
       );
+    const shareLinkRow = containerEl.createDiv();
+    this.renderShareLinkRow(shareLinkRow, m, null);
+    void this.loadShareLinkRow(shareLinkRow, m);
+    this.displaySentInvitations(containerEl, m.accountId);
+  }
+
+  /**
+   * Ask the server whether the share link is on, then redraw the row. Until it
+   * answers the row offers Copy alone, as it always did: a Turn off or Turn on
+   * button before then would be a guess at the state.
+   */
+  private async loadShareLinkRow(holder: HTMLElement, m: StoredMembership): Promise<void> {
+    // An action that finishes after the page redrew holds a detached row.
+    // Taking a generation for it would discard the live row's answer.
+    if (!holder.isConnected) return;
+    const generation = this.generations.next('shareLink');
+    let enabled: boolean | null = null;
+    try {
+      enabled = (await shareLinkFor(m, this.plugin.serverForMembership(m.id), (url, init) => this.apiFetch(url, init))).enabled;
+    } catch {
+      // Left at "not heard from": Copy still works, and says why if it cannot.
+    }
+    if (!this.alive() || !this.generations.isCurrent('shareLink', generation)) return;
+    this.renderShareLinkRow(holder, m, enabled);
+  }
+
+  private renderShareLinkRow(holder: HTMLElement, m: StoredMembership, enabled: boolean | null): void {
+    holder.empty();
+    const row = new Setting(holder)
+      .setName('Share link')
+      .setDesc(
+        enabled === false
+          ? 'Turned off. Nobody can take a seat with it until it is turned on again.'
+          : 'Anyone holding the link can take a seat. Replace it if it reached someone it should not have.',
+      );
+    const server = () => this.plugin.serverForMembership(m.id);
+    const fetch = (url: string, init?: RequestInit) => this.apiFetch(url, init);
+    for (const action of shareLinkActions(enabled)) {
+      if (action === 'copy') {
+        row.addButton((btn) => btn.setButtonText('Copy').onClick(() => this.copyShareLink(m)));
+      } else if (action === 'replace') {
+        row.addButton((btn) =>
+          btn.setButtonText('Replace…').onClick(async () => {
+            if (!(await this.confirmReplaceShareLink(m.accountName))) return;
+            let link: string;
+            try {
+              link = await replaceShareLink(m, server(), fetch);
+            } catch (err) {
+              new Notice(err instanceof Error ? err.message : 'Could not replace the share link');
+              void this.loadShareLinkRow(holder, m);
+              return;
+            }
+            // Rotating leaves the on/off switch alone, and another admin may
+            // have turned the link off since this row was drawn. Copying then
+            // would hand out a link that admits nobody, so ask first.
+            let stillOn = false;
+            try {
+              stillOn = (await shareLinkFor(m, server(), fetch)).enabled;
+            } catch {
+              // Unknown: say the old link is dead, which is certain, and copy nothing.
+            }
+            if (!stillOn) {
+              new Notice('The old share link has stopped working. The link is turned off, so nothing was copied.');
+            } else {
+              try {
+                await navigator.clipboard.writeText(link);
+                new Notice('The old share link has stopped working. The new one is copied.');
+              } catch {
+                // The replace itself succeeded: say so, or the owner may think
+                // the old link still works.
+                new Notice('The old share link has stopped working. Copying the new one failed; use Copy.');
+              }
+            }
+            void this.loadShareLinkRow(holder, m);
+          }),
+        );
+      } else if (action === 'off') {
+        row.addButton((btn) =>
+          btn.setButtonText('Turn off…').setWarning().onClick(async () => {
+            if (!(await this.confirmTurnOffShareLink(m.accountName))) return;
+            try {
+              await setShareLinkEnabled(server(), false, fetch);
+              new Notice('The share link is off and has stopped working.');
+            } catch (err) {
+              new Notice(err instanceof Error ? err.message : 'Could not turn the share link off');
+            }
+            void this.loadShareLinkRow(holder, m);
+          }),
+        );
+      } else {
+        row.addButton((btn) =>
+          btn.setButtonText('Turn on').onClick(async () => {
+            try {
+              await setShareLinkEnabled(server(), true, fetch);
+              // Same key as before: say so, since an old copy works again.
+              new Notice('The share link is on again. It is the same link as before, so any copy already sent works again.');
+            } catch (err) {
+              new Notice(err instanceof Error ? err.message : 'Could not turn the share link on');
+            }
+            void this.loadShareLinkRow(holder, m);
+          }),
+        );
+      }
+    }
+  }
+
+  /** Its own method so a test can answer it without driving a modal. */
+  private confirmReplaceShareLink(organisation: string): Promise<boolean> {
+    return new Promise((resolve) => new ConfirmModal(this.app, {
+      title: `Replace the share link for ${organisation}?`,
+      body:
+        'The current link stops working at once, for everyone who has it. People who already joined keep their seats. ' +
+        'A new link is copied for you to send.',
+      confirm: 'Replace link',
+      cancel: 'Cancel',
+    }, resolve).open());
+  }
+
+  /** Its own method so a test can answer it without driving a modal. */
+  private confirmTurnOffShareLink(organisation: string): Promise<boolean> {
+    return new Promise((resolve) => new ConfirmModal(this.app, {
+      title: `Turn off the share link for ${organisation}?`,
+      body:
+        'The link stops working at once: nobody can take a seat with it. People who already joined keep their seats. ' +
+        'Turning it on again brings back the same link, so if it reached someone it should not have, replace it instead.',
+      confirm: 'Turn off',
+      cancel: 'Cancel',
+    }, resolve).open());
   }
 
   /** Copy an organisation's share link. The pane's button and the palette command both land here. */
@@ -4003,25 +5224,29 @@ export class NectendaSettingTab extends PluginSettingTab {
       .addText((text) => text.setPlaceholder('obsidian://nectenda?key=nk_… or nk_…').onChange((v) => (this.pendingShareLink = v.trim())))
       .addButton((btn) =>
         btn.setButtonText('Join').onClick(async () => {
-          const raw = this.pendingShareLink;
-          if (!raw) return;
-          let key = raw;
-          let endpoint: string | undefined;
-          try {
-            if (raw.startsWith('obsidian://')) {
-              const u = new URL(raw);
-              key = u.searchParams.get('key') ?? '';
-              endpoint = u.searchParams.get('endpoint') ?? undefined;
-            }
-            if (!this.plugin.settings.keyMaterial?.publicKey && !(await this.setCloudPassphrase())) return;
-            const joined = await this.plugin.joinByShareKey(key, endpoint);
-            new Notice(`You have joined ${joined.accountName}.`);
-          } catch (err) {
-            new Notice(`Could not join: ${err instanceof Error ? err.message : String(err)}`);
-          }
+          await this.joinWithLink(this.pendingShareLink);
           this.update();
         }),
       );
+  }
+
+  /** Join with a pasted link or key. The pane's Join and the palette command both land here. */
+  async joinWithLink(raw: string): Promise<void> {
+    if (!raw) return;
+    let key = raw.trim();
+    let endpoint: string | undefined;
+    try {
+      if (key.startsWith('obsidian://')) {
+        const u = new URL(key);
+        key = u.searchParams.get('key') ?? '';
+        endpoint = u.searchParams.get('endpoint') ?? undefined;
+      }
+      if (!this.plugin.settings.keyMaterial?.publicKey && !(await this.setCloudPassphrase())) return;
+      const joined = await this.plugin.joinByShareKey(key, endpoint);
+      new Notice(`You have joined ${joined.accountName}.`);
+    } catch (err) {
+      new Notice(`Could not join: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
   private pendingShareLink = '';
 
@@ -4127,7 +5352,7 @@ export class NectendaSettingTab extends PluginSettingTab {
     // Hidden until the first answer arrives: an "Account" heading over
     // nothing would be a claim about a server that has not been reached.
     section.hide();
-    section.createEl('h3', { text: this.plugin.settings.mode === 'cloud' ? `Account: ${server.label}` : 'Account' });
+    heading(section, this.plugin.settings.mode === 'cloud' ? 'Plan, storage and devices' : 'Account');
     const slots: AccountSlots = {
       server,
       section,
@@ -4280,7 +5505,7 @@ export class NectendaSettingTab extends PluginSettingTab {
     const vaultNames = await this.openVaultNames(devices);
     redraw('devices', [devices, deviceSlots, [...vaultNames]], (into) => {
       if (devices.length === 0 && !deviceSlots) return;
-      into.createEl('h4', { text: 'Devices' });
+      heading(into, 'Devices');
       // A device holds a slot from the moment it is added until it is removed,
       // open or not: the number to say is how many are on the roster, not
       // how many are connected this minute.
@@ -4293,7 +5518,7 @@ export class NectendaSettingTab extends PluginSettingTab {
       if (deviceSlots && deviceSlots.max > 0 && !deviceSlots.thisDeviceEnrolled) {
         new Setting(group)
           .setName('This device is not added here')
-          .setDesc('It holds none of your deviceSlots in this organisation, so it is not syncing it. Adding it takes a slot.')
+          .setDesc('It holds none of this organisation\'s device slots, so it is not syncing here. Adding it takes a slot.')
           .addButton((btn) =>
             btn.setButtonText('Add this device').setCta().onClick(async () => {
               const res = await this.apiFetch(`${server.base}/account/devices`, {
@@ -4505,7 +5730,7 @@ export class NectendaSettingTab extends PluginSettingTab {
     // must; Cloud: the membership already says which role this person holds.
     const canManage = server.role === null || server.role === 'owner' || server.role === 'admin';
     const isOwner = server.role === null || server.role === 'owner';
-    section.createEl('h4', { text: 'Members' });
+    heading(section, LABELS.people);
     const roleLabel: Record<string, string> = { owner: 'owner', admin: 'admin', member: 'member' };
     const refresh = (): void => this.update();
     const explain = async (res: Response, fallback: string): Promise<void> => {
@@ -4566,7 +5791,7 @@ export class NectendaSettingTab extends PluginSettingTab {
     const pending = this.plugin.settings.pendingBlobUploads ?? [];
     if (pending.length === 0) return;
 
-    containerEl.createEl('h4', { text: `Waiting for space (${pending.length})` });
+    heading(containerEl, `Waiting for space (${pending.length})`);
     const waiting = createFragment();
     waiting.appendText('These will upload on their own once there is room. Your notes are syncing '
       + 'normally in the meantime.');
@@ -4597,7 +5822,7 @@ export class NectendaSettingTab extends PluginSettingTab {
     if (stranded.length === 0 && !misconfigured && oversizedCount === 0 && largeNotes.length === 0) return;
 
     // "Files", not "Attachments": notes too large to sync are listed here too.
-    containerEl.createEl('h4', { text: 'Files that will not sync' });
+    heading(containerEl, 'Files that will not sync');
 
     if (misconfigured) {
       new Setting(containerEl)
@@ -4698,7 +5923,7 @@ export class NectendaSettingTab extends PluginSettingTab {
     const skipped = state?.skippedEntries() ?? [];
     if (skipped.length === 0) return;
 
-    containerEl.createEl('h4', { text: 'Not downloaded on this device' });
+    heading(containerEl, 'Not downloaded on this device');
     noteRow(
       containerEl,
       'These are stored on the server and available on your other devices. '
@@ -4733,18 +5958,18 @@ export class NectendaSettingTab extends PluginSettingTab {
    * belongs to one organisation, so sharing here never touches another's.
    */
   private displaySharedFolders(containerEl: HTMLElement, server: FolderServer): void {
-    containerEl.createEl('h3', { text: 'Shared folders' });
+    heading(containerEl, LABELS.sharedFolders);
 
     const foldersContainer = createDiv('nectenda-surface nectenda-folders');
     new Setting(containerEl)
       .setName('Share a folder')
       .setDesc(
         this.plugin.settings.mode === 'cloud'
-          ? 'Choose a vault folder to share with this organisation.'
-          : 'Choose a vault folder to share with all users on this server.',
+          ? 'Choose a vault folder to share with this organisation. You can also right-click a folder.'
+          : 'Choose a vault folder to share with all users on this server. You can also right-click a folder.',
       )
       .addButton((btn) =>
-        btn.setButtonText('Share Folder').setCta().onClick(() => {
+        btn.setButtonText(LABELS.shareAFolder).setCta().onClick(() => {
           new FolderPickerModal(this.app, (folder) => {
             void this.shareFolder(folder.path, folder.name, server, foldersContainer)
               .catch((err: unknown) => {
@@ -4762,15 +5987,15 @@ export class NectendaSettingTab extends PluginSettingTab {
 
   /** Mappings no organisation's page can claim, listed on the home pane to be unmapped. */
   private displayUnclaimedMappings(containerEl: HTMLElement): void {
-    containerEl.createEl('h3', { text: 'Folders needing attention' });
-    noteRow(containerEl, 'These folders were mapped before mappings recorded their organisation, and this vault now belongs to several. They still sync; unmap one to stop that, then share or map it again from the organisation\'s page.');
+    heading(containerEl, 'Folders needing attention');
+    noteRow(containerEl, 'These folders were added before this vault recorded which organisation each belongs to, and it now belongs to several. They still sync; stop syncing one here, then share or add it again from its organisation\'s page.');
     const group = rowGroup(containerEl);
     for (const m of unclaimedMappings(this.plugin.settings.folderMappings, this.plugin.settings.memberships.length)) {
       new Setting(group)
         .setName(m.sharedFolderName)
         .setDesc(`Local: ${m.localPath}`)
         .addButton((btn) =>
-          btn.setButtonText('Unmap').setDestructive().onClick(async () => {
+          btn.setButtonText(LABELS.stopSyncingHere).setDestructive().onClick(async () => {
             this.plugin.settings.folderMappings = this.plugin.settings.folderMappings.filter((x) => x.sharedFolderId !== m.sharedFolderId);
             await this.plugin.saveSettings();
             this.plugin.refreshSync();
@@ -4852,7 +6077,7 @@ export class NectendaSettingTab extends PluginSettingTab {
           .setName('Some folder names are hidden')
           .setDesc(`${hidden.length} shared ${hidden.length === 1 ? 'folder' : 'folders'} can be named once your passphrase is entered.`)
           .addButton((btn) =>
-            btn.setButtonText('Show names').setCta().onClick(async () => {
+            btn.setButtonText(LABELS.showNames).setCta().onClick(async () => {
               const identity = await this.ensureIdentity('Reading the names of your shared folders.');
               if (!identity) return;
               for (const f of hidden) await this.fetchFolderKeys(f.id, identity, server);
@@ -4868,7 +6093,7 @@ export class NectendaSettingTab extends PluginSettingTab {
       // became invisible — still routing files, with nothing on screen to
       // unmap. Only say "none yet" when this vault holds none either.
       if (folders.length === 0 && !mappings.some((m) => mappingBelongsTo(m, server, new Set()))) {
-        noteRow(container, 'No shared folders yet. Share a folder to get started.');
+        noteRow(container, 'Nothing shared here yet. Share a folder from this vault, or ask someone to invite you to theirs.');
         return;
       }
 
@@ -4915,19 +6140,19 @@ export class NectendaSettingTab extends PluginSettingTab {
         folders, mappings, server, hasKeys: (id) => this.plugin.folderCrypto.hasKeys(id),
       });
       if (keyless.length > 0) {
-        container.createEl('h4', { text: 'Locked' });
+        heading(container, LABELS.needsPassphrase);
         const lockedGroup = rowGroup(container);
         for (const locked of keyless) {
           const folder = folders.find((f) => f.id === locked.sharedFolderId)!;
           new Setting(lockedGroup)
             .setName(locked.sharedFolderName)
             .setDesc(
-              `${locked.localPath} — this device has no key for this folder, so nothing syncs. ` +
-                'Unlock it with your password, or unmap it.',
+              `${locked.localPath} — this device has no key for this folder yet, so nothing syncs. ` +
+                'Unlock it with your passphrase, or stop syncing it here.',
             )
             .addButton((btn) =>
               btn
-                .setButtonText('Unlock')
+                .setButtonText(LABELS.unlock)
                 .setCta()
                 .onClick(async () => {
                   if (await this.loadFolderKeys(folder.id, folder.name)) {
@@ -4938,7 +6163,7 @@ export class NectendaSettingTab extends PluginSettingTab {
                 }),
             )
             .addButton((btn) =>
-              btn.setButtonText('Unmap').setDestructive().onClick(async () => {
+              btn.setButtonText(LABELS.stopSyncingHere).setDestructive().onClick(async () => {
                 this.plugin.settings.folderMappings = this.plugin.settings.folderMappings.filter(
                   (m) => m.sharedFolderId !== locked.sharedFolderId,
                 );
@@ -4951,18 +6176,18 @@ export class NectendaSettingTab extends PluginSettingTab {
       }
 
       if (orphans.length > 0) {
-        container.createEl('h4', { text: 'No longer shared' });
+        heading(container, LABELS.noLongerShared);
         const orphanGroup = rowGroup(container);
         for (const orphan of orphans) {
           new Setting(orphanGroup)
             .setName(orphan.sharedFolderName)
             .setDesc(
               `${orphan.localPath} — this folder is no longer on the server: its owner unshared it, ` +
-                'or it was deleted. Your notes are untouched; unmapping only stops Nectenda looking for it.',
+                'or it was deleted. Your notes are untouched; this only stops Nectenda looking for it.',
             )
             .addButton((btn) =>
               btn
-                .setButtonText('Unmap')
+                .setButtonText(LABELS.stopSyncingHere)
                 .setDestructive()
                 .onClick(async () => {
                   this.plugin.settings.folderMappings = this.plugin.settings.folderMappings.filter(
@@ -4978,7 +6203,7 @@ export class NectendaSettingTab extends PluginSettingTab {
       }
 
       if (mapped.length > 0) {
-        container.createEl('h4', { text: 'Synced Folders' });
+        heading(container, LABELS.inThisVault);
         const mappedGroup = rowGroup(container);
         for (const folder of mapped) {
           const mapping = mappings.find((m) => m.sharedFolderId === folder.id)!;
@@ -4986,27 +6211,24 @@ export class NectendaSettingTab extends PluginSettingTab {
           const setting = new Setting(mappedGroup)
             .setName(label(folder))
             .setDesc(`Local: ${mapping.localPath} \u2014 ${describe(folder).join(' \u00b7 ')}${roleLabel}`);
-          if (folder.role === 'owner') {
-            setting.addButton((btn) =>
-              btn.setButtonText('Members').onClick(() => {
-                new FolderMembersModal(this.app, {
-                  server: () => this.plugin.serverFor(folder.id),
-                  ownPublicKey: () => this.plugin.settings.keyMaterial?.publicKey ?? null,
-                  folderKeys: () => this.plugin.folderCrypto.get(folder.id),
-                }, folder.id, folder.name).open();
-              }),
-            );
-          }
+          // Invite is on the folder's own page and its menu; four buttons here
+          // squeezed the description into a column one word wide. People is
+          // on every row: an editor compares fingerprints too.
+          setting.addButton((btn) =>
+            btn.setButtonText(LABELS.showPeople).onClick(() => {
+              new FolderMembersModal(this.app, this.plugin.membersDeps(mapping), folder.id, folder.name).open();
+            }),
+          );
           if (mayUnshare(folder, server)) {
             setting.addButton((btn) =>
-              btn.setButtonText('Unshare…').setDestructive().onClick(() => {
+              btn.setButtonText(LABELS.stopSharing).setDestructive().onClick(() => {
                 void this.unshareFolder(folder, server, container);
               }),
             );
           }
           setting
             .addButton((btn) =>
-              btn.setButtonText('Unmap').onClick(async () => {
+              btn.setButtonText(LABELS.stopSyncingHere).onClick(async () => {
                 this.plugin.settings.folderMappings = this.plugin.settings.folderMappings.filter((m) => m.sharedFolderId !== folder.id);
                 await this.plugin.saveSettings();
                 this.plugin.refreshSync();
@@ -5017,30 +6239,33 @@ export class NectendaSettingTab extends PluginSettingTab {
       }
 
       if (unmapped.length > 0) {
-        container.createEl('h4', { text: 'Available Folders' });
+        heading(container, LABELS.availableToAdd);
         const unmappedGroup = rowGroup(container);
         for (const folder of unmapped) {
           const row = new Setting(unmappedGroup)
             .setName(label(folder))
             .setDesc(describe(folder).join(' \u00b7 '))
             .addButton((btn) =>
-              btn.setButtonText('Quick Map').setCta().onClick(async () => {
+              btn.setButtonText(LABELS.addToVault).setCta().onClick(async () => {
                 await this.quickMapFolder(folder, container);
               })
             )
             .addButton((btn) =>
-              btn.setButtonText('Choose Folder').onClick(() => {
+              btn.setButtonText(LABELS.chooseLocation).onClick(() => {
                 new FolderPickerModal(this.app, (localFolder) => {
-                  void this.mapFolder(folder, localFolder.path, container)
-                    .catch((err: unknown) => {
-                      log.warn('Could not map the folder', { error: String(err) });
-                    });
+                  void (async () => {
+                    if (pathState(localFolder) === 'occupied'
+                      && !(await this.confirmAdopt(localFolder.path))) return;
+                    await this.mapFolder(folder, localFolder.path, container);
+                  })().catch((err: unknown) => {
+                    log.warn('Could not map the folder', { error: String(err) });
+                  });
                 }).open();
               })
             );
           if (mayUnshare(folder, server)) {
             row.addButton((btn) =>
-              btn.setButtonText('Unshare…').setDestructive().onClick(() => {
+              btn.setButtonText(LABELS.stopSharing).setDestructive().onClick(() => {
                 void this.unshareFolder(folder, server, container);
               }),
             );
@@ -5150,7 +6375,7 @@ export class NectendaSettingTab extends PluginSettingTab {
       await this.plugin.saveSettings();
       this.plugin.refreshSync();
 
-      new Notice(`Folder "${name}" shared and mapped`);
+      new Notice(`Folder "${name}" is shared. Invite someone with a right-click on it.`);
       // Redraw the list in place: a rebuild of the pane would close the page.
       // A share from the palette or the folder menu passes no container, but
       // settings open in a window of their own on 1.13, so the organisation's
@@ -5209,6 +6434,29 @@ export class NectendaSettingTab extends PluginSettingTab {
     await this.loadSharedFolders(container, server);
   }
 
+  /**
+   * Add a folder shared with this person to the vault, from outside the pane
+   * — the "shared a folder with you" notice. Same path as the pane's own
+   * button, into a location that holds no notes already.
+   */
+  async addSharedFolder(folder: SharedFolderInfo & { role?: FolderRole }, membershipId: string | null): Promise<void> {
+    await this.quickMapFolder({ ...folder, membershipId }, createDiv());
+    this.plugin.refreshSettingsPane();
+  }
+
+  /** Its own method so a test can answer it without driving a modal. */
+  private confirmAdopt(path: string): Promise<boolean> {
+    return new Promise((resolve) => new ConfirmModal(this.app, {
+      title: `Add into "${path}"?`,
+      body:
+        `"${path}" already has notes in it. They will be uploaded to everyone in the shared folder, ` +
+        'and where a note of the same name differs, your copy is kept in .nectenda-backups/. ' +
+        'To keep them private, choose an empty folder instead.',
+      confirm: 'Add and share these notes',
+      cancel: 'Choose another folder',
+    }, resolve).open());
+  }
+
   /** Its own method so a test can answer it without driving a modal. */
   private confirmUnshare(name: string, others: number | null): Promise<boolean> {
     return new Promise((resolve) => new UnshareFolderModal(this.app, name, others, resolve).open());
@@ -5237,13 +6485,17 @@ export class NectendaSettingTab extends PluginSettingTab {
     if (!(await this.loadFolderKeys(folder.id, folder.name, folder.membershipId ?? null))) {
       new Notice(
         'That folder was not mapped: its encryption key could not be unlocked. ' +
-          'Try again and enter your password, or ask an owner to share it with you.',
+          'Try again and enter your passphrase, or ask an owner to share it with you.',
       );
       return;
     }
 
-    const localPath = await openFolderName(this.plugin.folderCrypto.get(folder.id), folder)
+    const name = await openFolderName(this.plugin.folderCrypto.get(folder.id), folder)
       ?? folder.name;
+    // Never into a folder that already holds notes: those would be uploaded to
+    // everyone in the shared folder. See add-location.ts.
+    const vaultRef = this.plugin.app.vault;
+    const localPath = defaultAddLocation(name, (p) => pathState(vaultRef.getAbstractFileByPath(p) as { children?: unknown[] } | null));
     try {
       const vault = this.plugin.app.vault;
       const existing = vault.getAbstractFileByPath(localPath);
@@ -5339,7 +6591,7 @@ export class NectendaSettingTab extends PluginSettingTab {
     if (!gotKeys) {
       new Notice(
         `"${folder.name}" was not mapped: its encryption key could not be unlocked. ` +
-          'Try again and enter your password, or ask an owner to share the folder with you.',
+          'Try again and enter your passphrase, or ask an owner to share the folder with you.',
       );
       return;
     }
@@ -5382,11 +6634,37 @@ export class NectendaSettingTab extends PluginSettingTab {
     return folder.membershipId ? this.plugin.serverForMembership(folder.membershipId) : this.plugin.servers()[0];
   }
 
+  /**
+   * A pending reset, at the top of the pane, keys or no keys: a device that is
+   * signed in is exactly what can cancel one somebody else asked for, so it
+   * must not be tucked under a page a worried person would not open
+   * (start-over.ts).
+   */
+  private displayPendingRelease(containerEl: HTMLElement): void {
+    const pending = this.plugin.settings.pendingRelease;
+    if (!pending) return;
+    const { title, detail } = pendingReleaseText(pending);
+    new Setting(containerEl)
+      .setName(title)
+      .setDesc(detail)
+      .addButton((btn) =>
+        btn.setButtonText('Cancel reset').setCta().onClick(async () => {
+          btn.setDisabled(true);
+          try {
+            await this.plugin.cancelStartOver();
+          } catch (err) {
+            new Notice(`Nectenda: could not cancel the reset. ${err instanceof Error ? err.message : String(err)}`);
+          }
+          this.update();
+        }),
+      );
+  }
+
   private displayEncryption(containerEl: HTMLElement): void {
     const publicKey = this.plugin.settings.keyMaterial?.publicKey;
     if (!publicKey) return;
 
-    containerEl.createEl('h3', { text: 'Encryption' });
+    heading(containerEl, 'Encryption');
     const setting = new Setting(containerEl)
       .setName('Your key fingerprint')
       .setDesc('Loading…');
@@ -5406,6 +6684,7 @@ export class NectendaSettingTab extends PluginSettingTab {
     //
     // The prompt is raised from this click and never from the draw: a render
     // that asks for a passphrase is the bug folder-names.test.ts guards.
+    const pendingRelease = this.plugin.settings.pendingRelease;
     if (this.plugin.isLocked()) {
       new Setting(containerEl)
         .setName('Your folders are locked')
@@ -5435,6 +6714,26 @@ export class NectendaSettingTab extends PluginSettingTab {
             }).open();
           }),
         );
+      // For when the recovery key is gone too. Last, and not a call to action:
+      // it gives up everything the other two buttons keep.
+      if (!pendingRelease) {
+        new Setting(containerEl)
+          .setName('Lost both the passphrase and the recovery key?')
+          .setDesc('Nobody can decrypt what they protected, including us. You can start over with a new, empty account for this address.')
+          .addButton((btn) =>
+            btn.setButtonText('Start over').setWarning().onClick(() => {
+              const email = this.plugin.settings.identity?.email;
+              if (!email) return;
+              new StartOverModal(this.app, email, (confirmed) => {
+                if (!confirmed) return;
+                void this.plugin
+                  .requestStartOver()
+                  .catch((err: unknown) => new Notice(`Nectenda: could not start over. ${err instanceof Error ? err.message : String(err)}`))
+                  .then(() => this.update());
+              }).open();
+            }),
+          );
+      }
       return;
     }
     // Stated because nothing else will state it. The OS offers no way to see
@@ -5462,7 +6761,7 @@ export class NectendaSettingTab extends PluginSettingTab {
    * nothing about the other.
    */
   private displayCollaboration(containerEl: HTMLElement): void {
-    containerEl.createEl('h3', { text: 'Collaboration' });
+    heading(containerEl, 'Collaboration');
 
     new Setting(containerEl)
       .setName('Share my mouse pointer')
@@ -5502,10 +6801,35 @@ export class NectendaSettingTab extends PluginSettingTab {
           this.plugin.fileStatus?.apply();
         }),
       );
+
+    // Where the Nectenda status icon shows. The same icon and menu in each;
+    // at least one stays on, or the state would have nowhere to be seen.
+    heading(containerEl, 'Nectenda status');
+    const places: Array<[keyof StatusPlaces, string, string]> = [
+      ['header', 'In each note\'s header', 'The icon at the top of every open note, describing that note.'],
+      ['ribbon', 'In the ribbon', 'The Nectenda logo in the ribbon, describing the note you are in — or the connection when none is open.'],
+      ['statusBar', 'In the status bar', 'The same icon at the bottom of the window.'],
+    ];
+    const available: StatusPlaces = { header: true, ribbon: true, statusBar: !Platform.isMobile };
+    for (const [key, name, desc] of places) {
+      if (!available[key]) continue;
+      new Setting(containerEl).setName(name).setDesc(desc).addToggle((toggle) =>
+        toggle.setValue(this.plugin.settings.statusIn[key]).onChange(async (value) => {
+          if (!value && !mayHide(this.plugin.settings.statusIn, key, available)) {
+            new Notice('Nectenda: keep the status in at least one place.');
+            toggle.setValue(true);
+            return;
+          }
+          this.plugin.settings.statusIn = { ...this.plugin.settings.statusIn, [key]: value };
+          await this.plugin.saveSettings();
+          this.plugin.headerStatus?.apply();
+        }),
+      );
+    }
   }
 
   private displayTroubleshooting(containerEl: HTMLElement): void {
-    containerEl.createEl('h3', { text: 'Troubleshooting' });
+    heading(containerEl, 'Troubleshooting');
 
     new Setting(containerEl)
       .setName('Diagnostic log')
@@ -5553,7 +6877,7 @@ export class NectendaSettingTab extends PluginSettingTab {
   }
 
   private displayAdminPanel(containerEl: HTMLElement): void {
-    containerEl.createEl('h3', { text: 'Admin' });
+    heading(containerEl, 'Admin');
 
     new Setting(containerEl)
       .setName('Invite tokens')
@@ -5589,7 +6913,7 @@ export class NectendaSettingTab extends PluginSettingTab {
         const { invites } = await invitesRes.json() as { invites: InviteTokenInfo[] };
         const unused = invites.filter((i) => !i.usedBy);
         if (unused.length > 0) {
-          container.createEl('h4', { text: 'Active Invite Tokens' });
+          heading(container, 'Active invite tokens');
           const tokenGroup = rowGroup(container);
           for (const invite of unused) {
             new Setting(tokenGroup)
@@ -5609,7 +6933,7 @@ export class NectendaSettingTab extends PluginSettingTab {
 
       if (usersRes.ok) {
         const { users } = await usersRes.json() as { users: UserInfo[] };
-        container.createEl('h4', { text: 'Users' });
+        heading(container, 'Users');
         const userGroup = rowGroup(container);
         for (const user of users) {
           const setting = new Setting(userGroup)
@@ -5670,13 +6994,19 @@ export class NectendaSettingTab extends PluginSettingTab {
       notice.hide();
     } catch (err) {
       notice.hide();
-      new Notice(`Login failed: ${err instanceof Error ? err.message : 'Could not connect'}`);
+      new Notice(`Sign-in failed: ${err instanceof Error ? err.message : 'Could not connect'}`);
     }
   }
 
   /** Persist a new session and start syncing. */
   private async applySession(result: SessionResult): Promise<void> {
     this.plugin.settings.token = result.token;
+    // A real sign-in: every folder shared with this person from here on is
+    // worth offering. Only a vault that was signed in before offers existed
+    // starts from null, and treats its first look as what was already there.
+    this.plugin.settings.offeredFolders ??= [];
+    this.plugin.welcomeNotice?.hide();
+    this.plugin.welcomeNotice = null;
     this.plugin.settings.username = result.user.username;
     this.plugin.settings.userRole = result.user.role;
     this.plugin.settings.keyMaterial = result.keyMaterial;
@@ -5689,7 +7019,7 @@ export class NectendaSettingTab extends PluginSettingTab {
     if (result.recoveryKey) {
       new RecoveryKeyModal(this.app, result.recoveryKey).open();
     } else {
-      new Notice(`Logged in as ${result.user.username}`);
+      new Notice(`Signed in as ${result.user.username}`);
     }
     this.update();
   }
@@ -5782,12 +7112,13 @@ export class NectendaSettingTab extends PluginSettingTab {
       this.plugin.folderCrypto.remove(folderId);
     }
     this.plugin.settings.folderKeys = {};
+    this.plugin.settings.offeredFolders = null;
     this.plugin.settings.errorReportDsn = '';
     this.plugin.sessionKeys = null;
     await this.plugin.saveSettings();
     this.plugin.refreshSettingsPane();
 
-    new Notice('Logged out');
+    new Notice('Signed out');
     this.update();
   }
 

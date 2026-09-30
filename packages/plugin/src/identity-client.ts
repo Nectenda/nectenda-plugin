@@ -1,6 +1,7 @@
 import { apiBaseUrl } from '@nectenda/shared';
 import { validateSignInResult, type SignInResult, type Membership, type PendingInvite } from './auth-flow';
 import { serverFetch, requestId } from './client-version.js';
+import type { PendingRelease } from './start-over.js';
 
 /**
  * The identity service and the hosted half of a sync server, as the plugin
@@ -108,6 +109,11 @@ export interface MeResponse {
    * the mechanism, not a policy.
    */
   errorReporting?: { dsn: string | null };
+  /**
+   * A request to start this account over, if one is waiting (start-over.ts).
+   * Optional: an identity service from before it existed sends nothing.
+   */
+  pendingRelease?: PendingRelease | null;
 }
 
 export interface KeyEnrolment {
@@ -175,6 +181,16 @@ export class IdentityClient {
 
   me(accessToken: string): Promise<MeResponse> {
     return this.json('/api/me', { token: accessToken }, 'Could not load your account');
+  }
+
+  /** Ask for this address to start over. Takes effect after the server's wait; see start-over.ts. */
+  requestRelease(accessToken: string, confirmEmail: string): Promise<{ pendingRelease: PendingRelease }> {
+    return this.json('/api/me/release', { method: 'POST', body: { confirmEmail }, token: accessToken }, 'Could not ask to start over');
+  }
+
+  /** Cancel a pending start-over, from any signed-in device. */
+  cancelRelease(accessToken: string): Promise<{ pendingRelease: null }> {
+    return this.json('/api/me/release', { method: 'DELETE', body: {}, token: accessToken }, 'Could not cancel the reset');
   }
 
   setDisplayName(accessToken: string, displayName: string): Promise<{ displayName: string }> {

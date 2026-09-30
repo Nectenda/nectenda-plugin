@@ -36,8 +36,8 @@ There are two ways to run it, and they differ in what reaches us:
 **Hosted at [nectenda.com](https://nectenda.com).** We operate the server, so
 your encrypted notes pass through our infrastructure and are stored on it. We
 cannot read them: content is encrypted on your device before it is sent, the
-keys are derived from your passphrase and never leave, and document paths are
-HMACs rather than filenames. What the server does see is real and is listed
+keys that decrypt it never leave your device unencrypted, and document paths
+are HMACs rather than filenames. What the server does see is real and is listed
 exhaustively in [docs/security-model.md](docs/security-model.md) — which
 accounts share which folders, update sizes and timings, device records, and the
 display name you choose for a shared folder. Signing in talks to

@@ -228,10 +228,46 @@ export interface BlobEntry {
   uploadedBy: string;
 }
 
+/**
+ * A structured file in the folder listing: one whose content merges key by key
+ * through `Y.Map`/`Y.Array` in its own document, rather than character by
+ * character (text) or whole (attachment).
+ *
+ * Under a **third root key**, `Y.Map('structured')`, for the same reason
+ * attachments have their own: a client that predates the kind never calls
+ * `getMap('structured')`, so it replicates these entries intact and cannot act
+ * on them. Were they in `files`, that client would open the document as
+ * `Y.Text` and seed it from the file — writing JSON into a text type that no
+ * newer client reads, while believing it had synced.
+ */
+export interface StructuredEntry {
+  size: number;
+  mtime: number;
+  /**
+   * Which codec reads this file, by name rather than by extension. A client
+   * that lacks it leaves the file alone instead of guessing from the name.
+   */
+  format: string;
+  /**
+   * Set when the path was an attachment before it became structured: the hash
+   * of the attachment version that was carried across (or last kept aside).
+   *
+   * A client that has not updated keeps writing the attachment, and its
+   * changes cannot merge into the structured document. They are kept as a
+   * conflict copy instead — once per version, which is what this remembers.
+   * Without it every start-up would compare the stale attachment with the file
+   * and make another copy.
+   */
+  blobHash?: string;
+}
+
 /** Root key for the attachment listing, and the version marker beside it. */
 export const BLOBS_MAP_KEY = 'blobs';
+/** Root key for structured files. See `StructuredEntry`. */
+export const STRUCTURED_MAP_KEY = 'structured';
 export const LISTING_MAP_KEY = 'listing';
-export const LISTING_VERSION = 2;
+/** 3: the `structured` root. 2: the `blobs` root. */
+export const LISTING_VERSION = 3;
 
 // Auth payloads
 export interface JwtPayload {
@@ -596,6 +632,48 @@ export interface SharedFolderInfo {
    */
   members?: number;
   lastActivityAt?: number | null;
+}
+
+/**
+ * An invitation to one folder for an address that has no seat in the folder's
+ * organisation yet. The server claims it when that address joins, making them
+ * a member; an owner's device then wraps the folder key for them. It carries
+ * no key material.
+ */
+export interface FolderInvitationInfo {
+  id: string;
+  folderId: string;
+  email: string;
+  role: 'owner' | 'editor';
+  invitedBy: string;
+  invitedByName: string | null;
+  createdAt: number;
+  expiresAt: number;
+  expired: boolean;
+  /** Why it will no longer be honoured, when it will not: its inviter stopped owning the folder. */
+  lapsedReason: 'inviter-not-owner' | null;
+}
+
+/** A folder the server just made someone a member of, because they were invited to it. */
+export interface ClaimedFolderInvitation {
+  folderId: string;
+  role: 'owner' | 'editor';
+  invitedBy: string;
+  invitedByName: string | null;
+}
+
+/**
+ * A member of a folder the caller owns who lacks one or more keys the caller
+ * holds. `publicKey` is null for someone who has not set up encryption, whom
+ * nobody can wrap for yet.
+ */
+export interface AwaitingKeyInfo {
+  folderId: string;
+  userId: string;
+  email: string;
+  displayName: string;
+  publicKey: string | null;
+  missing: Array<{ kind: 'content' | 'name'; keyId: string }>;
 }
 
 export interface CreateFolderRequest {

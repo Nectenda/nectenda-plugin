@@ -16,10 +16,10 @@
  * dependencies each, which is the whole of what a dialog about folder members
  * or about stored attachments turns out to need.
  */
-import { App, FuzzySuggestModal, Modal, Notice, Setting, TFolder } from 'obsidian';
+import { App, ButtonComponent, FuzzySuggestModal, Modal, Notice, Setting, TFolder } from 'obsidian';
+import { START_OVER_CONSEQUENCES, startOverReady } from './start-over';
 import type { StoredMembership } from './cloud-session';
 import {
-  memberLabel,
   pickerCandidates,
   type FolderMember,
   type FolderRole,
@@ -28,7 +28,11 @@ import {
 } from './folder-members';
 import type { PlanOffer } from './identity-client';
 import type { VerifyOutcome } from './identity-session';
-import { publicKeyFingerprint } from '@nectenda/shared';
+import { publicKeyFingerprint, type FolderInvitationInfo } from '@nectenda/shared';
+import { addExistingMember, type KeyTrust } from './folder-invite';
+import type { KnownKey } from './known-keys';
+import type { WaitingState } from './key-grants';
+import { memberRow } from './member-rows';
 import { serverFetch } from './client-version.js';
 import { wrapKeysFor, type FolderKeys } from './folder-crypto';
 import { log } from './logger';
@@ -147,7 +151,7 @@ export class RecoveryKeyModal extends Modal {
     contentEl.createEl('h2', { text: 'Save your recovery key' });
     contentEl.createEl('p', {
       text:
-        'This is the only way back into your notes if you forget your password. ' +
+        'This is the only way back into your notes if you forget your passphrase. ' +
         'It is shown once and cannot be retrieved later — not even by a server admin. ' +
         'Store it in a password manager now.',
     });
@@ -216,13 +220,13 @@ export class RecoveryModal extends Modal {
     this.contentEl.createEl('p', {
       text:
         'Enter the recovery key you saved when you registered, and choose a new ' +
-        'password. Your notes and every folder shared with you are unaffected.',
+        'passphrase. Your notes and every folder shared with you are unaffected.',
     });
     this.contentEl.createEl('p', {
       cls: 'setting-item-description',
       text:
         'Without the recovery key there is nothing to do here — the server cannot ' +
-        'reset a password it has never seen. Case and dashes do not matter.',
+        'reset a passphrase it has never seen. Case and dashes do not matter.',
     });
 
     let recoveryKey = '';
@@ -235,11 +239,11 @@ export class RecoveryModal extends Modal {
         return;
       }
       if (password.length < MIN_PASSWORD_LENGTH) {
-        new Notice(`Password must be at least ${MIN_PASSWORD_LENGTH} characters`);
+        new Notice(`The passphrase must be at least ${MIN_PASSWORD_LENGTH} characters`);
         return;
       }
       if (password !== confirm) {
-        new Notice('The two passwords do not match');
+        new Notice('The two passphrases do not match');
         return;
       }
       this.settle({ recoveryKey: recoveryKey.trim(), password });
@@ -251,12 +255,12 @@ export class RecoveryModal extends Modal {
       window.setTimeout(() => text.inputEl.focus(), 0);
     });
 
-    new Setting(this.contentEl).setName('New password').addText((text) => {
+    new Setting(this.contentEl).setName('New passphrase').addText((text) => {
       text.inputEl.type = 'password';
       text.onChange((v) => (password = v));
     });
 
-    new Setting(this.contentEl).setName('Confirm new password').addText((text) => {
+    new Setting(this.contentEl).setName('Confirm new passphrase').addText((text) => {
       text.inputEl.type = 'password';
       text.onChange((v) => (confirm = v));
       text.inputEl.addEventListener('keydown', (e) => {
@@ -282,7 +286,65 @@ export class RecoveryModal extends Modal {
 }
 
 /**
- * Asks for the passphrase so the identity key can be unwrapped, and keeps
+ * Start over, for someone who has lost both the passphrase and the recovery
+ * key. The words are in start-over.ts, where they are tested; this only lays
+ * them out and holds the button until the address is typed.
+ */
+export class StartOverModal extends Modal {
+  private settled = false;
+
+  constructor(
+    app: App,
+    private readonly email: string,
+    private readonly onSubmit: (confirmed: boolean) => void,
+  ) {
+    super(app);
+  }
+
+  onOpen(): void {
+    this.titleEl.setText('Start over with a new account');
+    this.contentEl.createEl('p', {
+      text: 'Only for when the passphrase and the recovery key are both gone for good. If you still have the recovery key, use "Forgot passphrase?" instead: it keeps everything.',
+    });
+    const list = this.contentEl.createEl('ul');
+    for (const line of START_OVER_CONSEQUENCES) list.createEl('li', { text: line });
+
+    let typed = '';
+    let button: ButtonComponent | null = null;
+    new Setting(this.contentEl)
+      .setName('Type your email address to confirm')
+      .setDesc(this.email)
+      .addText((text) => {
+        text.setPlaceholder(this.email).onChange((v) => {
+          typed = v;
+          button?.setDisabled(!startOverReady(typed, this.email));
+        });
+        window.setTimeout(() => text.inputEl.focus(), 0);
+      });
+    new Setting(this.contentEl).addButton((btn) => {
+      button = btn;
+      btn.setButtonText('Start over in 7 days').setWarning().setDisabled(true).onClick(() => {
+        if (!startOverReady(typed, this.email)) return;
+        this.settle(true);
+        this.close();
+      });
+    });
+  }
+
+  private settle(value: boolean): void {
+    if (this.settled) return;
+    this.settled = true;
+    this.onSubmit(value);
+  }
+
+  onClose(): void {
+    this.settle(false);
+    this.contentEl.empty();
+  }
+}
+
+/**
+ *Asks for the passphrase so the identity key can be unwrapped, and keeps
  * asking until it opens.
  *
  * The check happens *here*, through `verify`, rather than after the dialog has
@@ -871,6 +933,41 @@ export class ChoicePickerModal<T> extends FuzzySuggestModal<T> {
  * "This cannot be undone" is the whole of it, so the modal says what goes and
  * what stays before it says it.
  */
+/**
+ * A yes-or-no question with the consequence spelled out. Dismissing it is a
+ * no, like the unshare dialog: closing a window is not consent.
+ */
+export class ConfirmModal extends Modal {
+  private answered = false;
+
+  constructor(
+    app: App,
+    private readonly text: { title: string; body: string; confirm: string; cancel: string },
+    private readonly decide: (proceed: boolean) => void,
+  ) {
+    super(app);
+  }
+
+  onOpen(): void {
+    this.titleEl.setText(this.text.title);
+    this.contentEl.createEl('p', { text: this.text.body });
+    new Setting(this.contentEl)
+      .addButton((b) => b.setButtonText(this.text.cancel).onClick(() => this.answer(false)))
+      .addButton((b) => b.setButtonText(this.text.confirm).setWarning().onClick(() => this.answer(true)));
+  }
+
+  private answer(proceed: boolean): void {
+    this.answered = true;
+    this.decide(proceed);
+    this.close();
+  }
+
+  onClose(): void {
+    this.contentEl.empty();
+    if (!this.answered) this.decide(false);
+  }
+}
+
 export class UnshareFolderModal extends Modal {
   private answered = false;
 
@@ -1082,6 +1179,21 @@ export interface FolderMembersDeps {
    * member is added and simply cannot read anything yet.
    */
   folderKeys(): FolderKeys | null;
+  /** Whether a collaborator's key may be used; refuses one that changed. */
+  trust: KeyTrust;
+  /** What this vault remembers of someone's key, for the "compared" line. */
+  known(email: string): KnownKey | undefined;
+  /** The person compared this fingerprint with its owner out of band. */
+  markCompared(email: string, fingerprint: string): Promise<void>;
+  /** Why a member is still without a key, as the last automatic pass saw it. */
+  waiting(userId: string): WaitingState | undefined;
+  /** Open the invite dialog for this folder. */
+  invite(): void;
+  /**
+   * This vault owns the folder, and so may change who is in it. Everyone else
+   * sees the same people and fingerprints, and may mark one compared.
+   */
+  canManage: boolean;
 }
 
 export class FolderMembersModal extends Modal {
@@ -1097,7 +1209,7 @@ export class FolderMembersModal extends Modal {
   }
 
   onOpen(): void {
-    this.titleEl.setText(`Members of ${this.folderName}`);
+    this.titleEl.setText(`People in ${this.folderName}`);
     void this.render();
   }
 
@@ -1105,6 +1217,17 @@ export class FolderMembersModal extends Modal {
     return {
       Authorization: `Bearer ${this.deps.server().token}`,
       'Content-Type': 'application/json',
+    };
+  }
+
+  private shareDeps(): Parameters<typeof addExistingMember>[0] {
+    return {
+      server: this.deps.server(),
+      folderId: this.folderId,
+      keys: this.deps.folderKeys(),
+      trust: this.deps.trust,
+      fetch: serverFetch,
+      wrap: wrapKeysFor,
     };
   }
 
@@ -1117,7 +1240,7 @@ export class FolderMembersModal extends Modal {
     try {
       const res = await serverFetch(`${base}/folders/${this.folderId}/members`, { headers: this.headers() });
       if (!res.ok) {
-        contentEl.createEl('p', { text: 'Could not load members.' });
+        contentEl.createEl('p', { text: 'Could not load the people in this folder.' });
         return;
       }
       ({ members } = (await res.json()) as { members: FolderMember[] });
@@ -1126,39 +1249,66 @@ export class FolderMembersModal extends Modal {
       return;
     }
 
+    const { canManage } = this.deps;
+    if (canManage) {
+      new Setting(contentEl)
+        .setName('Invite someone')
+        .setDesc('By email. Someone new gets an invitation and has the folder as soon as they join.')
+        .addButton((btn) => btn.setButtonText('Invite…').setCta().onClick(() => {
+          this.close();
+          this.deps.invite();
+        }));
+    }
+
+    new Setting(contentEl).setName('People').setHeading();
     for (const member of members) {
       // The fingerprint is the only defence against a server that substitutes
       // its own public key for a collaborator's. Without comparing these out of
       // band — in person, over a call — the guarantee holds against an operator
-      // who only reads, not one who actively interferes.
+      // who only reads, not one who actively interferes. Remembering the key a
+      // person was first shared with, and refusing a different one later, is
+      // what this vault can do on its own; comparing is what rules out the start.
       const fingerprint = member.publicKey
         ? await publicKeyFingerprint(member.publicKey)
         : null;
-      // A person, not the shard's username — which for a hosted user is two
-      // ids joined by a dot. The address goes on the second line when the
-      // first is a display name; the fingerprint stays, as the check it is.
-      const who = memberLabel(member);
-      const address = member.displayName && member.email ? `${member.email} — ` : '';
-      const setting = new Setting(contentEl)
-        .setName(who)
-        .setDesc(
-          fingerprint
-            ? `${address}${member.role} — key ${fingerprint}`
-            : `${address}${member.role} — no encryption keys yet, cannot be given folder access`,
-        );
+      const self = !!member.publicKey && member.publicKey === this.deps.ownPublicKey();
+      const email = member.email ?? member.username;
+      const row = memberRow(member, {
+        fingerprint,
+        self,
+        known: this.deps.known(email),
+        waiting: this.deps.waiting(member.userId),
+        canManage,
+      });
+      const who = row.name;
+      const setting = new Setting(contentEl).setName(who).setDesc(row.desc);
+      if (row.warning) setting.descEl.addClass('mod-warning');
 
-      setting.addDropdown((drop) => {
+      if (row.compare && fingerprint) {
+        setting.addButton((btn) =>
+          btn
+            .setButtonText('Mark as compared')
+            .setTooltip(`Only after checking ${fingerprint} with ${who} outside Nectenda`)
+            .onClick(async () => {
+              await this.deps.markCompared(email, fingerprint);
+              await this.render();
+            }),
+        );
+      }
+
+      if (row.role) setting.addDropdown((drop) => {
         drop
           .addOption('owner', 'Owner')
           .addOption('editor', 'Editor')
           .setValue(member.role)
           .onChange(async (role) => {
-            await this.post(member.userId, who, role as FolderRole);
+            const outcome = await addExistingMember(this.shareDeps(), { userId: member.userId, who, role: role as FolderRole });
+            new Notice(outcome.ok ? `${who} is now ${role}` : outcome.message, outcome.ok ? 4000 : 10000);
             await this.render();
           });
       });
 
-      setting.addButton((btn) =>
+      if (row.remove) setting.addButton((btn) =>
         btn
           .setButtonText('Remove')
           .setDestructive()
@@ -1178,6 +1328,10 @@ export class FolderMembersModal extends Modal {
       );
     }
 
+    // The server lists invitations to owners only, and an editor could not
+    // revoke one anyway.
+    if (canManage) await this.renderInvitations(contentEl);
+
     const mine = this.deps.ownPublicKey();
     if (mine) {
       const note = contentEl.createEl('p', { cls: 'setting-item-description' });
@@ -1188,13 +1342,17 @@ export class FolderMembersModal extends Modal {
       );
     }
 
-    contentEl.createEl('h4', { text: 'Add someone' });
+    if (!canManage) {
+      contentEl.createEl('p', { cls: 'setting-item-description', text: 'Only the folder\'s owners can invite or remove people.' });
+      return;
+    }
+
     let role: FolderRole = 'editor';
     // Picked from the organisation's roster, not typed: the person must
     // already hold a seat here — folders never cross organisations — and an
     // address typed by hand had to match exactly or the add failed.
     new Setting(contentEl)
-      .setName('Add a member')
+      .setName('Add someone from the organisation')
       .setDesc('Someone who already belongs to this organisation.')
       .addDropdown((drop) =>
         drop
@@ -1206,7 +1364,6 @@ export class FolderMembersModal extends Modal {
       .addButton((btn) =>
         btn
           .setButtonText('Choose…')
-          .setCta()
           .onClick(async () => {
             let users: RosterUser[];
             try {
@@ -1222,7 +1379,12 @@ export class FolderMembersModal extends Modal {
             // leaves them out without needing to know their own id here.
             new FolderMemberPickerModal(this.app, pickerCandidates(users, members, null), (c) => {
               void (async () => {
-                await this.post(c.id, c.label.split(' — ')[0], role);
+                const who = c.label.split(' — ')[0];
+                const outcome = await addExistingMember(this.shareDeps(), { userId: c.id, who, role });
+                // Only claim success if the key actually reached them: a
+                // cheerful "is now editor" printed after a failure buries the
+                // one message that matters.
+                new Notice(outcome.ok ? `${who} is now ${role}. ${outcome.message}` : outcome.message, outcome.ok ? 6000 : 10000);
                 await this.render();
               })().catch((err: unknown) => {
                 log.warn('Could not add the member', { error: String(err) });
@@ -1232,75 +1394,92 @@ export class FolderMembersModal extends Modal {
       );
   }
 
-  private async post(userId: string, who: string, role: FolderRole): Promise<void> {
+  /**
+   * Invitations to this folder nobody has claimed yet. Shown so an owner can
+   * see why somebody has not arrived — waiting, expired, or no longer valid —
+   * instead of the row quietly not existing. A server from before folder
+   * invitations answers 404, and the section is simply left out.
+   */
+  private async renderInvitations(contentEl: HTMLElement): Promise<void> {
     const { base } = this.deps.server();
-    const res = await serverFetch(`${base}/folders/${this.folderId}/members`, {
-      method: 'POST',
-      headers: this.headers(),
-      body: JSON.stringify({ userId, role }),
-    });
-    if (!res.ok) {
-      const body = (await res.json().catch(() => ({}))) as { error?: string };
-      new Notice(body.error ?? 'Could not change membership');
+    let invitations: FolderInvitationInfo[] = [];
+    try {
+      const res = await serverFetch(`${base}/folders/${this.folderId}/invitations`, { headers: this.headers() });
+      if (!res.ok) return;
+      ({ invitations } = (await res.json()) as { invitations: FolderInvitationInfo[] });
+    } catch {
       return;
     }
-
-    const { member } = (await res.json().catch(() => ({}))) as { member?: { userId: string } };
-    // Only claim success if the key actually reached them. grantKey reports its
-    // own failures, and a cheerful "is now editor" printed afterwards is the
-    // last thing the user reads — which buries the one message that matters,
-    // in the state that already looks exactly like a sync failure.
-    const shared = member ? await this.grantKey(member.userId, who) : false;
-    if (shared) new Notice(`${who} is now ${role}`);
+    if (!invitations.length) return;
+    new Setting(contentEl).setName('Invited').setHeading();
+    for (const inv of invitations) {
+      const state = inv.lapsedReason === 'inviter-not-owner'
+        ? 'no longer valid: whoever sent it stopped owning this folder'
+        : inv.expired
+          ? 'expired — invite them again'
+          : `waiting for them to join (until ${new Date(inv.expiresAt * 1000).toLocaleDateString()})`;
+      const row = new Setting(contentEl).setName(inv.email).setDesc(`${inv.role} — ${state}`);
+      if (inv.expired || inv.lapsedReason) row.descEl.addClass('mod-warning');
+      row.addButton((btn) =>
+        btn.setButtonText('Revoke').setDestructive().onClick(async () => {
+          const res = await serverFetch(`${base}/folders/${this.folderId}/invitations/${inv.id}`, { method: 'DELETE', headers: this.headers() });
+          if (!res.ok) new Notice('Could not revoke that invitation');
+          await this.render();
+        }),
+      );
+    }
   }
 
-  /**
-   * Seal this folder's keys to a new member.
-   *
-   * Access and readability are separate things here, and the server can only
-   * grant the first: it has no folder key to give away. Without this the member
-   * sees the folder and receives ciphertext they cannot decrypt, which looks
-   * exactly like a sync failure.
-   *
-   * ECIES needs only the recipient's public key, so this works without the
-   * folder's original owner being online — but it does need *this* client to
-   * hold the folder key, which is why it reports plainly when it does not.
-   */
-  private async grantKey(userId: string, username: string): Promise<boolean> {
-    const keys = this.deps.folderKeys();
-    if (!keys) {
-      new Notice(`${username} was added, but this device has no key for the folder to share.`);
-      return false;
-    }
+  onClose(): void {
+    this.contentEl.empty();
+  }
+}
 
-    const { base } = this.deps.server();
-    try {
-      const res = await serverFetch(`${base}/folders/${this.folderId}/members`, {
-        headers: this.headers(),
-      });
-      const { members } = (await res.json()) as { members: FolderMember[] };
-      const recipient = members.find((m) => m.userId === userId);
-      if (!recipient?.publicKey) {
-        new Notice(`${username} has not enrolled encryption keys yet — no key was shared.`);
-        return false;
-      }
+/**
+ * Invite someone to one shared folder, by email.
+ *
+ * The one place to start collaborating on a folder. What happens next depends
+ * on who they are — `folder-invite.ts` decides — and the caller does it; this
+ * only collects the address and the role.
+ */
+export class InviteToFolderModal extends Modal {
+  constructor(
+    app: App,
+    private readonly folderName: string,
+    private readonly onSubmit: (email: string, role: FolderRole) => Promise<boolean>,
+  ) {
+    super(app);
+  }
 
-      const wrapped = await wrapKeysFor(keys, userId, recipient.publicKey);
-      const put = await serverFetch(`${base}/folders/${this.folderId}/keys`, {
-        method: 'POST',
-        headers: this.headers(),
-        body: JSON.stringify({ keys: wrapped }),
-      });
-      if (!put.ok && put.status !== 409) {
-        new Notice(`${username} was added, but the folder key could not be shared.`);
-        return false;
+  onOpen(): void {
+    this.titleEl.setText(`Invite to ${this.folderName}`);
+    let email = '';
+    let role: FolderRole = 'editor';
+    const submit = async (): Promise<void> => {
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+        new Notice('Enter an email address');
+        return;
       }
-      return true;
-    } catch (err) {
-      new Notice(`${username} was added, but the folder key could not be shared.`);
-      log.error('Could not grant a folder key', { userId, error: String(err) });
-      return false;
-    }
+      if (await this.onSubmit(email, role)) this.close();
+    };
+    this.contentEl.createEl('p', {
+      cls: 'setting-item-description',
+      text: 'They can edit everything in this folder. Someone new is also invited to your organisation, and takes a seat when they join.',
+    });
+    new Setting(this.contentEl).setName('Email address').addText((text) => {
+      text.setPlaceholder('name@example.com').onChange((v) => (email = v.trim()));
+      text.inputEl.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') void submit();
+      });
+      window.setTimeout(() => text.inputEl.focus(), 0);
+    });
+    new Setting(this.contentEl)
+      .setName('Role')
+      .setDesc('Owners can also invite and remove people.')
+      .addDropdown((drop) =>
+        drop.addOption('editor', 'Editor').addOption('owner', 'Owner').setValue('editor').onChange((v) => (role = v as FolderRole)),
+      );
+    new Setting(this.contentEl).addButton((btn) => btn.setButtonText('Send invitation').setCta().onClick(() => void submit()));
   }
 
   onClose(): void {
@@ -1402,3 +1581,55 @@ export class ManageStorageModal extends Modal {
     this.contentEl.empty();
   }
 }
+
+/** One line of text and a button: a pasted link, most often. */
+export class TextPromptModal extends Modal {
+  constructor(
+    app: App,
+    private readonly opts: { title: string; placeholder: string; cta: string; submit: (value: string) => Promise<void> },
+  ) {
+    super(app);
+  }
+
+  onOpen(): void {
+    this.titleEl.setText(this.opts.title);
+    let value = '';
+    const go = async (): Promise<void> => {
+      if (!value.trim()) return;
+      this.close();
+      await this.opts.submit(value.trim());
+    };
+    new Setting(this.contentEl).addText((text) => {
+      text.setPlaceholder(this.opts.placeholder).onChange((v) => (value = v));
+      text.inputEl.addClass('nectenda-wide-input');
+      text.inputEl.addEventListener('keydown', (e) => { if (e.key === 'Enter') void go(); });
+      window.setTimeout(() => text.inputEl.focus(), 0);
+    });
+    new Setting(this.contentEl).addButton((b) => b.setButtonText(this.opts.cta).setCta().onClick(() => void go()));
+  }
+
+  onClose(): void {
+    this.contentEl.empty();
+  }
+}
+
+/**
+ * A shared folder's settings page, as a dialog: the same page the settings
+ * pane shows, drawn by the same code, for the palette and the menus, which
+ * cannot open a page of the settings pane directly.
+ */
+export class FolderSettingsModal extends Modal {
+  constructor(app: App, private readonly name: string, private readonly draw: (el: HTMLElement) => void) {
+    super(app);
+  }
+
+  onOpen(): void {
+    this.titleEl.setText(this.name);
+    this.draw(this.contentEl);
+  }
+
+  onClose(): void {
+    this.contentEl.empty();
+  }
+}
+

@@ -1,5 +1,5 @@
 import { MarkdownView, TFile } from 'obsidian';
-import type { Extension } from '@codemirror/state';
+import * as Y from 'yjs';
 import { keymap, type EditorView } from '@codemirror/view';
 import { yCollab, yUndoManagerKeymap } from 'y-codemirror.next';
 import type { App, EventRef } from 'obsidian';
@@ -12,8 +12,16 @@ import { log } from './logger';
 import { PRESENCE_VERSION } from '@nectenda/shared';
 import { applySeed, buildSeedUpdate, type SeedUpdate } from './seed-update';
 import { seatFor, seatColour, type Person } from './presence';
-import { remotePointers, type RemotePointers } from './remote-pointer';
+import { goToInNote, remotePointers, type RemotePointers } from './remote-pointer';
+import { replayEdits } from './text-merge';
+import type { PendingEdits } from './pending-edits';
 import { resolveMapping, type FolderMapping } from './folder-mapping';
+import type { EditorWiring } from './editor-wiring';
+
+/** The CodeMirror view inside an Obsidian editor. Internal API, hence the reach. */
+function editorViewOf(view: MarkdownView): EditorView | null {
+  return (view.editor as unknown as { cm?: EditorView } | undefined)?.cm ?? null;
+}
 
 /** A `window.setTimeout`/`setInterval` handle: a number.
  *
@@ -63,7 +71,7 @@ function currentTheme(): 'light' | 'dark' {
  * hue is right either way, so the person is still identifiable; only the
  * contrast is not ideal.
  */
-function userColor(username: string): { seat: number; color: string; light: string } {
+export function userColor(username: string): { seat: number; color: string; light: string } {
   const seat = seatFor(username);
   const colour = seatColour(seat, currentTheme());
   return { seat, color: colour, light: withAlpha(colour, 0.28) };
@@ -85,6 +93,38 @@ function withAlpha(colour: string, alpha: number): string {
 export function peopleKey(people: readonly Person[]): string {
   return JSON.stringify(people.map((p) => [p.name, p.color]));
 }
+
+/**
+ * Which remote carets have just appeared.
+ *
+ * y-codemirror builds a new caret element every time a caret moves — its
+ * widget's `updateDOM` returns false — so a CSS animation on the caret itself
+ * replays on every keystroke the other person types, and their caret and name
+ * blink (measured: 32 restarts in 30 keystrokes). A remote caret must never
+ * blink: in someone else's colour it reads as your own. So the ease-in is
+ * keyed to *arrival* instead: this reports whether any client now has a caret
+ * that did not have one at the last change. Leaving and coming back counts as
+ * arriving again, because the caret really did go away.
+ *
+ * Pure over the awareness states it is handed, so it can be tested without an
+ * editor. `own` is this client's id, whose caret is never drawn here.
+ */
+export function caretArrivals(own: number): (states: Map<number, unknown>) => boolean {
+  let present = new Set<number>();
+  return (states) => {
+    const now = new Set<number>();
+    for (const [clientId, state] of states) {
+      if (clientId === own) continue;
+      if ((state as { cursor?: unknown } | null)?.cursor != null) now.add(clientId);
+    }
+    const arrived = [...now].some((id) => !present.has(id));
+    present = now;
+    return arrived;
+  };
+}
+
+/** How long an arrival marks the editor: the 240 ms ease-in, and a frame to spare. */
+export const CARET_ARRIVAL_MS = 320;
 
 /** How often an unchanged set of people is reported again. */
 export const PRESENCE_REFRESH_MS = 1000;
@@ -196,6 +236,11 @@ export interface EditorBridgeDeps {
   mappings(): FolderMapping[];
   /** "Share my mouse pointer": whether others see where this person's mouse is. Read live. */
   sharePointer(): boolean;
+  /**
+   * The recorder of edits made while an editor binds (NEC-159). Registered by
+   * the plugin as its own editor extension; the bridge arms and reads it.
+   */
+  pendingEdits: PendingEdits;
   /** "Show collaborators' mouse pointers": whether this person sees theirs. Read live. */
   showPointers(): boolean;
 }
@@ -214,7 +259,32 @@ export class EditorBridge {
   broadcastName(): string {
     return this.username;
   }
-  private collabExts: Extension[];
+
+  /**
+   * Where to take the view to see a collaborator in the open note, as an
+   * offset: their caret, else their mouse pointer (`goToInNote`). Read from
+   * their awareness state, which holds both as Yjs relative positions: those
+   * survive edits made since they were sent, where a line and column would
+   * not. For "go to them" from the presence circles; nothing is sent.
+   */
+  goToOffsetOf(name: string): { index: number; kind: 'caret' | 'pointer' } | null {
+    const text = this.boundText;
+    if (!text?.doc || !this.currentDocName) return null;
+    const awareness = this.provider.getAwareness(this.currentDocName);
+    if (!awareness) return null;
+    return goToInNote(awareness.getStates(), awareness.clientID, text, name);
+  }
+  private wiring: EditorWiring;
+  /**
+   * The editor the current bind is for. A second pane showing the same file is
+   * a different editor, and must be bound in its own right rather than taken
+   * for the one already bound (SAFE-D5).
+   */
+  private currentCm: EditorView | null = null;
+  /** Bumped by every bind and unbind, so a bind still awaiting can tell it was overtaken. */
+  private bindGeneration = 0;
+  /** A bind waiting for its document to sync, so unbinding can drop it. */
+  private syncedWait: { event: ProviderEvent; cb: () => void } | null = null;
   /** A pending wait for a document's subscription, so it can be cancelled. */
   private subscriptionWait: { event: ProviderEvent; cb: () => void; timer: TimerHandle } | null = null;
   private currentFile: string | null = null;
@@ -223,19 +293,36 @@ export class EditorBridge {
   private awarenessHandler: (() => void) | null = null;
   /** The bound note's pointer extension, so a settings change can redraw it. */
   private pointers: RemotePointers | null = null;
+  /** Marks the bound editor while a collaborator's caret arrives; see caretArrivals. */
+  private arrivalHandler: (() => void) | null = null;
+  private arrivalTimer: number | null = null;
+  private arrivalDom: HTMLElement | null = null;
+  /** The bound note's text, to turn a collaborator's cursor into an offset. */
+  private boundText: Y.Text | null = null;
 
   constructor(
     deps: EditorBridgeDeps,
     contentSync: ContentSync,
     provider: SyncProvider,
     username: string,
-    collabExts: Extension[],
+    wiring: EditorWiring,
   ) {
     this.deps = deps;
     this.contentSync = contentSync;
     this.provider = provider;
     this.username = username;
-    this.collabExts = collabExts;
+    this.wiring = wiring;
+    // The bound editor's state was replaced under it, taking the binding with
+    // it. Left alone, ContentSync would go on believing the note bound and sync
+    // it from neither side. Unbinding hands it back to disk reconciliation, and
+    // binding again restores the editor from the document.
+    this.wiring.onLost = () => {
+      log.warn('The bound editor lost its collaborative binding; binding it again', {
+        docName: this.currentDocName,
+      });
+      this.unbindCollab();
+      this.onActiveLeafChange();
+    };
   }
 
   setPresenceCallback(cb: (people: Person[]) => void): void {
@@ -335,6 +422,7 @@ export class EditorBridge {
     this.unbindCollab();
   }
 
+
   /** Re-evaluate the active file after folder mappings change */
   reconnectActiveFile(): void {
     this.unbindCollab();
@@ -350,8 +438,12 @@ export class EditorBridge {
     }
 
     const filePath = view.file.path;
+    const cm = editorViewOf(view);
 
-    if (filePath === this.currentFile) return;
+    // The same file in the same editor: already bound, or binding. The same
+    // file in another pane falls through and moves the binding there, because
+    // that pane carries nothing until it is bound itself.
+    if (filePath === this.currentFile && cm === this.currentCm) return;
 
     this.unbindCollab();
 
@@ -388,7 +480,9 @@ export class EditorBridge {
     }
 
     this.currentFile = filePath;
+    this.currentCm = cm;
     this.currentDocName = docName;
+    this.bindGeneration += 1;
 
     // Acquire the Y.Doc from ContentSync (connects on-demand if needed)
     const acquired = this.contentSync.acquireDoc(docName);
@@ -427,8 +521,16 @@ export class EditorBridge {
     const file = view.file;
 
     // Install yCollab once provider has synced this doc
+    // Whether this bind has been overtaken. A path alone cannot say: two panes
+    // of the same note share one, and moving between them starts a new bind
+    // for the same path while this one may still be awaiting below. Resuming
+    // then would install into the new pane without checking its text, and run
+    // a second set of presence handlers that nothing removes.
+    const bind = this.bindGeneration;
+    const stale = (): boolean => this.currentFile !== filePath || this.bindGeneration !== bind;
+
     const runInstallCollab = async (): Promise<void> => {
-      if (this.currentFile !== filePath) return;
+      if (stale()) return;
 
       // No awareness yet means the document has no subscription yet:
       // ContentSync calls provider.subscribe only once IndexedDB has finished
@@ -451,10 +553,10 @@ export class EditorBridge {
       // discards an external change — and because binding also stops the
       // disk-to-document path, nothing would pick it up afterwards.
       await this.contentSync.reconcileFromDisk(docName);
-      if (this.currentFile !== filePath) return;
+      if (stale()) return;
 
       const localContent = file ? await this.deps.app.vault.read(file) : '';
-      if (this.currentFile !== filePath) return;
+      if (stale()) return;
 
       // Prepared here rather than at the seed below, which must stay
       // synchronous: an `await` between the emptiness check and installing
@@ -465,7 +567,17 @@ export class EditorBridge {
       // needed depends on `ytext.length` at the moment of the check, not now.
       const seed: SeedUpdate | null =
         localContent.length > 0 ? await buildSeedUpdate(docName, localContent) : null;
-      if (this.currentFile !== filePath) return;
+      if (stale()) return;
+
+      // The editor this bind is for, and the only one it may be installed in
+      // (SAFE-D5). Without one there is nowhere to bind, and saying so beats
+      // announcing presence for a note nobody can type into.
+      const boundView = cm;
+      if (!boundView) {
+        log.warn('This editor has no CodeMirror view to bind; leaving it unbound', { docName });
+        this.unbindCollab();
+        return;
+      }
 
       // Announce presence. Must be setLocalState, not setLocalStateField:
       // subscriptions start with a null local state so background-synced files
@@ -525,7 +637,43 @@ export class EditorBridge {
       // disconnected, where two vaults duplicate every time rather than
       // occasionally.
       if (ytext.length === 0 && seed) {
-        applySeed(ytext.doc!, seed, localContent);
+        // The file went into the document: the edits that produced it, if the
+        // editor made them and Obsidian saved them, must not be replayed too.
+        if (applySeed(ytext.doc!, seed, localContent) !== 'already-present') {
+          this.deps.pendingEdits.adopted(filePath, localContent);
+        }
+      }
+
+      // Replay what the user did to the editor during this bind before the
+      // document wins (NEC-159, SAFE-B5). Every `await` above is a window in
+      // which a keystroke reaches the editor and nothing else — Obsidian has
+      // not saved it, so neither the file nor the document has it — and the
+      // `setValue` below used to erase it from every vault. Measured at 20 ms
+      // between the keystroke and the bind. Waiting to bind is not the answer:
+      // SAFE-C1's dead ends record that it drops first keystrokes the other way.
+      //
+      // The edits are the editor's own transactions, recorded all the while it
+      // was unbound (`pending-edits.ts`), not inferred from its text: four
+      // versions that inferred them lost a keystroke somewhere. Taken here,
+      // synchronously, because the keystroke can land during any await above —
+      // and from here until unbinding, yCollab carries the editor's edits.
+      // Every pane on this note is handed over, this one first: see `take`.
+      const pendings = this.deps.pendingEdits.take(boundView, filePath);
+      for (const pending of pendings) {
+        const replayed = replayEdits(ytext.doc!, ytext, pending.base, pending.changes);
+        const detail = { docName, ...replayed, interrupted: pending.interrupted };
+        if (pending.interrupted || !replayed.placed) {
+          // The pane was rewritten under its edits, or the document moved too
+          // far to place them: keep that pane's text whole as well — its own,
+          // from before the rewrite, not the active editor's. Not awaited: the
+          // text is captured, and the bind must stay synchronous.
+          log.warn('Edits made while the editor bound may not have replayed exactly — backing up the editor', detail);
+          void this.contentSync.backupEditorText(docName, pending.kept).catch((err: unknown) => {
+            log.error('Could not back up the editor while it bound', { docName, error: String(err) });
+          });
+        } else if (replayed.inserted > 0 || replayed.deleted > 0) {
+          log.debug('Replayed edits made while the editor bound', detail);
+        }
       }
 
       // Set editor to match ytext (source of truth)
@@ -535,23 +683,43 @@ export class EditorBridge {
       }
 
       // Install yCollab — editor and ytext already match
+      this.boundText = ytext;
       const collabExtension = yCollab(ytext, awareness);
       const undoKeymap = keymap.of(yUndoManagerKeymap);
-      // The editor this bind is for. `collabExts` reaches every editor
-      // (SAFE-D5), so without this a background or split pane showing another
-      // note would draw this note's pointers at that note's positions, and
-      // hovering it would send a pointer anchored in the wrong text.
-      const boundView = (view.editor as unknown as { cm?: EditorView }).cm ?? null;
+      // Installed in the bound editor only (SAFE-D5), so no other pane can
+      // draw this note's pointers at its own positions. The check stays as a
+      // second line: a pointer anchored in the wrong text is sent to everyone.
       this.pointers = remotePointers(ytext, awareness, {
         sharePointer: () => this.deps.sharePointer(),
         showPointers: () => this.deps.showPointers(),
         isBound: (v) => v === boundView,
       });
 
-      this.collabExts.length = 0;
-      this.collabExts.push(collabExtension, undoKeymap, this.pointers.extension);
+      // Ease a collaborator's caret in when it arrives, and only then: the
+      // stylesheet animates carets while the editor carries this class.
+      this.arrivalDom = boundView.dom ?? null;
+      const arrived = caretArrivals(awareness.clientID);
+      this.arrivalHandler = () => {
+        if (!arrived(awareness.getStates()) || !this.arrivalDom) return;
+        this.arrivalDom.classList.add('nectenda-caret-arriving');
+        if (this.arrivalTimer !== null) window.clearTimeout(this.arrivalTimer);
+        this.arrivalTimer = window.setTimeout(() => {
+          this.arrivalDom?.classList.remove('nectenda-caret-arriving');
+          this.arrivalTimer = null;
+        }, CARET_ARRIVAL_MS);
+      };
+      awareness.on('change', this.arrivalHandler);
+      this.arrivalHandler();
 
-      this.deps.app.workspace.updateOptions();
+      // Into this editor and no other. Checked, because the next line stops
+      // ContentSync reconciling from disk: an editor that did not take the
+      // binding would then be synced by nothing, and its edits lost on the next
+      // reconnect. Unbinding leaves the document to ContentSync instead.
+      if (!this.wiring.bind(boundView, [collabExtension, undoKeymap, this.pointers.extension])) {
+        log.warn('Could not install collaborative editing in this editor; leaving it unbound', { docName });
+        this.unbindCollab();
+        return;
+      }
 
       // Only now does CodeMirror own the document. Until this point ContentSync
       // must keep reconciling disk against the CRDT, or edits made before the
@@ -608,8 +776,10 @@ export class EditorBridge {
     } else {
       const onSynced = () => {
         this.provider.off(`synced:${docName}`, onSynced);
+        if (this.syncedWait?.cb === onSynced) this.syncedWait = null;
         installCollab();
       };
+      this.syncedWait = { event: `synced:${docName}`, cb: onSynced };
       this.provider.on(`synced:${docName}`, onSynced);
     }
   }
@@ -679,6 +849,11 @@ export class EditorBridge {
 
   private unbindCollab(): void {
     this.cancelSubscriptionWait();
+    this.bindGeneration += 1;
+    if (this.syncedWait) {
+      this.provider.off(this.syncedWait.event, this.syncedWait.cb);
+      this.syncedWait = null;
+    }
     if (this.currentDocName) {
       // Release awareness handler
       const awareness = this.provider.getAwareness(this.currentDocName);
@@ -686,6 +861,14 @@ export class EditorBridge {
         if (awareness) awareness.off('change', this.awarenessHandler);
         this.awarenessHandler = null;
       }
+      if (this.arrivalHandler) {
+        if (awareness) awareness.off('change', this.arrivalHandler);
+        this.arrivalHandler = null;
+      }
+      if (this.arrivalTimer !== null) window.clearTimeout(this.arrivalTimer);
+      this.arrivalTimer = null;
+      this.arrivalDom?.classList.remove('nectenda-caret-arriving');
+      this.arrivalDom = null;
 
       // Withdraw presence. The document stays subscribed for background sync,
       // so without this a closed file would keep showing our cursor to peers
@@ -696,10 +879,15 @@ export class EditorBridge {
       this.contentSync.releaseDoc(this.currentDocName);
       this.currentDocName = null;
       this.currentFile = null;
+      this.boundText = null;
 
       this.pointers = null;
-      this.collabExts.length = 0;
-      this.deps.app.workspace.updateOptions();
+      this.currentCm = null;
+      this.wiring.unbind();
+      // No note is bound now: the recorder logs every editor's edits again,
+      // for the next bind to replay. After the reconfigure, so nothing yCollab
+      // still does is logged as typing.
+      this.deps.pendingEdits.unbound();
       if (this.onPresenceChange) {
         this.onPresenceChange([]);
       }

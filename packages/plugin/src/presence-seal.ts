@@ -39,6 +39,17 @@ import type { DocCipher } from './multiplexed-provider';
  */
 export const PRESENCE_PAD_BYTES = 512;
 
+/**
+ * The bucket for a canvas document. A canvas state carries more than a note's
+ * — a pointer with the node it is over, a viewport, a selection — and a card
+ * caret (WIRE-095) is two more relative positions, about 200 bytes. Measured:
+ * a typical board state is ~340 bytes without the caret and ~545 with it, so
+ * at 512 the server could tell "typing in a card" from "on the board" by
+ * length alone. One 1024-byte bucket holds both, at twice the bytes per
+ * presence frame on canvases only.
+ */
+export const CANVAS_PRESENCE_PAD_BYTES = 1024;
+
 /** Separates presence from anything else ever sealed under a folder key. */
 const AAD_LABEL = 'nectenda:v1:presence';
 
@@ -64,8 +75,8 @@ export function presenceAad(docName: string, clientID: number, clock: number): U
  * Pad with trailing spaces. JSON.parse ignores trailing whitespace, so the
  * padding needs no length field and no stripping on the way out.
  */
-function pad(bytes: Uint8Array): Uint8Array {
-  const size = Math.max(PRESENCE_PAD_BYTES, Math.ceil(bytes.length / PRESENCE_PAD_BYTES) * PRESENCE_PAD_BYTES);
+function pad(bytes: Uint8Array, bucket: number): Uint8Array {
+  const size = Math.max(bucket, Math.ceil(bytes.length / bucket) * bucket);
   const out = new Uint8Array(size).fill(0x20);
   out.set(bytes, 0);
   return out;
@@ -78,8 +89,10 @@ export async function sealPresence(
   clientID: number,
   clock: number,
   state: unknown,
+  /** The padding bucket: `PRESENCE_PAD_BYTES`, or `CANVAS_PRESENCE_PAD_BYTES` for a canvas. */
+  bucket: number = PRESENCE_PAD_BYTES,
 ): Promise<string> {
-  const plaintext = pad(new TextEncoder().encode(JSON.stringify(state)));
+  const plaintext = pad(new TextEncoder().encode(JSON.stringify(state)), bucket);
   const { payload, keyId } = await cipher.encryptPayload(docName, plaintext, presenceAad(docName, clientID, clock));
   return JSON.stringify({ e: toBase64(payload), k: keyId });
 }

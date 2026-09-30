@@ -97,6 +97,11 @@ export interface BlobNotifier {
   attachmentsNotIncluded(): void;
   accountSuspended(): void;
   storageFull(blobId: string): void;
+  /**
+   * A member on an older version changed a file this one now syncs
+   * structurally; their version was kept beside it as a conflict copy.
+   */
+  keptOlderClientVersion(relativePath: string): void;
 }
 
 /** What attachment sync needs from the plugin around it. */
@@ -336,23 +341,65 @@ export class BlobSync {
    * "the file is empty" is precisely how content gets destroyed.
    */
   async download(sharedFolderId: string, relativePath: string, entry: BlobEntry): Promise<boolean> {
+    const fetched = await this.fetchVerified(sharedFolderId, relativePath, entry);
+    if (fetched === 'same' || fetched === null) return false;
+    const { state, fullPath, plaintext } = fetched;
+    await this.writeLocal(state, relativePath, fullPath, plaintext, entry.hash, entry.chunkSize);
+    return true;
+  }
+
+  /**
+   * Fetch one attachment version and keep it **beside** the file, never over
+   * it: `kept` when a copy was written, `same` when the file already holds
+   * exactly these bytes, `failed` otherwise.
+   *
+   * For a structured file an older client is still writing as an attachment
+   * (SAFE-A17). Its version cannot merge into the structured document, and
+   * writing it over the file would discard the document's.
+   */
+  async keepAsConflictCopy(
+    sharedFolderId: string,
+    relativePath: string,
+    entry: BlobEntry,
+  ): Promise<'kept' | 'same' | 'failed'> {
+    const fetched = await this.fetchVerified(sharedFolderId, relativePath, entry);
+    if (fetched === 'same') return 'same';
+    if (fetched === null) return 'failed';
+    const written = await this.writeConflictCopy(fetched.state, relativePath, fetched.plaintext);
+    if (written) {
+      this.deps.notify.keptOlderClientVersion(relativePath);
+      return 'kept';
+    }
+    return 'failed';
+  }
+
+  /**
+   * Everything a download does short of writing: the skip and budget
+   * decisions, the fetch, the key, and verification. `same` when the local
+   * file already holds these bytes, null when nothing may or could be fetched.
+   */
+  private async fetchVerified(
+    sharedFolderId: string,
+    relativePath: string,
+    entry: BlobEntry,
+  ): Promise<{ state: FolderState; fullPath: string; plaintext: Uint8Array } | 'same' | null> {
     const state = this.folders.get(sharedFolderId);
-    if (!state) return false;
+    if (!state) return null;
 
     const fullPath = `${state.localPath}/${relativePath}`;
     const keys = this.deps.folderKeys(sharedFolderId);
-    if (!keys) return false;
+    if (!keys) return null;
 
     // A decision this device already made — either it crashed opening this, or
     // the user said no. Either way, not again until they ask for it.
     const device = this.deps.deviceState();
-    if (device?.isSkipped(sharedFolderId, relativePath)) return false;
+    if (device?.isSkipped(sharedFolderId, relativePath)) return null;
 
     // Already holding exactly these bytes — checked without reading the file
     // into memory.
     if ((await this.hashLocal(fullPath, entry.chunkSize)) === entry.hash) {
       state.lastSyncedHash.set(relativePath, entry.hash);
-      return false;
+      return 'same';
     }
 
     // Above what this device believes it can handle, ask before trying. Below
@@ -363,7 +410,7 @@ export class BlobSync {
       const proceed = await this.deps.notify.confirmLargeDownload(relativePath, entry.size);
       if (!proceed) {
         await device.decline(sharedFolderId, relativePath, entry.size);
-        return false;
+        return null;
       }
       // Nothing to clear on consent: this branch is only reached when the file
       // is *not* already skipped, so there is no refusal on record. The ceiling
@@ -389,7 +436,7 @@ export class BlobSync {
       const ciphertext = await this.get(sharedFolderId, entry.blobId, state.abort.signal);
       if (!ciphertext) {
         if (learner) await learner.endAttempt();
-        return false;
+        return null;
       }
 
       const raw = keys.contentKeys.get(entry.keyId);
@@ -397,7 +444,7 @@ export class BlobSync {
         log.warn('No key generation for attachment; leaving the local file alone', {
           relativePath, keyId: entry.keyId,
         });
-        return false;
+        return null;
       }
       const blobKey = await importContentKey(await decrypt(raw, fromBase64(entry.wrappedKey)));
       plaintext = await openBlob(blobKey, entry.blobId, ciphertext, {
@@ -416,7 +463,7 @@ export class BlobSync {
       // We are still running, so this was not a kill. Clearing it stops the
       // next launch mistaking an ordinary failure for a crash.
       if (learner) await learner.endAttempt();
-      return false;
+      return null;
     }
 
     if (learner) {
@@ -427,10 +474,9 @@ export class BlobSync {
       await learner.recordSuccess(entry.size);
     }
 
-    if (!this.folders.has(sharedFolderId)) return false; // unmapped mid-download
+    if (!this.folders.has(sharedFolderId)) return null; // unmapped mid-download
 
-    await this.writeLocal(state, relativePath, fullPath, plaintext, entry.hash, entry.chunkSize);
-    return true;
+    return { state, fullPath, plaintext };
   }
 
   /**
@@ -469,12 +515,12 @@ export class BlobSync {
     state.lastSyncedHash.set(relativePath, hash);
   }
 
-  /** Local bytes about to be replaced or removed, kept beside the file. */
+  /** Bytes about to be replaced, removed or refused, kept beside the file. */
   private async writeConflictCopy(
     state: FolderState,
     relativePath: string,
     bytes: Uint8Array,
-  ): Promise<void> {
+  ): Promise<boolean> {
     const stamp = new Date().toISOString().replace(/[:.]/g, '-');
     const dot = relativePath.lastIndexOf('.');
     const base = dot > 0 ? relativePath.slice(0, dot) : relativePath;
@@ -483,8 +529,10 @@ export class BlobSync {
     try {
       await this.vault.createBinary(target, bytes);
       log.warn('Kept a conflicting local attachment', { path: target });
+      return true;
     } catch (err) {
       log.error('Could not write conflict copy', { path: target, error: String(err) });
+      return false;
     }
   }
 

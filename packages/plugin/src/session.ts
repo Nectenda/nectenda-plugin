@@ -387,10 +387,11 @@ export async function recoverAndReset(
 // Nectenda Cloud
 //
 // On the hosted service the passphrase is local-only, always. It derives the
-// master key that wraps the identity keypair and nothing else: no
-// authentication hash is ever derived from it, and nothing derived from it is
-// sent anywhere. Identity is proved separately, at accounts.nectenda.com. The
-// key material itself lives there rather than on a sync server because one
+// master key, whose HKDF output wraps the identity keypair: no authentication
+// hash or verifier is ever derived from it or sent. Identity is proved
+// separately, at accounts.nectenda.com. What the identity service does hold is
+// the private key wrapped under that passphrase-derived key — ciphertext, but
+// open to offline guessing by whoever holds a copy. The key material itself lives there rather than on a sync server because one
 // person may belong to organisations on several servers and has one keypair.
 // ---------------------------------------------------------------------------
 
@@ -425,7 +426,7 @@ export async function cloudSetPassphrase(
  *
  * Entirely local. The parameters are already in `keyMaterial`, so a wrong
  * passphrase is answered by AES-GCM failing its tag here rather than by any
- * server — nothing derived from it is ever sent, which is why retrying costs no
+ * server — checking a guess sends nothing at all, which is why retrying costs no
  * round trip and why no server-side limiter sees an attempt.
  */
 export async function cloudUnlock(password: string, keyMaterial: CloudKeyMaterial): Promise<SessionKeys> {

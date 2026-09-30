@@ -1,6 +1,7 @@
 import { IndexeddbPersistence } from 'y-indexeddb';
 import { loadSeqCheckpoint, saveSeqCheckpoint } from './seq-checkpoint';
 import * as Y from 'yjs';
+import { applyMinimalDiff } from './text-merge';
 import type { Awareness } from 'y-protocols/awareness';
 import type { DocIndex } from './doc-index';
 import type { FolderMapping } from './folder-mapping';
@@ -10,54 +11,14 @@ import type { SyncProvider } from './provider-router';
 import { idbStoreName } from './idb-name';
 import { log } from './logger';
 import { seedDocument } from './seed-update';
+import { backupLocalFile } from './local-backup';
 
 const WRITE_DEBOUNCE = 500;
-/** Dot-prefixed so Obsidian hides it from the file explorer by default. */
-const BACKUP_FOLDER = '.nectenda-backups';
 /** Backoff step when the local file does not exist yet; multiplied by attempt. */
 const WRITE_RETRY_DELAY = 400;
 const MAX_WRITE_RETRIES = 5;
 const BATCH_SIZE = 5;
 const BATCH_DELAY = 200;
-
-/**
- * Apply a minimal diff to a Y.Text to preserve CRDT character identities.
- * Instead of delete-all + insert-all (which creates tombstones that destroy
- * concurrent changes), this finds the common prefix/suffix and only modifies
- * the changed region.
- */
-function applyMinimalDiff(ydoc: Y.Doc, ytext: Y.Text, oldStr: string, newStr: string): void {
-  // Find common prefix
-  let prefixLen = 0;
-  const minLen = Math.min(oldStr.length, newStr.length);
-  while (prefixLen < minLen && oldStr[prefixLen] === newStr[prefixLen]) {
-    prefixLen++;
-  }
-
-  // Find common suffix (not overlapping with prefix)
-  let suffixLen = 0;
-  while (
-    suffixLen < (minLen - prefixLen) &&
-    oldStr[oldStr.length - 1 - suffixLen] === newStr[newStr.length - 1 - suffixLen]
-  ) {
-    suffixLen++;
-  }
-
-  const deleteStart = prefixLen;
-  const deleteCount = oldStr.length - prefixLen - suffixLen;
-  const insertText = newStr.slice(prefixLen, newStr.length - suffixLen);
-
-  if (deleteCount === 0 && insertText.length === 0) return;
-
-  ydoc.transact(() => {
-    if (deleteCount > 0) {
-      ytext.delete(deleteStart, deleteCount);
-    }
-    if (insertText.length > 0) {
-      ytext.insert(deleteStart, insertText);
-    }
-  });
-}
 
 /**
  * One document's sync state.
@@ -560,47 +521,45 @@ export class ContentSync {
     }
   }
 
-  /**
-   * Copy local content aside before a first sync overwrites it.
-   *
-   * Timestamped so repeated conflicts cannot collide, and kept inside the vault
-   * so Obsidian can open it. The folder is dot-prefixed, which keeps it out of
-   * the file explorer by default without hiding it from search or the file
-   * system.
-   */
-  private async backupLocalFile(
-    localPath: string,
-    content: string,
-    reason = 'First sync found different content on both sides — backed up the local copy',
-  ): Promise<void> {
-    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-    // A backup that overwrites a backup is a lost version, which is the exact
-    // thing this function exists to prevent. `toISOString` is millisecond
-    // granular, so two backups of one path inside the same millisecond produced
-    // the same path and the second silently replaced the first — and that is
-    // not hypothetical: it happens on every run of the test below, which is why
-    // "checks once per connection" could not fail. Suffix rather than a finer
-    // clock: the guarantee wanted here is "never overwrite", and asking the
-    // vault is the only thing that actually promises it.
-    let backupPath = `${BACKUP_FOLDER}/${stamp}/${localPath}`;
-    for (let n = 2; this.vault.exists(backupPath); n++) {
-      const dot = localPath.lastIndexOf('.');
-      const slash = localPath.lastIndexOf('/');
-      const [stem, ext] = dot > slash ? [localPath.slice(0, dot), localPath.slice(dot)] : [localPath, ''];
-      backupPath = `${BACKUP_FOLDER}/${stamp}/${stem} (${n})${ext}`;
-    }
+  /** See `local-backup.ts`. A method so the call sites below stay as they were. */
+  private backupLocalFile(localPath: string, content: string, reason?: string): Promise<void> {
+    return backupLocalFile(this.vault, localPath, content, reason);
+  }
 
-    try {
-      const dir = backupPath.slice(0, backupPath.lastIndexOf('/'));
-      await this.vault.createFolder(dir);
-      await this.vault.write(backupPath, content);
-      log.warn(reason, { path: localPath, backup: backupPath });
-    } catch (err) {
-      log.error('Failed to back up local content before first sync', {
-        path: localPath,
-        error: String(err),
+  /**
+   * Told whenever a file's content has been taken into its document, so the
+   * record of unbound editors' edits can drop what that content already holds
+   * (NEC-159, `PendingEdits.adopted`). Otherwise an edit saved by Obsidian,
+   * taken in here, and replayed by the next bind would be typed twice.
+   */
+  private adoptedText: (path: string, text: string) => void = () => undefined;
+
+  setOnAdopted(listener: (path: string, text: string) => void): void {
+    this.adoptedText = listener;
+  }
+
+  /**
+   * Keep an editor's text aside when a bind could not replay what was typed
+   * into it exactly (NEC-159, SAFE-B5): the editor was reloaded under the
+   * typing, or the document had moved too far to place it. The bind is about
+   * to set the editor from the document, so the text goes to
+   * `.nectenda-backups/`, never lost.
+   */
+  backupEditorText(docName: string, content: string): Promise<void> {
+    const state = this.fileDocs.get(docName);
+    if (!state) {
+      // The bind acquired this document a moment ago, so this should not
+      // happen — and if it does, the text must not vanish without a word.
+      log.error('Could not back up the editor: its document is no longer open', {
+        docName, bytes: content.length,
       });
+      return Promise.resolve();
     }
+    return this.backupLocalFile(
+      state.localPath,
+      content,
+      'The editor held text that could not be merged exactly while it bound — backed up the editor',
+    );
   }
 
   /**
@@ -874,6 +833,7 @@ export class ContentSync {
         });
         applyMinimalDiff(state.ydoc, state.ytext, current, disk);
         state.lastSyncedContent = disk;
+        this.adoptedText(state.localPath, disk);
       };
 
       // With a known baseline the answer is exact. If the file still matches
@@ -907,7 +867,10 @@ export class ContentSync {
         // another vault seeded this and the content was since deleted, and that
         // deletion wins. Recording a baseline then would tell the write path the
         // file is safe to blank.
-        if (outcome !== 'already-present') state.lastSyncedContent = disk;
+        if (outcome !== 'already-present') {
+          state.lastSyncedContent = disk;
+          this.adoptedText(state.localPath, disk);
+        }
         return;
       }
 
@@ -986,6 +949,7 @@ export class ContentSync {
         // A destructive delete-all + insert-all would create tombstones
         // that destroy concurrent changes from other clients.
         applyMinimalDiff(state.ydoc, state.ytext, current, content);
+        this.adoptedText(state.localPath, content);
       }
     } catch (err) {
       log.error('Failed to read file for sync', { path: state.localPath, error: String(err) });
@@ -1086,7 +1050,7 @@ export class ContentSync {
       // the document is unconfirmed; past that point an empty document is
       // taken as a real deletion and honoured — but the local copy is put
       // aside first. "The server says this document is empty" has already
-      // once meant "this vault failed to upload it" (#15), and the cost is
+      // once meant "this vault failed to upload it", and the cost is
       // asymmetric: a spurious backup costs a file, a missed one costs
       // someone's writing.
       if (content === '' && diskContent !== '') {
@@ -1118,7 +1082,8 @@ export class ContentSync {
         // Under an identity derived from the content, so that another vault
         // doing exactly this at exactly this moment authors the same operation
         // rather than a second copy of the same words.
-        await seedDocument(state.ydoc, state.docName, content);
+        const outcome = await seedDocument(state.ydoc, state.docName, content);
+        if (outcome !== 'already-present') this.adoptedText(state.localPath, content);
       }
     } catch (err) {
       log.error('Failed to seed content', { path: state.localPath, error: String(err) });

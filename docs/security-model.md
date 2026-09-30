@@ -29,6 +29,7 @@ more than it should about where to push on a system nobody has audited yet.
 | Note and folder *paths* | **No** — document ids are HMACs of the path |
 | Attachment content | **No** — sealed in a chunked AEAD envelope |
 | Attachment filenames | **No** — they live inside the encrypted listing |
+| Structured file content and names | **No** — a file merged key by key (no format uses this yet) is a document like a note: the same ciphertext, an HMAC id, and its name inside the encrypted listing |
 | Your passphrase | **No** — on the hosted service, never sent in any form; a self-hosted server receives an independent derivation that cannot yield the key |
 | Your private key | **No** — stored wrapped, unwrappable only by your password |
 | Folder display names | **No** — sealed under the folder's content key |
@@ -41,14 +42,18 @@ more than it should about where to push on a system nobody has audited yet.
 The keys never reach it.
 
 **Your passphrase never leaves the device.** It is stretched with PBKDF2-SHA256
-at 600,000 iterations into a master key. That key is never sent and never
-stored. On the **hosted service no hash or verifier of it is sent either**: you
-sign in by a code to your email, a passkey, or a provider account, and the
-passphrase is used only to unwrap your keys locally. The one thing the hosted
-service holds that the passphrase bears on is your private key, **wrapped**
-under a key derived from it: ciphertext, the same as the copy in your vault,
-and open to offline guessing by whoever holds a copy (see "Guessing the
-passphrase is limited by the passphrase" below). A
+at 600,000 iterations into a master key. That key is never sent or stored in
+the clear: it is kept only sealed under your recovery key (see "Recovery
+material" below). On the **hosted service no hash or verifier of it
+is sent either**: you sign in by a code to your email, a passkey, or a provider
+account, and the passphrase is used only to unwrap your keys locally. What the
+hosted service holds that the passphrase bears on is your private key,
+**wrapped** under a key derived from it: ciphertext, the same as the copy in
+your vault, and open to offline guessing by whoever holds a copy (see "Guessing
+the passphrase is limited by the passphrase" below). **Earlier wrappings are
+kept**: when you change your passphrase, the private key wrapped under the old
+one is retained rather than deleted, so an old passphrase stays as guessable
+against it as the current one is against the current copy. A
 **self-hosted server** uses the passphrase as its login password too, by split
 derivation: it receives a *second, independent* derivation, which cannot be used
 to derive the encryption key, and bcrypts even that before storing it, because
@@ -74,8 +79,9 @@ no such thing as a folder whose name the server can read.
 followed by `HMAC-SHA256(nameKey, relativePath)` truncated to 16 bytes. The
 server cannot reverse it and therefore never learns your folder structure or
 note titles. The name key is wrapped to members like any other folder secret,
-and is deliberately separate from the content key so that rotating content keys
-does not rewrite every id in the log.
+and is deliberately separate from the content key so that rotating content keys, when
+that exists (it does not yet; see "What we do not claim"), would not rewrite
+every id in the log.
 
 **Content is encrypted before it is pushed.** Each update is sealed with
 AES-256-GCM, IV prepended, 28 bytes of overhead. Attachments use a chunked
@@ -94,8 +100,9 @@ key instead. You would be sharing with the operator, and everything would look
 normal.
 
 **The defence is fingerprint comparison, and it requires you to act.** The
-folder members screen shows a fingerprint for every member and for you. Compare
-them
+folder members screen shows a fingerprint for every member and for you, to
+every member of the folder — owners and editors alike, since a comparison takes
+both people. Compare them
 with your collaborators through any channel that is not this server — in person,
 a phone call, a different messenger. If they match, no key was substituted.
 
@@ -104,6 +111,41 @@ verification, and it carries the same caveat: **it only works if somebody
 checks.** Until then the guarantee holds against an operator who reads, not one
 who interferes.
 
+**What the client does without being asked.** Each vault remembers the key it
+first shared a folder with for each collaborator, by email address, and **refuses
+a different key for the same person later**. It shares nothing and shows a warning
+that stays on screen until dismissed. Nectenda replaces a person's keypair in one
+case only: they lost both the passphrase and the recovery key, and asked to
+**start over**. That request is emailed to the address and waits seven days,
+and any device still signed in can cancel it. Only then does the address get a
+new account with a new key. A support restore can later swap the old account
+back, which changes the key a second time. So a changed key means either
+somebody started over or a server is substituting its own, and a person should
+decide which. Asking them, outside Nectenda, settles it. The wait is also why
+someone who takes over a mailbox cannot quietly swap in a key: the owner's own
+signed-in device tells them and lets them stop it. An open vault asks at least
+hourly, and also when its window is focused again while its session is fresh, so one left
+running for days still hears. The people list shows
+each fingerprint as "not compared yet" or "compared" with a date, and "Mark as
+compared" is also how you accept a changed key once you have checked it.
+`packages/plugin/src/known-keys.ts` holds the rule.
+
+This makes one thing stronger and leaves one thing as it was. A substitution
+*after* a first honest share is now caught. A substitution on the *first* share
+is not: the first key seen for someone is trusted because it is first, as SSH
+trusts a host. Comparing fingerprints is still what rules that out.
+
+**Sharing happens automatically, and that changes when it happens, not what is
+trusted.** When you invite someone to a folder before they have an account, the
+server makes them a member once they join. The next time one of your devices is
+open, and holds that folder's key, it wraps the key to the public key the server
+returns, applying the rule above, and tells you with the fingerprint.
+`packages/plugin/src/key-grants.ts` is the whole of it. It runs only for folders
+you own, only with keys already open on that device, and never asks for your
+passphrase. This is the same trust decision the members dialog always made when
+you pressed Add. The difference is that it happens later, with a notice instead
+of you watching it happen.
+
 ## What is not encrypted
 
 Stated plainly, because a security document that only lists strengths is
@@ -111,6 +153,14 @@ marketing.
 
 - **The membership graph.** Which accounts share which folders, and when they
   were added.
+- **Invitations to a folder.** When an owner invites an address that has no
+  seat yet straight to a folder, the server records the folder id, the address,
+  the role, who invited them and when, and later who claimed it. It holds no key
+  and no name: the invitation makes the person a member once they join, and the
+  folder key still reaches them only as a wrap an owner's device makes to their
+  public key — the step the fingerprint comparison above defends. Only hosted
+  servers accept these, because a claim matches on an address the identity
+  service verified.
 - **Account and identity records.** Username and email, account, plan, and role.
 - **Device records.** A device id, a label, and the platform string, with
   first- and last-seen timestamps. The label a vault sends for itself is
@@ -144,9 +194,14 @@ marketing.
   the server and relayed to everyone else with the note open. Its contents are
   sealed under the folder's content key and bound to that note, that
   participant and that moment, so the server can neither read a state nor move
-  it to another note. It is padded to a multiple of 512 bytes, so its length
-  does not show whether your editor has focus or what moved (a very long canvas
-  selection does still show that it is long). What the server does see is that a device has the
+  it to another note. It is padded to a multiple of 512 bytes (1024 on a
+  canvas, whose states are larger), so its length does not show whether your
+  editor has focus, whether you are typing in a canvas card, or what moved (a
+  very long canvas selection, or a drag of many cards at once, does still show
+  that it is long). On an open canvas the same sealed state carries where your pointer
+  is on the board, what you have selected, where your caret is in a card you
+  are typing in, and a drag or connection you have not dropped yet — none of
+  it readable by the server. What the server does see is that a device has the
   note open (it knows that from the subscription anyway), and when and how
   often that device's presence changes. That rate can tell typing apart from
   moving a pointer. Hiding it would need cover traffic, which Nectenda does not
@@ -185,6 +240,17 @@ marketing.
   `packages/shared/src/scrub.ts`, and it is tested by planting a forbidden
   string and confirming it does not arrive. If readable content ever appeared
   in a report, that would be an incident, not a policy question.
+- **Usage metrics, which we keep internally.** To see how the service is
+  used, we copy some of the metadata listed above to a machine of our own and
+  keep its history there: sign-up and sign-in method, how far each sign-in
+  got (including ones abandoned before an address was typed), organisation and folder
+  membership, device platforms and last-seen days, per-folder update counts,
+  attachment counts and usage totals. People appear there under a random
+  identifier, not their email or name. None of it touches content, paths,
+  folder names or keys, because the server has none of those to give. It is
+  read through a read-only credential that cannot change anything. The
+  server keeps nothing extra for it: every figure is one this list already
+  says the server has.
 - **Error reports from the plugin**, when you are signed in to the hosted
   service and have not turned them off. This is the one thing on this list the
   client sends about itself, so it is worth being exact.
@@ -257,8 +323,15 @@ someone has read, they have.
   the same thing and should not be presented as if it were.
 - **No forward secrecy for stored history.** The append-only log is encrypted
   under the folder's current content key generation. Someone who obtains a
-  content key and a copy of the log can read the history that key covers. Key
-  rotation limits the window; it does not erase the past. The server also
+  content key and a copy of the log can read the history that key covers.
+  Content keys are not rotated today: a folder keeps its first key for its
+  whole life, including after a member is removed, so a removed member's copy
+  of the key would still open anything they could get hold of. What stops them
+  is the server no longer serving them, except that an attachment download
+  link it was already given stays valid for that link's lifetime, an hour by
+  default. Rotation is provided for in the key
+  format; even then it would limit the window, and it does not erase the past.
+  The server also
   keeps earlier whole-document versions of each note, still as ciphertext
   under whichever key generation wrote them, so that edit history survives
   the log being compacted. Those are kept until the note or its folder is
@@ -335,7 +408,8 @@ Worth checking, in rough order of value:
 3. **That the server's copy is unreadable.** If you self-host, attach to your
    own server's database and read the stored update payloads. They are opaque
    without a folder key.
-4. **That fingerprints match** what your collaborator sees.
+4. **That fingerprints match** what your collaborator sees, and that you have
+   never seen the warning that a collaborator's key changed.
 
 ### That the file you installed is the source you read
 

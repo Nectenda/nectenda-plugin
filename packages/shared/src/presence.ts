@@ -54,9 +54,22 @@ export type Viewport =
 export type Selection = { surface: 'canvas' | 'excalidraw'; ids: string[] };
 
 /**
+ * A gesture in progress on a canvas, drawn by peers as a ghost before it is
+ * committed (WIRE-094). A drag or resize carries the nodes' live rectangles;
+ * a connection being drawn carries its start and where its loose end is.
+ * Nothing here is in the document: the gesture's end commits it there, once.
+ */
+export type GestureRect = { id: string; x: number; y: number; w: number; h: number };
+export type Gesture =
+  | { surface: 'canvas'; kind: 'move' | 'resize'; nodes: GestureRect[] }
+  | { surface: 'canvas'; kind: 'connect'; from: string; side?: string; x: number; y: number };
+
+/**
  * The state as written. `cursor` is y-codemirror's and keeps its shape and
  * name, because y-codemirror reads it by that name; this type only says it is
- * there. Text surfaces keep using it rather than `selection`.
+ * there. Text surfaces keep using it rather than `selection`. On a canvas it is
+ * the caret inside the card being typed in, in the same shape: its relative
+ * positions name that card's `Y.Text` (WIRE-095).
  */
 export interface PresenceV1 {
   v: number;
@@ -65,6 +78,8 @@ export interface PresenceV1 {
   pointer: Pointer | null;
   viewport: Viewport | null;
   selection: Selection | null;
+  /** Optional on the wire: absent reads as null, and a client older than it ignores it. */
+  gesture: Gesture | null;
 }
 
 const isObject = (v: unknown): v is Record<string, unknown> =>
@@ -127,6 +142,29 @@ function readSelection(v: unknown): Selection | null {
   return { surface: v.surface, ids: [...v.ids] };
 }
 
+function readRect(v: unknown): GestureRect | null {
+  if (!isObject(v)) return null;
+  const { id, x, y, w, h } = v;
+  if (!isStr(id) || !isNum(x) || !isNum(y) || !isNum(w) || !isNum(h)) return null;
+  return { id, x, y, w, h };
+}
+
+function readGesture(v: unknown): Gesture | null {
+  if (!isObject(v) || v.surface !== 'canvas') return null;
+  if (v.kind === 'move' || v.kind === 'resize') {
+    if (!Array.isArray(v.nodes)) return null;
+    const nodes = v.nodes.map(readRect);
+    if (nodes.some((n) => n === null)) return null;
+    return { surface: 'canvas', kind: v.kind, nodes: nodes as GestureRect[] };
+  }
+  if (v.kind === 'connect') {
+    if (!isStr(v.from) || !isNum(v.x) || !isNum(v.y)) return null;
+    if (v.side !== undefined && !isStr(v.side)) return null;
+    return { surface: 'canvas', kind: 'connect', from: v.from, x: v.x, y: v.y, ...(isStr(v.side) ? { side: v.side } : {}) };
+  }
+  return null;
+}
+
 /**
  * Read an opened presence state into the fields this version understands.
  *
@@ -143,5 +181,6 @@ export function readPresence(state: unknown): PresenceV1 | null {
     pointer: readPointer(state.pointer),
     viewport: readViewport(state.viewport),
     selection: readSelection(state.selection),
+    gesture: readGesture(state.gesture),
   };
 }

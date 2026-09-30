@@ -3,15 +3,18 @@ import { IndexeddbPersistence } from 'y-indexeddb';
 import { loadSeqCheckpoint, saveSeqCheckpoint } from './seq-checkpoint';
 import * as Y from 'yjs';
 import { META_DOC_SUFFIX } from '@nectenda/shared';
-import type { FileEntry, BlobEntry } from '@nectenda/shared';
-import { BLOBS_MAP_KEY, LISTING_MAP_KEY, LISTING_VERSION } from '@nectenda/shared';
-import { kindOf } from './blob-policy';
+import type { FileEntry, BlobEntry, StructuredEntry } from '@nectenda/shared';
+import { BLOBS_MAP_KEY, LISTING_MAP_KEY, LISTING_VERSION, STRUCTURED_MAP_KEY } from '@nectenda/shared';
+import { kindOf, type FileKind } from './blob-policy';
 import { joinWithin } from './vault-path';
 import type { BlobSync } from './blob-sync';
 import type { DocIndex } from './doc-index';
 import type { SyncProvider } from './provider-router';
 import type { VaultAdapter } from './vault-adapter';
 import type { ContentSync } from './content-sync';
+import type { StructuredSync } from './structured-sync';
+import { codecForFormat, codecForPath, STRUCTURED_FORMATS, type StructuredCodec } from './structured-formats';
+import { writeConflictCopy } from './local-backup';
 import { idbStoreName } from './idb-name';
 import { log } from './logger';
 
@@ -32,6 +35,11 @@ interface MetaConnection {
    * read, which is the only protection that works on a client already shipped.
    */
   bmap: Y.Map<BlobEntry>;
+  /**
+   * Structured files, under a third root, by the same argument as `bmap`: a
+   * client that predates the kind never reads it and cannot act on it.
+   */
+  smap: Y.Map<StructuredEntry>;
   idbProvider: IndexeddbPersistence;
 }
 
@@ -55,6 +63,11 @@ export interface FileSyncDeps {
   vaultKey(): string;
   /** Attachment sync, once it exists. Null before then, and callers check. */
   blobSync(): BlobSync | null;
+  /**
+   * Structured formats by extension. Production omits it and gets
+   * `STRUCTURED_FORMATS`; tests pass their own codec.
+   */
+  structuredFormats?: Readonly<Record<string, StructuredCodec>>;
 }
 
 export class FileSync {
@@ -62,6 +75,7 @@ export class FileSync {
   private vault: VaultAdapter;
   private provider: SyncProvider;
   private contentSync: ContentSync | null = null;
+  private structuredSync: StructuredSync | null = null;
   /** Serialises create/delete per path. See sequence(). */
   private pathChain: Map<string, Promise<void>> = new Map();
   /**
@@ -76,6 +90,11 @@ export class FileSync {
    */
   private remoteCreates: Set<string> = new Set();
   private connections: Map<string, MetaConnection> = new Map();
+  /**
+   * Folders whose listing could not be placed on a connection, by local path,
+   * held so `retryUnplaced` can try again when one appears.
+   */
+  private unplaced: Map<string, string> = new Map();
   private folderReadyListeners: ((sharedFolderId: string) => void)[] = [];
 
   constructor(deps: FileSyncDeps, provider: SyncProvider, vault: VaultAdapter) {
@@ -86,6 +105,32 @@ export class FileSync {
 
   setContentSync(contentSync: ContentSync): void {
     this.contentSync = contentSync;
+  }
+
+  setStructuredSync(structuredSync: StructuredSync): void {
+    this.structuredSync = structuredSync;
+  }
+
+  private get formats(): Readonly<Record<string, StructuredCodec>> {
+    return this.deps.structuredFormats ?? STRUCTURED_FORMATS;
+  }
+
+  /**
+   * What a path in a folder is, for the watcher.
+   *
+   * The listing decides before the name does. A path already listed as
+   * structured stays structured even when this build has no codec for it — a
+   * newer member shared it in a format this one cannot read — because reading
+   * it by its name instead would upload it as an attachment and fork it.
+   */
+  classify(sharedFolderId: string, relativePath: string): FileKind {
+    const conn = this.connections.get(sharedFolderId);
+    // Listed as text wins over listed as structured, as `placeStructured`
+    // decides: two roots claiming a path must not put two writers on it, and
+    // the watcher must reach the same verdict or it reconnects what was refused.
+    if (conn?.ymap.has(relativePath) && kindOf(relativePath, this.formats) !== 'ignore') return 'text';
+    if (conn?.smap.has(relativePath)) return 'structured';
+    return kindOf(relativePath, this.formats);
   }
 
   /**
@@ -131,6 +176,7 @@ export class FileSync {
     const ydoc = new Y.Doc();
     const ymap = ydoc.getMap<FileEntry>('files');
     const bmap = ydoc.getMap<BlobEntry>(BLOBS_MAP_KEY);
+    const smap = ydoc.getMap<StructuredEntry>(STRUCTURED_MAP_KEY);
 
     const idbProvider = new IndexeddbPersistence(idbStoreName(this.deps.vaultKey(), docName), ydoc);
 
@@ -141,7 +187,11 @@ export class FileSync {
       //
       // A subscribe that throws (the folder has no route to a server yet) used
       // to escape as an unhandled rejection: no listing, no observer, and no
-      // line anywhere saying so. Logged now; the outcome is unchanged.
+      // line anywhere saying so. Then it was logged, and still never retried,
+      // so a folder added the moment before its organisation's connection
+      // opened stayed empty for the rest of the session. Now the half-built
+      // listing is torn down and the folder waits for `retryUnplaced`, which
+      // the router's `routes-changed` calls when a connection appears.
       try {
         this.provider.subscribe(docName, ydoc, {
           load: () => loadSeqCheckpoint(idbProvider, ydoc),
@@ -149,10 +199,15 @@ export class FileSync {
         });
       } catch (err) {
         log.warn('Could not subscribe the folder listing', { sharedFolderId, error: String(err) });
+        void idbProvider.destroy().catch((e: unknown) => {
+          log.warn('IndexedDB teardown failed', { error: String(e) });
+        });
+        ydoc.destroy();
+        this.unplaced.set(sharedFolderId, localPath);
         return;
       }
 
-      const conn: MetaConnection = { sharedFolderId, localPath, ydoc, ymap, bmap, idbProvider };
+      const conn: MetaConnection = { sharedFolderId, localPath, ydoc, ymap, bmap, smap, idbProvider };
       this.connections.set(sharedFolderId, conn);
       log.debug('Folder listing subscribed', { sharedFolderId, listed: ymap.size });
 
@@ -195,6 +250,11 @@ export class FileSync {
         void this.handleRemoteBlobChanges(conn, event);
       });
 
+      smap.observe((event, transaction) => {
+        if (transaction.origin === LOCAL_ORIGIN) return;
+        this.handleRemoteStructuredChanges(conn, event);
+      });
+
       // Initial sync once provider is connected
       const onSync = () => {
         this.provider.off(`synced:${docName}`, onSync);
@@ -219,7 +279,24 @@ export class FileSync {
     }
   }
 
+  /**
+   * Folder listings that could not be placed on a connection, tried again
+   * now that one may have appeared. Through `connectFolder`, so the key check
+   * applies exactly as on a first connect.
+   */
+  retryUnplaced(): void {
+    if (this.unplaced.size === 0) return;
+    const pending = [...this.unplaced];
+    this.unplaced.clear();
+    log.info('Retrying folder listings that had no connection', { count: pending.length });
+    for (const [sharedFolderId, localPath] of pending) this.connectFolder(sharedFolderId, localPath);
+  }
+
   disconnectFolder(sharedFolderId: string): void {
+    // A folder that is let go of is not retried later: an unmapped folder
+    // coming back when some unrelated connection opened would be a folder
+    // syncing that nobody asked for.
+    this.unplaced.delete(sharedFolderId);
     const conn = this.connections.get(sharedFolderId);
     if (!conn) return;
 
@@ -328,13 +405,51 @@ export class FileSync {
   ): Promise<void> {
     for (const [key, change] of event.changes.keys) {
       const entry = conn.bmap.get(key);
+
+      // A path that has become structured. Only a client that predates that
+      // still writes its attachment entry, and what it writes cannot merge into
+      // the structured document — so it is kept beside the file, never written
+      // over it and never dropped (SAFE-A17). Its deletion is not honoured
+      // either: the structured listing is the authority for this path now, and
+      // keeping a file somebody deleted costs a file.
+      if (conn.smap.has(key)) {
+        if (change.action === 'delete') {
+          log.info('An older client removed the attachment entry of a structured file; keeping the file', {
+            relativePath: key,
+          });
+        } else if (entry) {
+          this.keepAttachmentVersion(conn, key, entry);
+        }
+        continue;
+      }
+
       if (change.action === 'delete') {
+        // Structured by name: the structured listing decides whether this file
+        // goes, even once its own entry has already gone. A vault that deletes
+        // a file it adopted removes both entries, and they arrive here together
+        // — the provider merges back-to-back updates — so the structured entry
+        // is already absent by now. The attachment engine would compare the
+        // file with bytes it last synced before adoption, find every edit
+        // since, and keep the lot as a conflict copy of a deleted file.
+        if (this.structuredSync && kindOf(key, this.formats) === 'structured') {
+          log.debug('Attachment entry of a structured file removed; the structured listing decides', {
+            relativePath: key,
+          });
+          continue;
+        }
         this.sequence(conn.sharedFolderId, key, () =>
           this.deps.blobSync()?.removeLocal(conn.sharedFolderId, key) ?? Promise.resolve(),
         );
         continue;
       }
       if (!entry) continue;
+
+      // Structured by name, listed only as an attachment: an older client made
+      // it. Adopt it into the structured listing, keeping the attachment entry.
+      if (this.structuredSync && kindOf(key, this.formats) === 'structured') {
+        this.migrateAttachment(conn, key, entry);
+        continue;
+      }
 
       // Refuse a path claimed by both maps rather than racing two writers at
       // one file. The classifier partitions the namespace by extension, so this
@@ -397,6 +512,224 @@ export class FileSync {
     const conn = this.connections.get(sharedFolderId);
     if (!conn) return [];
     return [...conn.bmap.entries()];
+  }
+
+  /** Whether the folder lists this path as structured. */
+  isStructuredListed(sharedFolderId: string, relativePath: string): boolean {
+    return this.connections.get(sharedFolderId)?.smap.has(relativePath) ?? false;
+  }
+
+  getStructuredEntry(sharedFolderId: string, relativePath: string): StructuredEntry | undefined {
+    return this.connections.get(sharedFolderId)?.smap.get(relativePath);
+  }
+
+  /** List a structured file. False when the listing is not open yet. */
+  setStructuredEntry(sharedFolderId: string, relativePath: string, entry: StructuredEntry): boolean {
+    const conn = this.connections.get(sharedFolderId);
+    if (!conn) return false;
+    conn.ydoc.transact(() => conn.smap.set(relativePath, entry), LOCAL_ORIGIN);
+    return true;
+  }
+
+  removeStructuredEntry(sharedFolderId: string, relativePath: string): boolean {
+    const conn = this.connections.get(sharedFolderId);
+    if (!conn?.smap.has(relativePath)) return false;
+    conn.ydoc.transact(() => conn.smap.delete(relativePath), LOCAL_ORIGIN);
+    return true;
+  }
+
+  /** Move a structured entry, in one transaction so peers see a rename. */
+  renameStructuredEntry(sharedFolderId: string, from: string, to: string): boolean {
+    const conn = this.connections.get(sharedFolderId);
+    const entry = conn?.smap.get(from);
+    if (!conn || !entry) return false;
+    conn.ydoc.transact(() => {
+      conn.smap.delete(from);
+      conn.smap.set(to, entry);
+    }, LOCAL_ORIGIN);
+    return true;
+  }
+
+  /** The entry for a local structured file, from what is on disk. */
+  structuredEntryFor(localFilePath: string, relativePath: string, blobHash?: string): StructuredEntry | null {
+    const codec = codecForPath(relativePath, this.formats);
+    if (!codec) return null;
+    const stat = this.vault.stat(localFilePath) ?? { size: 0, mtime: Date.now() };
+    return blobHash ? { ...stat, format: codec.format, blobHash } : { ...stat, format: codec.format };
+  }
+
+  /**
+   * Structured files appearing, vanishing or renamed in the listing — the text
+   * path's handling, for the third root.
+   */
+  private handleRemoteStructuredChanges(conn: MetaConnection, event: Y.YMapEvent<StructuredEntry>): void {
+    const structuredSync = this.structuredSync;
+    if (!structuredSync) return;
+    const added: string[] = [];
+    const deleted: string[] = [];
+    for (const [key, change] of event.changes.keys) {
+      if (change.action === 'add') added.push(key);
+      else if (change.action === 'delete') deleted.push(key);
+      // 'update' is a changed entry for the same path — a newer stat, or a
+      // recorded attachment hash. Nothing on disk follows from it.
+    }
+
+    if (deleted.length === 1 && added.length === 1) {
+      const from = deleted[0];
+      const to = added[0];
+      const fromLocal = joinWithin(conn.localPath, from);
+      const toLocal = joinWithin(conn.localPath, to);
+      if (!fromLocal || !toLocal) {
+        log.warn('Refused a rename whose name leaves the folder', { folder: conn.sharedFolderId });
+        return;
+      }
+      if (this.vault.isFile(fromLocal)) {
+        this.vault.rename(fromLocal, toLocal).catch((err: unknown) => {
+          log.error(`Failed to rename ${fromLocal} → ${toLocal}:`, err);
+        });
+        // `fill: false`: the vault that renamed it fills the new document.
+        // This copy may be the staler one, and two fills collide.
+        structuredSync.moveFile(conn.sharedFolderId, conn.localPath, from, to, conn.smap.get(to)?.format, {
+          fill: false,
+        });
+        return;
+      }
+    }
+
+    if (added.length > 0) {
+      void this.deps.docIndex
+        .warm(conn.sharedFolderId, added)
+        .then(() => {
+          for (const key of added) this.placeStructured(conn, key);
+        })
+        .catch((err: unknown) => {
+          log.warn('Could not act on newly listed structured files', {
+            sharedFolderId: conn.sharedFolderId, count: added.length, error: String(err),
+          });
+        });
+    }
+
+    for (const key of deleted) {
+      this.sequence(conn.sharedFolderId, key, () =>
+        this.completeRemoteDeletion(conn.sharedFolderId, conn.localPath, key),
+      );
+    }
+  }
+
+  /** Make a listed structured file exist here and follow it. */
+  private placeStructured(conn: MetaConnection, key: string): void {
+    const structuredSync = this.structuredSync;
+    if (!structuredSync) return;
+    // Two roots claiming one path would put two writers on one file. The text
+    // listing is the older and wins; this one is refused, out loud.
+    if (conn.ymap.has(key)) {
+      log.error('Path listed as both text and structured; ignoring the structured entry', {
+        relativePath: key,
+      });
+      return;
+    }
+    const localFilePath = joinWithin(conn.localPath, key);
+    if (!localFilePath) {
+      log.warn('Refused a shared file whose name leaves the folder', { folder: conn.sharedFolderId });
+      return;
+    }
+    const format = conn.smap.get(key)?.format;
+    // A format this build cannot read: say so, and create nothing. An empty
+    // placeholder would look like the file, emptied (SAFE-A16).
+    if (format !== undefined && !codecForFormat(format, this.formats)) {
+      structuredSync.connectFile(conn.sharedFolderId, conn.localPath, key, format);
+      return;
+    }
+    if (!this.vault.exists(localFilePath)) {
+      this.sequence(conn.sharedFolderId, key, () =>
+        this.createLocalFile(conn.sharedFolderId, key, localFilePath, () =>
+          structuredSync.connectFile(conn.sharedFolderId, conn.localPath, key, format),
+        ),
+      );
+    } else {
+      structuredSync.connectFile(conn.sharedFolderId, conn.localPath, key, format);
+    }
+  }
+
+  /**
+   * Adopt an attachment as a structured file (step one of a format's
+   * migration). The attachment entry stays: a client that predates the kind
+   * still reads it, and removing it would read to that client as a deletion
+   * and trash the file there (SAFE-A17). It goes when the file is deleted or
+   * renamed (VaultWatcher's `forgetAttachmentEntry`), or this would adopt it
+   * back on the next connect. The file is downloaded first when
+   * this vault does not have it, so the structured document is filled from the
+   * attachment's content rather than from nothing.
+   */
+  private migrateAttachment(conn: MetaConnection, key: string, entry: BlobEntry): void {
+    if (conn.smap.has(key) || conn.ymap.has(key)) return;
+    const localFilePath = joinWithin(conn.localPath, key);
+    if (!localFilePath) return;
+    this.sequence(conn.sharedFolderId, key, async () => {
+      // Only a file this vault did not have is known to hold the attachment's
+      // bytes afterwards, so only then is its version recorded as carried
+      // across. A file already here may differ, and is compared by
+      // `keepAttachmentVersion` instead of being assumed equal.
+      let carried: string | undefined;
+      if (!this.vault.exists(localFilePath)) {
+        // Marked as the listing's own create, so the watcher follows the file
+        // rather than listing it itself — without the hash only this knows.
+        const marker = `${conn.sharedFolderId}\u0000${key}`;
+        this.remoteCreates.add(marker);
+        try {
+          const wrote = await this.deps.blobSync()?.download(conn.sharedFolderId, key, entry);
+          if (wrote) carried = entry.hash;
+        } finally {
+          window.setTimeout(() => this.remoteCreates.delete(marker), 0);
+        }
+      }
+      if (!this.vault.isFile(localFilePath)) return;
+      const already = conn.smap.get(key);
+      if (already) {
+        // Listed meanwhile, by another vault. Record what was carried, which
+        // that vault could not know about this copy.
+        if (carried && !already.blobHash) {
+          conn.ydoc.transact(() => conn.smap.set(key, { ...already, blobHash: carried }), LOCAL_ORIGIN);
+        }
+        return;
+      }
+      const listed = this.structuredEntryFor(localFilePath, key, carried);
+      if (!listed) return;
+      conn.ydoc.transact(() => conn.smap.set(key, listed), LOCAL_ORIGIN);
+      log.info('Adopted an attachment as a structured file', { relativePath: key, format: listed.format });
+      await this.deps.docIndex.warm(conn.sharedFolderId, [key]);
+      this.structuredSync?.connectFile(conn.sharedFolderId, conn.localPath, key, listed.format);
+      if (!carried) this.keepAttachmentVersion(conn, key, entry);
+    });
+  }
+
+  /**
+   * An attachment version of a structured file that has not been kept yet:
+   * written by a client that predates the kind, after the file became
+   * structured. Downloaded beside the file as a conflict copy, once — the hash
+   * is recorded on the structured entry so a restart does not copy it again.
+   */
+  private keepAttachmentVersion(conn: MetaConnection, key: string, entry: BlobEntry): void {
+    const listed = conn.smap.get(key);
+    if (!listed || listed.blobHash === entry.hash) return;
+    this.sequence(conn.sharedFolderId, key, async () => {
+      const blobSync = this.deps.blobSync();
+      if (!blobSync) return;
+      const current = conn.smap.get(key);
+      if (!current || current.blobHash === entry.hash) return;
+      const outcome = await blobSync.keepAsConflictCopy(conn.sharedFolderId, key, entry);
+      // Recorded for `same` as well: the file already holds exactly these
+      // bytes, which is as kept as it gets. A failure leaves the hash
+      // unrecorded, so the next start tries again rather than forgetting it.
+      if (outcome !== 'failed') {
+        conn.ydoc.transact(() => conn.smap.set(key, { ...current, blobHash: entry.hash }), LOCAL_ORIGIN);
+      }
+      if (outcome === 'kept') {
+        log.warn('An older client changed a structured file; kept its version as a conflict copy', {
+          relativePath: key,
+        });
+      }
+    });
   }
 
   private applyAdditions(conn: MetaConnection, added: string[]): void {
@@ -473,6 +806,7 @@ export class FileSync {
     }
 
     this.contentSync?.disconnectFile(sharedFolderId, relativePath);
+    this.structuredSync?.disconnectFile(sharedFolderId, relativePath);
   }
 
   private async preserveThenTrash(
@@ -511,29 +845,24 @@ export class FileSync {
     relativePath: string,
     localFilePath: string,
   ): Promise<void> {
-    if (!this.contentSync) return;
-
     const docName = this.deps.docIndex.refSync(sharedFolderId, relativePath);
     if (!docName) return;
-    const unsynced = await this.contentSync.unsyncedLocalContent(docName);
+    // Whichever engine holds the document knows whether the file has work the
+    // network has not seen. A path is one kind, so at most one of them does.
+    const engine = this.contentSync?.hasDoc(docName)
+      ? this.contentSync
+      : this.structuredSync?.hasDoc(docName) ? this.structuredSync : null;
+    if (!engine) return;
+    const unsynced = await engine.unsyncedLocalContent(docName);
     if (unsynced === null) return; // Disk matched the synced document; nothing at risk.
 
-    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-    const dot = localFilePath.lastIndexOf('.');
-    const base = dot === -1 ? localFilePath : localFilePath.slice(0, dot);
-    const ext = dot === -1 ? '' : localFilePath.slice(dot);
-    const copyPath = `${base} (conflicted copy ${stamp})${ext}`;
-
-    try {
-      await this.vault.create(copyPath, unsynced);
-      log.warn('Remote deletion would have discarded local edits — saved a conflict copy', {
-        original: localFilePath,
-        copy: copyPath,
-      });
-      new Notice(`Nectenda: "${relativePath}" was deleted elsewhere. Your changes were saved as a conflict copy.`);
-    } catch (err) {
-      log.error('Failed to save conflict copy', { path: copyPath, error: String(err) });
-    }
+    const copyPath = await writeConflictCopy(this.vault, localFilePath, unsynced);
+    if (!copyPath) return;
+    log.warn('Remote deletion would have discarded local edits — saved a conflict copy', {
+      original: localFilePath,
+      copy: copyPath,
+    });
+    new Notice(`Nectenda: "${relativePath}" was deleted elsewhere. Your changes were saved as a conflict copy.`);
   }
 
   /** Whether this path is being created on the folder listing's instruction. */
@@ -541,11 +870,27 @@ export class FileSync {
     return this.remoteCreates.has(`${sharedFolderId}\u0000${relativePath}`);
   }
 
-  private async createLocalFileWithContent(
+  private createLocalFileWithContent(
     sharedFolderId: string,
     folderLocalPath: string,
     relativePath: string,
     localFilePath: string,
+  ): Promise<void> {
+    return this.createLocalFile(sharedFolderId, relativePath, localFilePath, () =>
+      this.contentSync?.connectFile(sharedFolderId, folderLocalPath, relativePath),
+    );
+  }
+
+  /**
+   * Create an empty placeholder for a listed file, then hand it to the engine
+   * that will fill it. Shared by text and structured files; `connect` is the
+   * only part that differs.
+   */
+  private async createLocalFile(
+    sharedFolderId: string,
+    relativePath: string,
+    localFilePath: string,
+    connect: () => void,
   ): Promise<void> {
     const marker = `${sharedFolderId}\u0000${relativePath}`;
     this.remoteCreates.add(marker);
@@ -569,7 +914,7 @@ export class FileSync {
         await this.vault.create(localFilePath, '');
       }
 
-      this.contentSync?.connectFile(sharedFolderId, folderLocalPath, relativePath);
+      connect();
     } catch (err) {
       log.error(`Failed to create ${localFilePath}:`, err);
     } finally {
@@ -620,7 +965,61 @@ export class FileSync {
       }
     }
 
+    await this.initialStructuredSync(conn);
     await this.initialBlobSync(conn);
+  }
+
+  /**
+   * Reconcile structured files once, on connect: list local ones the listing
+   * lacks, adopt attachments whose format is now structured, place what the
+   * listing names, and keep any attachment version an older client wrote.
+   *
+   * Before the attachment sweep, deliberately: a path adopted here must be in
+   * the structured listing by the time that sweep asks, or it would be
+   * uploaded as an attachment again.
+   */
+  private async initialStructuredSync(conn: MetaConnection): Promise<void> {
+    const structuredSync = this.structuredSync;
+    if (!structuredSync) return;
+
+    // Local structured files the listing has never heard of — new ones, and
+    // attachments this build now reads as structured. Their attachment entry,
+    // if any, is left exactly where it is (SAFE-A17). Its hash is deliberately
+    // not recorded here: the file on disk may differ from it, and recording it
+    // would mark that version kept without anyone having compared the bytes.
+    // The sweep at the end compares, and records it once it has.
+    const enrolled: Array<[string, StructuredEntry]> = [];
+    for (const path of this.vault.listFiles(conn.localPath)) {
+      const relPath = path.slice(conn.localPath.length + 1);
+      if (kindOf(relPath, this.formats) !== 'structured') continue;
+      if (conn.smap.has(relPath)) continue;
+      if (conn.ymap.has(relPath)) {
+        log.error('Path listed as text but named as structured; leaving it as text', { relativePath: relPath });
+        continue;
+      }
+      const entry = this.structuredEntryFor(path, relPath);
+      if (entry) enrolled.push([relPath, entry]);
+    }
+    if (enrolled.length > 0) {
+      conn.ydoc.transact(() => {
+        for (const [relPath, entry] of enrolled) conn.smap.set(relPath, entry);
+      }, LOCAL_ORIGIN);
+    }
+
+    // Attachments of a structured format that this vault does not have at all:
+    // download, then adopt.
+    for (const [relPath, entry] of conn.bmap.entries()) {
+      if (conn.smap.has(relPath) || conn.ymap.has(relPath)) continue;
+      if (kindOf(relPath, this.formats) !== 'structured') continue;
+      this.migrateAttachment(conn, relPath, entry);
+    }
+
+    await this.deps.docIndex.warm(conn.sharedFolderId, Array.from(conn.smap.keys()));
+    for (const relPath of conn.smap.keys()) this.placeStructured(conn, relPath);
+
+    for (const [relPath, entry] of conn.bmap.entries()) {
+      if (conn.smap.has(relPath)) this.keepAttachmentVersion(conn, relPath, entry);
+    }
   }
 
   /**
@@ -640,7 +1039,8 @@ export class FileSync {
     // Local attachments the listing has never heard of.
     for (const path of this.vault.listFiles(conn.localPath)) {
       const relPath = path.slice(conn.localPath.length + 1);
-      if (kindOf(relPath) !== 'blob') continue;
+      if (kindOf(relPath, this.formats) !== 'blob') continue;
+      if (conn.smap.has(relPath)) continue; // structured in the listing, whatever its name
       if (listed.has(relPath)) continue;
       blobSync.scheduleUpload(conn.sharedFolderId, relPath);
     }
@@ -650,6 +1050,9 @@ export class FileSync {
     // and it never overwrites a differing local file without a conflict copy.
     for (const [relPath, entry] of conn.bmap.entries()) {
       if (conn.ymap.has(relPath)) continue; // refused elsewhere as ambiguous
+      // Structured now: handled above, as a migration or a kept version, and
+      // never written over the file.
+      if (conn.smap.has(relPath) || kindOf(relPath, this.formats) === 'structured') continue;
       this.sequence(conn.sharedFolderId, relPath, () =>
         blobSync.download(conn.sharedFolderId, relPath, entry).then(() => undefined),
       );

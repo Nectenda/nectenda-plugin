@@ -2,6 +2,7 @@ import type { Membership, PendingInvite, SignInResult } from './auth-flow';
 import { ShardClient, IdentityError, type DeviceFields, type ShardSession } from './identity-client';
 import { log } from './logger';
 import { serverFetch } from './client-version.js';
+import { apiBaseUrl } from '@nectenda/shared';
 
 /**
  * What the plugin keeps about a Nectenda Cloud sign-in, and how it turns an
@@ -9,7 +10,7 @@ import { serverFetch } from './client-version.js';
  *
  * Nothing here is a secret the identity service does not already hold, except
  * the tokens, which the caller keeps in the secret store. The passphrase and
- * anything derived from it never pass through this module.
+ * the keys derived from it never pass through this module.
  */
 
 /** The signed-in person. Tokens are held separately, in the secret store. */
@@ -133,6 +134,69 @@ export async function establishMemberships(
     }
   }
   return { memberships: out, unreachable };
+}
+
+/**
+ * Add this device to the roster of every organisation it has only just
+ * learned it belongs to.
+ *
+ * A background refresh deliberately never enrols: a slot freed for one device
+ * must not go to whichever other device happens to refresh next. But that
+ * rule is about seats this vault already knew, where "not enrolled" is a
+ * standing somebody chose. A seat this vault has never seen is a different
+ * case. The person joined the organisation somewhere else — accepted an
+ * invitation on their laptop while their phone was signed in — and this
+ * device has never been offered it. Leaving it unenrolled left the phone
+ * adding the shared folder, asking for the passphrase, saying the folder was
+ * mapped, and then syncing nothing, with no word of why.
+ *
+ * One request per new seat, with that seat's own token, rather than a
+ * refresh with `enrol: true`: the session route enrols in every organisation
+ * on the server at once, which would also re-add this device wherever it was
+ * taken off. Anything that fails leaves the seat as it was; a refused seat
+ * comes back with the server's count, for the caller to report.
+ */
+export async function enrolNewSeats(
+  memberships: StoredMembership[],
+  previous: Pick<StoredMembership, 'id'>[],
+  device: DeviceFields,
+  fetchFn: typeof fetch = (input, init) => serverFetch(input, init),
+): Promise<{ memberships: StoredMembership[]; added: string[]; refused: StoredMembership[] }> {
+  const known = new Set(previous.map((p) => p.id));
+  const added: string[] = [];
+  const refused: StoredMembership[] = [];
+  const out: StoredMembership[] = [];
+  for (const m of memberships) {
+    const offered = !known.has(m.id) && m.device?.enrolled === false && m.device.reason === 'NOT_ENROLLED' && !!m.token && !!device.deviceId;
+    if (!offered) { out.push(m); continue; }
+    try {
+      const res = await fetchFn(`${apiBaseUrl(m.endpoint)}/account/devices`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${m.token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify(device),
+      });
+      const body = (await res.json().catch(() => ({}))) as { slots?: { used?: number; max?: number }; code?: string };
+      const used = body.slots?.used ?? m.device!.used;
+      const max = body.slots?.max ?? m.device!.max;
+      if (res.ok) {
+        out.push({ ...m, device: { enrolled: true, used, max } });
+        added.push(m.id);
+        log.info('Added this device to an organisation it has just joined', { membershipId: m.id, used, max });
+      } else if (res.status === 409) {
+        const next: StoredMembership = { ...m, device: { enrolled: false, used, max, reason: body.code ?? 'DEVICE_LIMIT' } };
+        out.push(next);
+        refused.push(next);
+        log.warn('An organisation this device has just joined has no free device slot', { membershipId: m.id, used, max });
+      } else {
+        out.push(m);
+        log.warn('Could not add this device to an organisation it has just joined', { membershipId: m.id, status: res.status });
+      }
+    } catch (err) {
+      out.push(m);
+      log.warn('Could not add this device to an organisation it has just joined', { membershipId: m.id, error: String(err) });
+    }
+  }
+  return { memberships: out, added, refused };
 }
 
 /** The membership list a sign-in result or `/api/me` carries, as the plugin stores it. */

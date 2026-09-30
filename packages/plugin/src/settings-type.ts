@@ -3,6 +3,8 @@ import type { FolderMapping } from './folder-mapping';
 import type { PendingInvite } from './auth-flow';
 import type { StoredFolderKeys } from './folder-crypto';
 import type { KeyMaterial, KdfParams, UserRole } from '@nectenda/shared';
+import type { KnownKeys } from './known-keys';
+import type { PendingRelease } from './start-over';
 
 /**
  * What the plugin persists, and what it starts with.
@@ -50,6 +52,14 @@ export interface NectendaSettings {
   memberships: StoredMembership[];
   /** Invitations addressed to this identity's email, shown in settings and the header icon. */
   pendingInvites: PendingInvite[];
+  /**
+   * A request to start this account over, as the identity service last
+   * reported it. Shown on every signed-in device so any of them can cancel it
+   * (start-over.ts); cleared at sign-out with the rest of the account.
+   */
+  pendingRelease: PendingRelease | null;
+  /** Which request the notice was last raised for, so it is raised once per request. */
+  announcedReleaseAt?: number;
   /**
    * When the recovery key was confirmed saved. The modal that shows it cannot
    * be dismissed any other way, because the key is shown once and a
@@ -208,6 +218,30 @@ export interface NectendaSettings {
    * file travels with the vault.
    */
   secrets: Record<string, string>;
+  /**
+   * Collaborators' key fingerprints this vault has shared a folder with, by
+   * address. A different key for the same person is refused rather than used;
+   * see `known-keys.ts`. Not secret — fingerprints of public keys — and kept
+   * across sign-outs, because forgetting them would quietly re-trust whatever
+   * key the server offers next.
+   */
+  knownKeys: KnownKeys;
+  /**
+   * Shared folders already offered to this vault, or already listed when the
+   * offer first ran, so each newly shared folder is offered once. Null until
+   * the first complete look; see `awaiting-folders.ts`.
+   */
+  offeredFolders: string[] | null;
+  /** The "Get started" list was closed. It also goes by itself once the essentials are done. */
+  getStartedDismissed: boolean;
+  /**
+   * Where the Nectenda status icon is shown. The same icon and menu in each;
+   * at least one is always on. The status bar is ignored on a phone, which
+   * has none.
+   */
+  statusIn: { header: boolean; ribbon: boolean; statusBar: boolean };
+  /** Settings were opened once on a first run, so it is not done again. */
+  welcomed: boolean;
 }
 
 export const DEFAULT_SETTINGS: NectendaSettings = {
@@ -218,6 +252,7 @@ export const DEFAULT_SETTINGS: NectendaSettings = {
   refreshToken: '',
   memberships: [],
   pendingInvites: [],
+  pendingRelease: null,
   recoveryKeyAcknowledgedAt: null,
   publishedVaultLabel: '',
   // Empty, not a localhost address. A cloud vault never sets this, so a
@@ -248,5 +283,10 @@ export const DEFAULT_SETTINGS: NectendaSettings = {
   errorReportDsn: '',
   folderKeys: {},
   secrets: {},
+  knownKeys: {},
+  offeredFolders: null,
+  getStartedDismissed: false,
+  statusIn: { header: true, ribbon: true, statusBar: false },
+  welcomed: false,
 };
 

@@ -29,3 +29,42 @@ export class SingleFlight<T> {
     return p;
   }
 }
+
+/**
+ * What a session refresh does beyond rotating the tokens. A full one also
+ * re-establishes every organisation's session and restarts sync; a token-only
+ * one stores the new tokens and nothing else.
+ */
+export type RefreshKind = 'full' | 'token';
+
+/**
+ * The session refresh's gate: still one refresh token presented at a time,
+ * but a caller that needs a full refresh never takes a token-only one for it.
+ *
+ * Joining is safe one way only. Anyone may join a full refresh, since it
+ * rotates the tokens too. A caller wanting a full refresh that finds a
+ * token-only one under way waits for it and then runs its own: the token-only
+ * one re-established nothing, and a caller told it had would skip the work it
+ * came for. It runs after, not beside, because the two would present the same
+ * refresh token and end the session.
+ */
+export class RefreshGate {
+  private inflight: { kind: RefreshKind; p: Promise<boolean> } | null = null;
+
+  get pending(): boolean {
+    return this.inflight !== null;
+  }
+
+  async run(kind: RefreshKind, fn: () => Promise<boolean>): Promise<boolean> {
+    while (this.inflight) {
+      const current = this.inflight;
+      if (kind === 'token' || current.kind === 'full') return current.p;
+      await current.p.catch(() => undefined);
+    }
+    const p = fn().finally(() => {
+      if (this.inflight?.p === p) this.inflight = null;
+    });
+    this.inflight = { kind, p };
+    return p;
+  }
+}

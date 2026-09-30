@@ -1,4 +1,4 @@
-import { addIcon, MarkdownView, Menu, type App } from 'obsidian';
+import { addIcon, MarkdownView, Menu, setIcon, type App } from 'obsidian';
 import type { FileStatusView } from './file-status-indicator';
 
 /** The connection states the plugin reports, as `updateStatus` receives them. */
@@ -39,17 +39,29 @@ export interface HeaderInput {
   /** People other than this device with the note open. */
   others: number;
   invites: number;
+  /** Folders already shared with this person, ready to add here. Absent counts as none. */
+  readyFolders?: number;
+  /** "3 folders syncing in this vault", for the tooltip. Absent leaves the line out. */
+  foldersLine?: string | null;
 }
 
 export interface HeaderState {
   tone: HeaderTone;
   /** For the tooltip and `aria-label`: the whole status, in words. */
   label: string;
-  /** Text for the corner badge, or null for none. */
+  /** The number at the bottom right: other people in the note. Null for none. */
   badge: string | null;
+  /**
+   * The dot at the top right: something is waiting for this person —
+   * an invitation, or a folder shared with them. Independent of the badge,
+   * so a number always means people and the dot always means "for you".
+   */
+  waiting: boolean;
 }
 
-const PROBLEMS = new Set<ConnectionStatus>(['device-limit', 'suspended', 'update-required', 'signed-out']);
+/** States that need the person to do something, not just wait. */
+export const PROBLEM_CONNECTIONS = new Set<ConnectionStatus>(['device-limit', 'suspended', 'update-required', 'signed-out']);
+const PROBLEMS = PROBLEM_CONNECTIONS;
 const AWAY = new Set<ConnectionStatus>(['disconnected', 'offline', 'restarting', 'moving']);
 
 export function headerState(input: HeaderInput): HeaderState {
@@ -61,7 +73,9 @@ export function headerState(input: HeaderInput): HeaderState {
   else if (connection === 'idle') tone = 'idle';
   else if (!note || note.status === 'confirmed') tone = 'ok';
   else if (note.status === 'error') tone = 'problem';
-  else if (note.status === 'offline') tone = 'offline';
+  // Untracked reads as offline, not busy: nothing is moving and nothing will
+  // until the note connects, and the accent said otherwise.
+  else if (note.status === 'offline' || note.status === 'untracked') tone = 'offline';
   else tone = 'busy';
 
   const lines = [`Nectenda: ${CONNECTION_LABELS[connection]}`];
@@ -69,11 +83,14 @@ export function headerState(input: HeaderInput): HeaderState {
   if (others === 1) lines.push('1 other person has this note open');
   else if (others > 1) lines.push(`${others} other people have this note open`);
   if (invites > 0) lines.push(`${invites} invitation${invites === 1 ? '' : 's'} waiting`);
+  const ready = input.readyFolders ?? 0;
+  if (ready > 0) lines.push(`${ready} folder${ready === 1 ? '' : 's'} shared with you, ready to add`);
+  if (input.foldersLine) lines.push(input.foldersLine);
 
   // Others only, and nothing at all when it is just you: a number should
   // always mean somebody else is here.
   const badge = others > 0 ? (others > 9 ? '9+' : String(others)) : null;
-  return { tone, label: lines.join('\n'), badge };
+  return { tone, label: lines.join('\n'), badge, waiting: invites + ready > 0 };
 }
 
 /**
@@ -93,19 +110,65 @@ export function countOthers(people: ReadonlyArray<{ name: string }>, broadcastNa
 export type HeaderMenuItem =
   | { kind: 'label'; title: string }
   | { kind: 'toggle'; id: 'share-pointer' | 'show-pointers'; title: string; checked: boolean }
-  | { kind: 'action'; id: 'inspect' | 'settings'; title: string }
+  | { kind: 'action'; id: 'inspect' | 'settings' | 'shared-with-you' | 'folder-settings' | 'invite'; title: string }
+  | { kind: 'person'; name: string; title: string }
   | { kind: 'separator' };
 
-export function headerMenu(state: HeaderState, pointers: { share: boolean; show: boolean }, inSharedFolder: boolean): HeaderMenuItem[] {
+/** What the menu needs beyond the state: the same for all three places the icon appears. */
+export interface MenuContext {
+  pointers: { share: boolean; show: boolean };
+  /** The note is in a folder this vault syncs; `owner` when this account owns that folder. */
+  folder: { owner: boolean } | null;
+  /** Other people in the note, by name. */
+  people: string[];
+  /** Invitations plus folders shared with you and ready to add. */
+  waiting: number;
+}
+
+/**
+ * The icon's menu. One list for the note header, the ribbon and the status
+ * bar, so whichever a person keeps, it does the same things.
+ */
+export function headerMenu(state: HeaderState, ctx: MenuContext): HeaderMenuItem[] {
   const items: HeaderMenuItem[] = [];
   for (const line of state.label.split('\n')) items.push({ kind: 'label', title: line });
+  if (ctx.people.length) {
+    items.push({ kind: 'separator' });
+    for (const name of ctx.people) items.push({ kind: 'person', name, title: `Go to ${name}` });
+  }
+  if (ctx.waiting > 0) {
+    items.push({ kind: 'separator' });
+    items.push({ kind: 'action', id: 'shared-with-you', title: `Shared with you: ${ctx.waiting} waiting…` });
+  }
+  if (ctx.folder) {
+    items.push({ kind: 'separator' });
+    items.push({ kind: 'action', id: 'folder-settings', title: 'Folder settings…' });
+    if (ctx.folder.owner) items.push({ kind: 'action', id: 'invite', title: 'Invite to folder…' });
+    items.push({ kind: 'action', id: 'inspect', title: 'Inspect sync state' });
+  }
   items.push({ kind: 'separator' });
-  items.push({ kind: 'toggle', id: 'share-pointer', title: 'Share my mouse pointer', checked: pointers.share });
-  items.push({ kind: 'toggle', id: 'show-pointers', title: "Show collaborators' mouse pointers", checked: pointers.show });
+  items.push({ kind: 'toggle', id: 'share-pointer', title: 'Share my mouse pointer', checked: ctx.pointers.share });
+  items.push({ kind: 'toggle', id: 'show-pointers', title: "Show collaborators' mouse pointers", checked: ctx.pointers.show });
   items.push({ kind: 'separator' });
-  if (inSharedFolder) items.push({ kind: 'action', id: 'inspect', title: 'Inspect sync state' });
   items.push({ kind: 'action', id: 'settings', title: 'Open Nectenda settings' });
   return items;
+}
+
+/** Where the status icon is shown. At least one is always on; see `mayHide`. */
+export interface StatusPlaces {
+  header: boolean;
+  ribbon: boolean;
+  statusBar: boolean;
+}
+
+/**
+ * Whether a place may be switched off: not when it is the last one showing.
+ * `available` says which places this platform has — a phone has no status
+ * bar, so one switched on in a synced settings file does not count there.
+ */
+export function mayHide(places: StatusPlaces, which: keyof StatusPlaces, available: StatusPlaces = { header: true, ribbon: true, statusBar: true }): boolean {
+  const shown = (Object.keys(places) as Array<keyof StatusPlaces>).filter((k) => places[k] && available[k]);
+  return !(shown.length === 1 && shown[0] === which);
 }
 
 export const HEADER_ICON = 'nectenda-mark';
@@ -130,14 +193,25 @@ export interface HeaderStatusDeps {
   connection(): ConnectionStatus;
   /** A fresh status lookup for this redraw. */
   statusIndex(): (path: string) => FileStatusView | null;
-  /** Others in the active note; the only note presence is known for. */
-  othersInActiveNote(): number;
+  /** Others in the active note, by name; the only note presence is known for. */
+  peopleInActiveNote(): string[];
   invites(): number;
+  readyFolders(): number;
+  foldersLine(): string | null;
+  /** The shared folder a note is in, or null; `owner` when this account owns it. */
+  folderFor(path: string): { owner: boolean } | null;
+  places(): StatusPlaces;
   pointers(): { share: boolean; show: boolean };
   setSharePointer(on: boolean): Promise<void>;
   setShowPointers(on: boolean): Promise<void>;
   inspect(path: string): Promise<void>;
+  goToPerson(name: string): void;
+  openFolderSettings(path: string): void;
+  inviteToFolder(path: string): void;
+  openSharedWithYou(): void;
   openSettings(): void;
+  addRibbon(onClick: (evt: MouseEvent) => void): HTMLElement;
+  addStatusBar(): HTMLElement;
 }
 
 const TONE_CLASSES: Record<HeaderTone, string> = {
@@ -149,87 +223,153 @@ const TONE_CLASSES: Record<HeaderTone, string> = {
 };
 
 /**
- * The Nectenda icon at the top right of every open note.
+ * Draw the status onto one icon: tone, label, the people number and the
+ * waiting dot. The one function every place goes through, which is what keeps
+ * the note header, the ribbon and the status bar the same by construction.
  *
- * It replaced the status-bar text, which mobile never had: Obsidian on a phone
- * has no status bar, so a person there had no way to see whether anything was
- * syncing. One action per Markdown view, kept in a WeakMap so a closed view
- * takes its entry with it.
+ * Writes only what differs. The header sits under wherever the mouse happens
+ * to rest, and a page that changes under a still mouse gets a synthetic mouse
+ * move from Chromium — which the pointer sharing reads as the person pointing.
+ */
+export function renderIcon(el: HTMLElement, state: HeaderState): void {
+  for (const [tone, cls] of Object.entries(TONE_CLASSES)) {
+    if (el.hasClass(cls) !== (tone === state.tone)) el.toggleClass(cls, tone === state.tone);
+  }
+  if (el.getAttribute('aria-label') !== state.label) el.setAttribute('aria-label', state.label);
+  let badge = el.querySelector<HTMLElement>('.nectenda-header-badge');
+  if (state.badge) {
+    if (!badge) badge = el.createSpan({ cls: 'nectenda-header-badge' });
+    if (badge.textContent !== state.badge) badge.setText(state.badge);
+  } else {
+    badge?.remove();
+  }
+  const dot = el.querySelector('.nectenda-status-waiting');
+  if (state.waiting && !dot) el.createSpan({ cls: 'nectenda-status-waiting' });
+  else if (!state.waiting) dot?.remove();
+}
+
+/**
+ * The Nectenda status, in up to three places: each note's header, the ribbon
+ * and the status bar. Which are shown is the person's choice; all of them are
+ * the same icon, coloured the same, labelled the same, and open the same menu.
+ *
+ * The header icon describes its own note. The ribbon and the status bar
+ * describe the active note, or only the connection when no note is open —
+ * which is why they exist at all: a header needs a note.
+ *
+ * The header is there on every platform; a phone has no status bar, and keeps
+ * its ribbon in a menu.
  */
 export class HeaderStatus {
   private actions = new WeakMap<MarkdownView, HTMLElement>();
   private views = new Set<MarkdownView>();
+  private ribbon: HTMLElement | null = null;
+  private statusBar: HTMLElement | null = null;
 
   constructor(private deps: HeaderStatusDeps) {}
+
+  /** Create or remove each place to match the settings, then draw. */
+  apply(): void {
+    const places = this.deps.places();
+    if (!places.header) this.stopHeaders();
+    if (places.ribbon && !this.ribbon) {
+      this.ribbon = this.deps.addRibbon((evt) => this.openMenu(evt, this.activePath()));
+      this.ribbon.addClass('nectenda-status-icon');
+    } else if (!places.ribbon && this.ribbon) {
+      this.ribbon.remove();
+      this.ribbon = null;
+    }
+    if (places.statusBar && !this.statusBar) {
+      const el = this.deps.addStatusBar();
+      el.addClass('nectenda-status-icon', 'nectenda-status-bar', 'mod-clickable');
+      setIcon(el, HEADER_ICON);
+      el.addEventListener('click', (evt) => this.openMenu(evt, this.activePath()));
+      this.statusBar = el;
+    } else if (!places.statusBar && this.statusBar) {
+      this.statusBar.remove();
+      this.statusBar = null;
+    }
+    this.refresh();
+  }
+
+  private activePath(): string | null {
+    return this.deps.app.workspace.getActiveViewOfType(MarkdownView)?.file?.path ?? null;
+  }
+
+  private stateFor(path: string | null, others: string[], statusOf = this.deps.statusIndex()): HeaderState {
+    return headerState({
+      connection: this.deps.connection(),
+      note: path ? statusOf(path) : null,
+      others: others.length,
+      invites: this.deps.invites(),
+      readyFolders: this.deps.readyFolders(),
+      foldersLine: this.deps.foldersLine(),
+    });
+  }
 
   refresh(): void {
     const statusOf = this.deps.statusIndex();
     const active = this.deps.app.workspace.getActiveViewOfType(MarkdownView);
-    const live = new Set<MarkdownView>();
-    for (const leaf of this.deps.app.workspace.getLeavesOfType('markdown')) {
-      const view = leaf.view;
-      if (!(view instanceof MarkdownView)) continue;
-      live.add(view);
-      const path = view.file?.path ?? null;
-      const note = path ? statusOf(path) : null;
-      const state = headerState({
-        connection: this.deps.connection(),
-        note,
-        others: view === active ? this.deps.othersInActiveNote() : 0,
-        invites: this.deps.invites(),
-      });
-      this.render(view, state);
+    const people = this.deps.peopleInActiveNote();
+    if (this.deps.places().header) {
+      const live = new Set<MarkdownView>();
+      for (const leaf of this.deps.app.workspace.getLeavesOfType('markdown')) {
+        const view = leaf.view;
+        if (!(view instanceof MarkdownView)) continue;
+        live.add(view);
+        const path = view.file?.path ?? null;
+        this.renderHeader(view, this.stateFor(path, view === active ? people : [], statusOf));
+      }
+      // Views closed since the last redraw: the element went with them, but
+      // they must not be held.
+      for (const v of this.views) if (!live.has(v)) this.views.delete(v);
     }
-    // Views closed since the last redraw: nothing to remove, the element went
-    // with them, but they must not be held.
-    for (const v of this.views) if (!live.has(v)) this.views.delete(v);
+    if (this.ribbon || this.statusBar) {
+      const state = this.stateFor(active?.file?.path ?? null, people, statusOf);
+      if (this.ribbon) renderIcon(this.ribbon, state);
+      if (this.statusBar) renderIcon(this.statusBar, state);
+    }
   }
 
-  stop(): void {
+  private stopHeaders(): void {
     for (const view of this.views) this.actions.get(view)?.remove();
     this.views.clear();
     this.actions = new WeakMap();
   }
 
-  /**
-   * Writes only what differs, like the explorer marks. The header sits under
-   * wherever the mouse happens to rest, and a page that changes under a still
-   * mouse gets a synthetic mouse move from Chromium — which the pointer
-   * sharing reads as the person pointing. A redraw that rewrote identical
-   * attributes on every keystroke's status change was churn with a cost.
-   */
-  private render(view: MarkdownView, state: HeaderState): void {
+  stop(): void {
+    this.stopHeaders();
+    this.ribbon?.remove();
+    this.ribbon = null;
+    this.statusBar?.remove();
+    this.statusBar = null;
+  }
+
+  private renderHeader(view: MarkdownView, state: HeaderState): void {
     let el = this.actions.get(view);
     if (!el || !el.isConnected) {
-      el = view.addAction(HEADER_ICON, 'Nectenda', (evt) => this.openMenu(evt, view));
-      el.addClass('nectenda-header-status');
+      el = view.addAction(HEADER_ICON, 'Nectenda', (evt) => this.openMenu(evt, view.file?.path ?? null, view));
+      el.addClass('nectenda-header-status', 'nectenda-status-icon');
       this.actions.set(view, el);
       this.views.add(view);
     }
-    for (const [tone, cls] of Object.entries(TONE_CLASSES)) {
-      if (el.hasClass(cls) !== (tone === state.tone)) el.toggleClass(cls, tone === state.tone);
-    }
-    if (el.getAttribute('aria-label') !== state.label) el.setAttribute('aria-label', state.label);
-    let badge = el.querySelector<HTMLElement>('.nectenda-header-badge');
-    if (state.badge) {
-      if (!badge) badge = el.createSpan({ cls: 'nectenda-header-badge' });
-      if (badge.textContent !== state.badge) badge.setText(state.badge);
-    } else {
-      badge?.remove();
-    }
+    renderIcon(el, state);
   }
 
-  private openMenu(evt: MouseEvent, view: MarkdownView): void {
-    const path = view.file?.path ?? null;
-    const note = path ? this.deps.statusIndex()(path) : null;
-    const state = headerState({
-      connection: this.deps.connection(),
-      note,
-      others: view === this.deps.app.workspace.getActiveViewOfType(MarkdownView) ? this.deps.othersInActiveNote() : 0,
-      invites: this.deps.invites(),
-    });
+  /** The one menu, for any of the three places. `view` is set for a header icon, which speaks for its own note. */
+  private openMenu(evt: MouseEvent, path: string | null, view?: MarkdownView): void {
+    const active = this.deps.app.workspace.getActiveViewOfType(MarkdownView);
+    const people = !view || view === active ? this.deps.peopleInActiveNote() : [];
+    const state = this.stateFor(path, people);
+    const folder = path ? this.deps.folderFor(path) : null;
     const menu = new Menu();
-    for (const item of headerMenu(state, this.deps.pointers(), note !== null)) {
+    const items = headerMenu(state, {
+      pointers: this.deps.pointers(),
+      folder,
+      people,
+      waiting: this.deps.invites() + this.deps.readyFolders(),
+    });
+    for (const item of items) {
       if (item.kind === 'separator') {
         menu.addSeparator();
       } else if (item.kind === 'label') {
@@ -240,9 +380,17 @@ export class HeaderStatus {
             ? this.deps.setSharePointer(!item.checked)
             : this.deps.setShowPointers(!item.checked));
         }));
+      } else if (item.kind === 'person') {
+        menu.addItem((i) => i.setTitle(item.title).setIcon('user').onClick(() => this.deps.goToPerson(item.name)));
       } else {
-        menu.addItem((i) => i.setTitle(item.title).setIcon(item.id === 'inspect' ? 'activity' : 'settings').onClick(() => {
+        const icons: Record<typeof item.id, string> = {
+          inspect: 'activity', settings: 'settings', 'shared-with-you': 'inbox', 'folder-settings': 'folder-cog', invite: 'user-plus',
+        };
+        menu.addItem((i) => i.setTitle(item.title).setIcon(icons[item.id]).onClick(() => {
           if (item.id === 'inspect' && path) void this.deps.inspect(path);
+          else if (item.id === 'folder-settings' && path) this.deps.openFolderSettings(path);
+          else if (item.id === 'invite' && path) this.deps.inviteToFolder(path);
+          else if (item.id === 'shared-with-you') this.deps.openSharedWithYou();
           else if (item.id === 'settings') this.deps.openSettings();
         }));
       }

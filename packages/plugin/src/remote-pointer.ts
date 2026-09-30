@@ -255,18 +255,102 @@ export function caretsToDraw(
   const out: CaretToDraw[] = [];
   for (const [clientId, raw] of states) {
     if (clientId === ownClientId) continue;
-    const state = readPresence(raw);
-    const head = (state?.cursor as { head?: unknown } | null)?.head;
-    if (!state?.user || head == null) continue;
-    try {
-      const abs = Y.createAbsolutePositionFromRelativePosition(Y.createRelativePositionFromJSON(head), doc);
-      if (!abs || abs.type !== ytext) continue;
-      out.push({ clientId, index: abs.index, name: state.user.name, color: state.user.color });
-    } catch {
-      continue;
-    }
+    const caret = caretIn(raw, doc);
+    if (!caret || caret.type !== ytext) continue;
+    out.push({ clientId, index: caret.head, name: caret.name, color: caret.color });
   }
   return out.sort((a, b) => a.clientId - b.clientId);
+}
+
+/** A collaborator's selected text in one `Y.Text`: `from` before `to`, never empty. */
+export interface SelectionToDraw {
+  clientId: number;
+  from: number;
+  to: number;
+  /** Their colour at the alpha a note's selection is tinted with (`colorLight`). */
+  tint: string;
+}
+
+/**
+ * Other people's selections that lie in `ytext` — the other half of the
+ * `cursor` a caret is drawn from. A note gets these from y-codemirror; a
+ * canvas card draws its own (card-caret.ts, canvas-presence.ts). A bare
+ * caret is not a selection, and is not in this list.
+ */
+export function selectionsToDraw(
+  states: ReadonlyMap<number, unknown>,
+  ownClientId: number,
+  ytext: Y.Text,
+): SelectionToDraw[] {
+  const doc = ytext.doc;
+  if (!doc) return [];
+  const out: SelectionToDraw[] = [];
+  for (const [clientId, raw] of states) {
+    if (clientId === ownClientId) continue;
+    const caret = caretIn(raw, doc);
+    if (!caret || caret.type !== ytext || caret.anchor === caret.head) continue;
+    out.push({
+      clientId,
+      from: Math.min(caret.anchor, caret.head),
+      to: Math.max(caret.anchor, caret.head),
+      tint: caret.colorLight,
+    });
+  }
+  return out.sort((a, b) => a.clientId - b.clientId);
+}
+
+/**
+ * Where "go to" a collaborator lands in a note: their caret, since in text
+ * that is where they are working; their mouse pointer when they have no caret
+ * here (their window is not focused, and y-codemirror withdraws the caret
+ * then); null when they have neither in this note. The kind says whether it
+ * is an editing position — only a caret is worth putting ours at.
+ */
+export function goToInNote(
+  states: ReadonlyMap<number, unknown>,
+  ownClientId: number,
+  ytext: Y.Text,
+  name: string,
+): { index: number; kind: 'caret' | 'pointer' } | null {
+  const caret = caretsToDraw(states, ownClientId, ytext).find((c) => c.name === name);
+  if (caret) return { index: caret.index, kind: 'caret' };
+  const pointer = pointersToDraw(states, ownClientId, ytext).find((p) => p.name === name);
+  return pointer ? { index: pointer.index, kind: 'pointer' } : null;
+}
+
+/**
+ * Where one person's caret is in `doc`: the type it lies in, its head (where
+ * the caret is drawn) and its anchor (the other end of what they have
+ * selected), with who they are. Null for no caret, no user, or a head that does
+ * not resolve here. The type is what says which note — or which canvas card —
+ * the caret is in. An anchor that does not resolve into that same type is
+ * taken as the head: a caret with no selection, never an error.
+ */
+export function caretIn(
+  raw: unknown,
+  doc: Y.Doc,
+): { type: Y.AbstractType<unknown>; head: number; anchor: number; name: string; color: string; colorLight: string } | null {
+  const state = readPresence(raw);
+  const cursor = state?.cursor as { head?: unknown; anchor?: unknown } | null | undefined;
+  if (!state?.user || cursor?.head == null) return null;
+  const at = (rel: unknown): Y.AbsolutePosition | null => {
+    try {
+      return Y.createAbsolutePositionFromRelativePosition(Y.createRelativePositionFromJSON(rel), doc);
+    } catch {
+      return null;
+    }
+  };
+  const head = at(cursor.head);
+  if (!head) return null;
+  const anchor = cursor.anchor == null ? null : at(cursor.anchor);
+  return {
+    type: head.type,
+    head: head.index,
+    anchor: anchor?.type === head.type ? anchor.index : head.index,
+    name: state.user.name,
+    color: state.user.color,
+    colorLight: state.user.colorLight,
+  };
 }
 
 /**
@@ -417,8 +501,9 @@ export function fadeDelayMs(movedAt: number, now: number): number {
  * arrived already faded (NEC-112).
  *
  * A pane that is not bound to this note leaves the clock alone. The extension
- * is on every editor (SAFE-D5) but the clock is the bound pane's, and pruning it
- * from another pane would restart the fade of a pointer that stopped long ago.
+ * is installed in the bound editor only (SAFE-D5), so this is a second line of
+ * defence: the clock is the bound pane's, and pruning it from another pane
+ * would restart the fade of a pointer that stopped long ago.
  */
 export function pointersToMark(
   bound: boolean,
@@ -438,7 +523,7 @@ export function pointersToMark(
 
 type MarkerKind = 'pointer' | 'caret';
 
-const EDGE_CLASSES: Record<Edge, string> = {
+export const EDGE_CLASSES: Record<Edge, string> = {
   top: 'nectenda-pointer-edge-top',
   bottom: 'nectenda-pointer-edge-bottom',
   left: 'nectenda-pointer-edge-left',
@@ -481,22 +566,9 @@ class PointerMarker implements LayerMarker {
   }
 
   draw(): HTMLElement {
-    // `createDiv`/`createSpan` rather than `document.createElement`, which the
-    // directory's `prefer-create-el` rule reports. The globals are used rather
-    // than the element methods because a CodeMirror `LayerMarker` has to return
-    // a detached element — there is no parent yet to call `.createDiv()` on.
-    const el = createDiv();
-    el.classList.add('nectenda-pointer');
+    const el = buildPointerMarker(this.clientId, this.name, this.color);
     if (this.kind === 'caret') el.classList.add('nectenda-pointer-caret');
-    el.setAttribute('aria-hidden', 'true');
-    el.dataset.nectendaClient = String(this.clientId);
     el.dataset.nectendaKind = this.kind;
-    el.style.setProperty('--nectenda-pointer-colour', this.color);
-    el.appendChild(svgPath('nectenda-pointer-arrow', '0 0 12 16', 'M1 1 L1 13.5 L4.2 10.6 L6.6 15 L8.6 14 L6.3 9.7 L10.8 9.7 Z'));
-    // Points up; the edge classes rotate it towards the text it stands for.
-    el.appendChild(svgPath('nectenda-pointer-chevron', '0 0 16 10', 'M1.5 9 L8 1.5 L14.5 9 Z'));
-    const label = el.createSpan({ cls: 'nectenda-pointer-name' });
-    label.textContent = this.name;
     this.place(el);
     this.timeFade(el);
     return el;
@@ -557,17 +629,47 @@ class PointerMarker implements LayerMarker {
     el.style.left = `${this.left}px`;
     el.style.top = `${this.top}px`;
     el.style.setProperty('--nectenda-pointer-drop', `${this.drop}px`);
-    for (const [edge, cls] of Object.entries(EDGE_CLASSES)) {
-      if (edge === this.edge) el.classList.add(cls);
-      else el.classList.remove(cls);
-    }
-    if (this.edge) el.classList.add('nectenda-pointer-edge');
-    else el.classList.remove('nectenda-pointer-edge');
+    setPointerEdge(el, this.edge);
     // A merged indicator never fades: the caret it also stands for is still
     // there after the pointer comes to rest.
     if (this.withCaret) el.classList.add('nectenda-pointer-with-caret');
     else el.classList.remove('nectenda-pointer-with-caret');
   }
+}
+
+/**
+ * A collaborator's pointer as it looks everywhere: an arrow whose tip is the
+ * element's origin, a chevron shown instead while pinned to an edge, and the
+ * name. Detached, so a CodeMirror layer marker can return it; the canvas
+ * overlay appends it (canvas-presence.ts). One builder, so a note and a canvas
+ * cannot drift apart in how a person's pointer looks.
+ */
+export function buildPointerMarker(clientId: number, name: string, color: string): HTMLElement {
+  // `createDiv`/`createSpan` rather than `document.createElement`, which the
+  // directory's `prefer-create-el` rule reports. The globals are used rather
+  // than the element methods because a CodeMirror `LayerMarker` has to return
+  // a detached element — there is no parent yet to call `.createDiv()` on.
+  const el = createDiv();
+  el.classList.add('nectenda-pointer');
+  el.setAttribute('aria-hidden', 'true');
+  el.dataset.nectendaClient = String(clientId);
+  el.style.setProperty('--nectenda-pointer-colour', color);
+  el.appendChild(svgPath('nectenda-pointer-arrow', '0 0 12 16', 'M1 1 L1 13.5 L4.2 10.6 L6.6 15 L8.6 14 L6.3 9.7 L10.8 9.7 Z'));
+  // Points up; the edge classes rotate it towards what it stands for.
+  el.appendChild(svgPath('nectenda-pointer-chevron', '0 0 16 10', 'M1.5 9 L8 1.5 L14.5 9 Z'));
+  const label = el.createSpan({ cls: 'nectenda-pointer-name' });
+  label.textContent = name;
+  return el;
+}
+
+/** Pin a pointer marker to `edge`, or unpin it: the classes the stylesheet turns into a chevron. */
+export function setPointerEdge(el: HTMLElement, edge: Edge | null): void {
+  for (const [side, cls] of Object.entries(EDGE_CLASSES)) {
+    if (side === edge) el.classList.add(cls);
+    else el.classList.remove(cls);
+  }
+  if (edge) el.classList.add('nectenda-pointer-edge');
+  else el.classList.remove('nectenda-pointer-edge');
 }
 
 function svgPath(cls: string, viewBox: string, d: string): SVGSVGElement {
@@ -599,11 +701,11 @@ export interface RemotePointerOptions {
   /** "Show collaborators' mouse pointers" — a local noise setting. Read live. */
   showPointers(): boolean;
   /**
-   * Whether `view` is the editor this note is bound to. The extension array is
-   * shared by every editor in the workspace (SAFE-D5), so a pane showing a
-   * different note carries this extension too, wired to this note's text. It
-   * must neither draw this note's pointers at its own positions nor send a
-   * pointer anchored in text it is not showing.
+   * Whether `view` is the editor this note is bound to. The extension is
+   * installed in that editor only (SAFE-D5); this is kept as a second line,
+   * because it once reached every pane in the workspace, and a pane showing a
+   * different note must neither draw this note's pointers at its own positions
+   * nor send a pointer anchored in text it is not showing.
    */
   isBound(view: EditorView): boolean;
 }
@@ -660,8 +762,9 @@ export function remotePointers(
         this.onMove = (e) => {
           if (!pointsByHovering(e.pointerType)) return;
           if (!options.isBound(view)) {
-            // Once per editor: a pane showing another note carries this
-            // extension too (SAFE-D5), and moving over it must send nothing.
+            // Once per editor. Unreachable while the extension is installed in
+            // the bound editor only (SAFE-D5); if it is ever reached again,
+            // moving over another note's pane must still send nothing.
             if (!this.warnedUnbound) {
               this.warnedUnbound = true;
               log.debug('Pointer over an editor this note is not bound to; not sending it');

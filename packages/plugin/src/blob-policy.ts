@@ -1,4 +1,5 @@
 import { gzipBytes, canCompress, type BlobCodec } from '@nectenda/shared';
+import { codecForPath, STRUCTURED_FORMATS, type StructuredCodec } from './structured-formats';
 
 /**
  * What a path is, and whether it is worth compressing.
@@ -8,27 +9,40 @@ import { gzipBytes, canCompress, type BlobCodec } from '@nectenda/shared';
  * moves bytes.
  */
 
-export type FileKind = 'text' | 'blob' | 'ignore';
+export type FileKind = 'text' | 'structured' | 'blob' | 'ignore';
 
 /**
- * Classify a vault path.
+ * Classify a vault path by its name.
  *
- * Only `.md` goes through `Y.Text`. **Everything else is a blob, including
- * `.canvas` and `.json`** — a canvas is JSON, and JSON merged character-wise
+ * Only `.md` goes through `Y.Text`. A format with a registered codec
+ * (`structured-formats.ts`) is `structured`: merged key by key in its own
+ * document. **Everything else is a blob, including `.canvas` and `.json` until
+ * a codec claims them** — a canvas is JSON, and JSON merged character-wise
  * under concurrent edit produces something syntactically invalid that looks
  * fine until it is opened. As a blob it is last-writer-wins with a visible
  * conflict copy, which is the honest trade: disagreement beats convergence on
  * content that is wrong.
+ *
+ * The name is only the default. A path the folder listing already records as
+ * structured stays structured whatever this says — see
+ * `FileSync.isStructuredListed`, which the watcher asks first.
+ *
+ * `formats` is a parameter so tests can register a codec without a mutable
+ * global that production code could also reach.
  *
  * `ignore` covers dot-directories. `listFiles` walks the vault index, which
  * already excludes them, so this is belt and braces — but it is stated
  * explicitly so that nobody later reaches for `adapter.list()`, which does see
  * them, and starts syncing the plugin's own configuration.
  */
-export function kindOf(path: string): FileKind {
+export function kindOf(
+  path: string,
+  formats: Readonly<Record<string, StructuredCodec>> = STRUCTURED_FORMATS,
+): FileKind {
   const parts = path.split('/');
   if (parts.some((p) => p.startsWith('.'))) return 'ignore';
   if (path.endsWith('.md')) return 'text';
+  if (codecForPath(path, formats)) return 'structured';
   return 'blob';
 }
 
