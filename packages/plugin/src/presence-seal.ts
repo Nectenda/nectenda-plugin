@@ -30,14 +30,20 @@ import type { DocCipher } from './multiplexed-provider';
  * say which field changed — a pointer move and a selection change otherwise
  * differ by exactly the bytes that moved.
  *
- * 512, not 256, because 256 was measured and leaked: y-codemirror's cursor
- * (two relative positions) is set to null when the editor loses focus, and a
- * focused state (~310 bytes) and an unfocused one (~140) landed in different
- * 256-byte buckets. One bucket holds a text state with its caret, pointer and
- * viewport. A multiple rather than one fixed size, because a canvas selection
- * of many ids must still fit — and a state that large does show its size.
+ * Not 256, because 256 was measured and leaked: a state with y-codemirror's
+ * cursor (two relative positions, ~310 bytes) and one without (~140) landed
+ * in different buckets. Not 512 either, since the Properties panel's focus
+ * (WIRE-097). y-codemirror.next 0.3.6 does not clear the cursor when the
+ * editor loses focus — it clears it only while the editor still has focus —
+ * so someone who clicks from the text into a property carries their caret
+ * and the panel focus together: measured 653 bytes against 428 for someone
+ * typing, which at 512 told the server "editing a property" from "typing"
+ * (found in review). One 1024 bucket holds both, with a path of some 600
+ * characters. A multiple rather than one fixed size, because a canvas
+ * selection of many ids must still fit — and a state that large does show
+ * its size.
  */
-export const PRESENCE_PAD_BYTES = 512;
+export const PRESENCE_PAD_BYTES = 1024;
 
 /**
  * The bucket for a canvas document. A canvas state carries more than a note's
@@ -49,6 +55,14 @@ export const PRESENCE_PAD_BYTES = 512;
  * presence frame on canvases only.
  */
 export const CANVAS_PRESENCE_PAD_BYTES = 1024;
+
+/**
+ * The bucket for a base. Who and which view measured 287 bytes, but a focus
+ * (WIRE-096) adds the entry's path, as long as the user made it, and at 512
+ * a long one would put "on an entry" in a bigger bucket than "on the view".
+ * 1024 holds a focus with a path of some 600 characters.
+ */
+export const BASES_PRESENCE_PAD_BYTES = 1024;
 
 /** Separates presence from anything else ever sealed under a folder key. */
 const AAD_LABEL = 'nectenda:v1:presence';

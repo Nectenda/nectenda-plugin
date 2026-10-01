@@ -1,6 +1,11 @@
 import * as Y from 'yjs';
-import { keysBetween } from './fractional-key';
 import { mergeTextEdit } from './text-merge';
+import {
+  applyOrder, applyWholeValues, bury as buryIn, byOrderKey, canonical, clearTombstones as clearIn, normaliseJson,
+  recordKey, same, SEP, tombstonesByRecord,
+} from './structured-records';
+
+export { canonical, normaliseJson };
 
 /**
  * A canvas as a Y.Doc, independent of how it reaches the screen.
@@ -51,7 +56,6 @@ export const ROOT_ORDER = 'order';
 export const ROOT_EXTRA = 'extra';
 export const ROOT_TOMBSTONES = 'tombstones';
 
-const SEP = '\u0000';
 /**
  * Marks a node field as the model's own, not the file's. `\u0001textGone`
  * holds the text a card had when an edit took its text away (see applyText).
@@ -68,42 +72,14 @@ export interface CanvasValue {
   extra: Record<string, unknown>;
 }
 
-interface Tombstone {
-  snapshot: Record<string, unknown>;
-  /** For an edge removed together with a node: that node. */
-  with?: string;
-}
-
 type Kind = 'n' | 'e';
 
 // ── Values ────────────────────────────────────────────────────────────────
 
-/**
- * A value as JSON would carry it: `undefined` fields dropped, NaN and Infinity
- * as null. Everything entering the document, and everything compared, goes
- * through this — a value that does not equal its own round trip rewrites the
- * file forever (Relay 78cbc93b, 9da7ee10).
- */
-export function normaliseJson(value: unknown): unknown {
-  if (value === undefined) return undefined;
-  const text = JSON.stringify(value);
-  return text === undefined ? undefined : (JSON.parse(text) as unknown);
-}
 
 function normaliseRecord(rec: Record<string, unknown>): CanvasRecord {
   return normaliseJson(rec) as CanvasRecord;
 }
-
-/** JSON with object keys sorted, for comparing meaning rather than layout. */
-export function canonical(value: unknown): string {
-  if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'null';
-  if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`;
-  const obj = value as Record<string, unknown>;
-  const keys = Object.keys(obj).filter((k) => obj[k] !== undefined).sort();
-  return `{${keys.map((k) => `${JSON.stringify(k)}:${canonical(obj[k])}`).join(',')}}`;
-}
-
-const same = (a: unknown, b: unknown): boolean => canonical(a) === canonical(b);
 
 /** A canvas value with every record normalised; top-level keys other than nodes/edges into `extra`. */
 export function normaliseCanvas(value: CanvasValue): CanvasValue {
@@ -156,46 +132,17 @@ function rawRecords(ydoc: Y.Doc, kind: Kind): Map<string, CanvasRecord> {
   return out;
 }
 
-function tombstonesByRecord(ydoc: Y.Doc): Map<string, Tombstone[]> {
-  const out = new Map<string, Tombstone[]>();
-  ydoc.getMap<unknown>(ROOT_TOMBSTONES).forEach((value, key) => {
-    const parts = key.split(SEP);
-    if (parts.length !== 3) return;
-    const t = value as Tombstone | null;
-    if (!t || typeof t !== 'object' || typeof t.snapshot !== 'object') return;
-    const rk = `${parts[0]}${SEP}${parts[1]}`;
-    let list = out.get(rk);
-    if (!list) {
-      list = [];
-      out.set(rk, list);
-    }
-    list.push(t);
-  });
-  return out;
-}
-
-const recordKey = (kind: Kind, id: string): string => `${kind}${SEP}${id}`;
-
 /** How the document orders nodes: by key, then id, so equal keys still agree everywhere. */
-function orderKeyOf(ydoc: Y.Doc, id: string): string {
-  const k = ydoc.getMap<unknown>(ROOT_ORDER).get(id);
-  return typeof k === 'string' ? k : '';
-}
-
 function byOrder(ydoc: Y.Doc): (a: CanvasRecord, b: CanvasRecord) => number {
-  return (a, b) => {
-    const ka = orderKeyOf(ydoc, a.id);
-    const kb = orderKeyOf(ydoc, b.id);
-    if (ka !== kb) return ka < kb ? -1 : 1;
-    return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
-  };
+  const cmp = byOrderKey(ydoc.getMap<unknown>(ROOT_ORDER));
+  return (a, b) => cmp(a.id, b.id);
 }
 
 /** The canvas the document holds now. */
 export function readCanvas(ydoc: Y.Doc): CanvasValue {
   const nodes = rawRecords(ydoc, 'n');
   const edges = rawRecords(ydoc, 'e');
-  const tombs = tombstonesByRecord(ydoc);
+  const tombs = tombstonesByRecord(ydoc.getMap<unknown>(ROOT_TOMBSTONES));
 
   // A record matching a snapshot is deleted — for an edge, subject to the
   // node it went with.
@@ -319,19 +266,13 @@ function applyText(ydoc: Y.Doc, texts: Y.Map<Y.Text>, id: string, base: string |
 }
 
 function clearTombstones(ydoc: Y.Doc, kind: Kind, id: string): void {
-  const root = ydoc.getMap<unknown>(ROOT_TOMBSTONES);
-  const prefix = `${kind}${SEP}${id}${SEP}`;
-  for (const k of [...root.keys()]) if (k.startsWith(prefix)) root.delete(k);
+  clearIn(ydoc.getMap<unknown>(ROOT_TOMBSTONES), kind, id);
 }
 
 function bury(ydoc: Y.Doc, kind: Kind, snapshot: CanvasRecord, withNode?: string): void {
   const hasAny = [...fieldsRoot(ydoc, kind).keys()].some((k) => k.startsWith(`${snapshot.id}${SEP}`));
   if (!hasAny) return; // nothing in the document to delete
-  // Keyed by this vault's client id: two vaults deleting one record at once
-  // write different keys, so neither overwrites the other (which SAFE-A14
-  // would rightly report as a lost write).
-  const t: Tombstone = withNode ? { snapshot, with: withNode } : { snapshot };
-  ydoc.getMap<unknown>(ROOT_TOMBSTONES).set(`${kind}${SEP}${snapshot.id}${SEP}${ydoc.clientID}`, t);
+  buryIn(ydoc.getMap<unknown>(ROOT_TOMBSTONES), ydoc.clientID, kind, snapshot.id, snapshot, withNode);
 }
 
 /**
@@ -356,8 +297,8 @@ export function applyCanvas(ydoc: Y.Doc, input: CanvasValue, baseInput: CanvasVa
     for (const n of base.nodes) if (!kept.has(n.id)) deletedNodes.add(n.id);
   }
   applyRecords(ydoc, 'e', value.edges, base?.edges ?? null, deletedNodes);
-  applyOrder(ydoc, value.nodes.map((n) => n.id), base ? base.nodes.map((n) => n.id) : null);
-  applyExtra(ydoc, value.extra, base?.extra ?? null);
+  applyOrder(ydoc.getMap<unknown>(ROOT_ORDER), value.nodes.map((n) => n.id), base ? base.nodes.map((n) => n.id) : null);
+  applyWholeValues(ydoc.getMap<unknown>(ROOT_EXTRA), value.extra, base?.extra ?? null);
 }
 
 function applyRecords(
@@ -389,88 +330,6 @@ function applyRecords(
       else if (typeof b.toNode === 'string' && deletedNodes.has(b.toNode)) withNode = b.toNode;
     }
     bury(ydoc, kind, b, withNode);
-  }
-}
-
-/**
- * Z-order. Only nodes whose position really changed get a new key: the ones
- * outside the longest run that kept its relative order from `base`, and nodes
- * new to it. A single "bring to front" re-keys one node, not the board, so a
- * concurrent reorder elsewhere survives.
- */
-function applyOrder(ydoc: Y.Doc, ids: string[], baseIds: string[] | null): void {
-  const order = ydoc.getMap<unknown>(ROOT_ORDER);
-  const basePos = new Map((baseIds ?? []).map((id, i) => [id, i]));
-  const kept = longestIncreasing(ids.filter((id) => basePos.has(id) && typeof order.get(id) === 'string'), basePos);
-
-  let i = 0;
-  let lo = '';
-  while (i < ids.length) {
-    const id = ids[i];
-    if (kept.has(id)) {
-      const k = order.get(id) as string;
-      if (k > lo) lo = k;
-      i++;
-      continue;
-    }
-    // A run of nodes needing keys, placed after `lo` and before the next kept
-    // node's key that is above it.
-    let j = i;
-    while (j < ids.length && !kept.has(ids[j])) j++;
-    let hi: string | null = null;
-    for (let x = j; x < ids.length; x++) {
-      const k = order.get(ids[x]);
-      if (kept.has(ids[x]) && typeof k === 'string' && k > lo) {
-        hi = k;
-        break;
-      }
-    }
-    const keys = keysBetween(lo, hi, j - i);
-    for (let x = i; x < j; x++) order.set(ids[x], keys[x - i]);
-    lo = keys[keys.length - 1] ?? lo;
-    i = j;
-  }
-}
-
-/** The ids, in `ids` order, forming the longest run increasing in `pos`. */
-function longestIncreasing(ids: string[], pos: Map<string, number>): Set<string> {
-  const tails: number[] = [];
-  const tailIdx: number[] = [];
-  const prev: number[] = new Array<number>(ids.length).fill(-1);
-  for (let i = 0; i < ids.length; i++) {
-    const p = pos.get(ids[i]) as number;
-    let lo = 0;
-    let hi = tails.length;
-    while (lo < hi) {
-      const mid = (lo + hi) >> 1;
-      if (tails[mid] < p) lo = mid + 1;
-      else hi = mid;
-    }
-    tails[lo] = p;
-    tailIdx[lo] = i;
-    prev[i] = lo > 0 ? tailIdx[lo - 1] : -1;
-  }
-  const out = new Set<string>();
-  let k = tails.length ? tailIdx[tails.length - 1] : -1;
-  while (k >= 0) {
-    out.add(ids[k]);
-    k = prev[k];
-  }
-  return out;
-}
-
-function applyExtra(ydoc: Y.Doc, extra: Record<string, unknown>, base: Record<string, unknown> | null): void {
-  const root = ydoc.getMap<unknown>(ROOT_EXTRA);
-  const keys = new Set([...Object.keys(extra), ...Object.keys(base ?? {})]);
-  for (const k of keys) {
-    const next = extra[k];
-    const was = base ? base[k] : root.get(k);
-    if (same(was, next) && (base !== null || root.has(k) === (next !== undefined))) continue;
-    if (next === undefined) {
-      if (base !== null) root.delete(k);
-    } else {
-      root.set(k, next);
-    }
   }
 }
 

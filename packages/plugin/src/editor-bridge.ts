@@ -9,7 +9,7 @@ import type { SyncProvider } from './provider-router';
 import type { ProviderEvent } from './multiplexed-provider';
 import type { Awareness } from 'y-protocols/awareness';
 import { log } from './logger';
-import { PRESENCE_VERSION } from '@nectenda/shared';
+import { PRESENCE_VERSION, readPresence } from '@nectenda/shared';
 import { applySeed, buildSeedUpdate, type SeedUpdate } from './seed-update';
 import { seatFor, seatColour, type Person } from './presence';
 import { goToInNote, remotePointers, type RemotePointers } from './remote-pointer';
@@ -87,11 +87,11 @@ function withAlpha(colour: string, alpha: number): string {
 }
 
 /**
- * The people in a presence list, as one comparable string: who, and in which
- * colour. Order matters, because the circles are drawn in that order.
+ * The people in a presence list, as one comparable string: who, in which
+ * colour, on which view of a base, and editing which property. Order matters, because the circles are drawn in that order.
  */
 export function peopleKey(people: readonly Person[]): string {
-  return JSON.stringify(people.map((p) => [p.name, p.color]));
+  return JSON.stringify(people.map((p) => [p.name, p.color, p.where ?? null, p.editing ?? null]));
 }
 
 /**
@@ -164,10 +164,15 @@ export function presenceReporter(
     // open does not flicker between two entries.
     const people = new Map<string, Person>();
     for (const [clientId, state] of awareness.getStates()) {
-      const user = (state as { user?: { name?: string; color?: string } } | undefined)?.user;
+      const s = state as { user?: { name?: string; color?: string } } | undefined;
+      const user = s?.user;
       const name = user?.name ?? `client:${clientId}`;
       if (!people.has(name)) {
-        people.set(name, { name, color: user?.color ?? seatColour(seatFor(name), currentTheme()) });
+        const person: Person = { name, color: user?.color ?? seatColour(seatFor(name), currentTheme()) };
+        const view = readPresence(state)?.view;
+        if (view?.surface === 'bases') person.where = view.name;
+        if (view?.surface === 'properties') person.editing = view.focus.property;
+        people.set(name, person);
       }
     }
     const key = `${awareness.getStates().size}|${peopleKey([...people.values()])}`;
@@ -276,6 +281,16 @@ export class EditorBridge {
   }
   private wiring: EditorWiring;
   /**
+   * The workspace and vault listeners this bridge added, so `stop` can take
+   * them off again. Registering them with the plugin only removes them at
+   * unload, and a sync restart is not an unload: the stopped bridge kept
+   * answering every leaf change, and its unbind emptied the wiring it shares
+   * with its replacement — the live note's binding (see `stop`).
+   */
+  private eventRefs: Array<{ owner: 'workspace' | 'vault'; ref: EventRef }> = [];
+  /** Set by `stop`; every deferred continuation checks it before acting. */
+  private stopped = false;
+  /**
    * The editor the current bind is for. A second pane showing the same file is
    * a different editor, and must be bound in its own right rather than taken
    * for the one already bound (SAFE-D5).
@@ -317,6 +332,7 @@ export class EditorBridge {
     // it from neither side. Unbinding hands it back to disk reconciliation, and
     // binding again restores the editor from the document.
     this.wiring.onLost = () => {
+      if (this.stopped) return;
       log.warn('The bound editor lost its collaborative binding; binding it again', {
         docName: this.currentDocName,
       });
@@ -333,7 +349,7 @@ export class EditorBridge {
     const ref = this.deps.app.workspace.on('active-leaf-change', () => {
       this.onActiveLeafChange();
     });
-    this.deps.registerEvent(ref);
+    this.track('workspace', ref);
 
     // A rename changes the open file's path without changing the leaf, so
     // 'active-leaf-change' never fires and the editor stays bound to the old
@@ -352,7 +368,7 @@ export class EditorBridge {
       if (!(file instanceof TFile)) return;
       this.onActiveLeafChange();
     });
-    this.deps.registerEvent(renameRef);
+    this.track('vault', renameRef);
 
     // The broadcast colour is sampled from the theme at the moment presence is
     // announced, so switching light/dark mid-session would leave everyone else
@@ -365,7 +381,7 @@ export class EditorBridge {
     const themeRef = this.deps.app.workspace.on('css-change', () => {
       this.reannouncePresence();
     });
-    this.deps.registerEvent(themeRef);
+    this.track('workspace', themeRef);
 
     this.onActiveLeafChange();
   }
@@ -413,13 +429,44 @@ export class EditorBridge {
     awareness.setLocalState({ ...existing, pointer: null });
   }
 
+  /**
+   * The note bound to the editor, and the awareness its presence goes out on,
+   * for presence the editor does not carry itself: the Properties panel's
+   * focus (property-focus.ts, WIRE-097). Null while nothing is bound.
+   */
+  boundPresence(): { path: string; awareness: Awareness } | null {
+    if (!this.currentDocName || !this.currentFile) return null;
+    const awareness = this.provider.getAwareness(this.currentDocName);
+    return awareness ? { path: this.currentFile, awareness } : null;
+  }
+
   /** Redraw collaborators' pointers, after "Show collaborators' mouse pointers" changes. */
   refreshPointers(): void {
     this.pointers?.refresh();
   }
 
+  /** Tie a listener to this bridge, and to the plugin as a backstop for unload. */
+  private track(owner: 'workspace' | 'vault', ref: EventRef): void {
+    this.eventRefs.push({ owner, ref });
+    this.deps.registerEvent(ref);
+  }
+
+  /**
+   * Unbind, and stop answering anything.
+   *
+   * A sync restart builds a new bridge on the same `EditorWiring`, so a bridge
+   * left listening is not merely idle. This one used to keep its listeners: it
+   * then met every leaf change with a destroyed router, could never bind, gave
+   * up — and its next unbind emptied the shared wiring, which by then held the
+   * live bridge's binding in the editor being typed into. The live bridge
+   * still believed the note bound, so editor and document drifted apart
+   * unseen until the note was switched away from and back.
+   */
   stop(): void {
     this.unbindCollab();
+    this.stopped = true;
+    for (const { owner, ref } of this.eventRefs) this.deps.app[owner].offref(ref);
+    this.eventRefs = [];
   }
 
 
@@ -430,6 +477,7 @@ export class EditorBridge {
   }
 
   private onActiveLeafChange(): void {
+    if (this.stopped) return;
     const view = this.deps.app.workspace.getActiveViewOfType(MarkdownView);
 
     if (!view?.file) {

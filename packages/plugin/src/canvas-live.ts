@@ -6,7 +6,7 @@ import {
   type CanvasRecord, type CanvasValue,
 } from './canvas-model';
 import {
-  checkCanvasShape, OBSIDIAN_CANVAS_READ_AGAINST,
+  checkCanvasShape, DRAGGING_CLASS, OBSIDIAN_CANVAS_READ_AGAINST,
   type CanvasData, type CanvasLike, type CanvasNodeLike, type CanvasViewInternal,
 } from './canvas-internals';
 import type { BindResult, BoundView, StructuredSync } from './structured-sync';
@@ -15,7 +15,7 @@ import { log } from './logger';
 /**
  * A canvas open in a view, bound live to its document (SAFE-A20).
  *
- * Over disk (canvas-view-guard.ts), an open canvas sees another vault's change
+ * Over disk (text-view-guard.ts), an open canvas sees another vault's change
  * only when Obsidian reloads the file — a couple of seconds late, re-rendering
  * the card being typed in, and pushing an undo step that reverts the peer's
  * change. Bound, the view is the file's only writer and the document talks to
@@ -42,9 +42,10 @@ import { log } from './logger';
  * - Drawing a remote change never writes to the document. A "repair" written
  *   back on each remote apply is how Excalidraw's own edits came to beat real
  *   ones (Excalidraw #11933). Rounding settles in the view.
- * - While the user drags or resizes, a remote change's position and size wait
- *   for the gesture to end — other fields do not — and are then read afresh
- *   from the document, not replayed.
+ * - While the user drags or resizes, a remote change to the position or size
+ *   of a node the gesture moves, or its removal, waits for the gesture to end —
+ *   other fields, and other nodes, do not — and is then read afresh from the
+ *   document, not replayed.
  * - Undo steps back only this user's edits: a remote change is written into
  *   every snapshot of Obsidian's history, field by field, and a node a peer
  *   deleted leaves them all, so undo can neither revert a peer nor revive what
@@ -136,6 +137,14 @@ export class CanvasLiveBinding implements BoundView {
   private gesture = false;
   /** A remote change was drawn during a gesture and not saved yet. */
   private saveOwed = false;
+  /**
+   * Something was held for a drag Obsidian kept after `gesture` fell (see
+   * movingGeometry), so the gesture's end has already run without it. Read
+   * afresh at the next pointerup or save instead: a drag cancelled, or dropped
+   * where it began, saves nothing, and would otherwise leave a peer's change
+   * undrawn until some other change came.
+   */
+  private heldLate = false;
   private unobserve: (() => void) | null = null;
   private restore: (() => void)[] = [];
   /** Cards whose editor canvas-card-binding.ts has bound to their Y.Text. */
@@ -404,11 +413,11 @@ export class CanvasLiveBinding implements BoundView {
       this.gesture = true;
     };
     const up = (): void => {
-      if (!this.gesture) return;
+      if (!this.gesture && !this.heldLate) return;
       this.gesture = false;
       // After Obsidian's own pointerup handler, which commits the gesture
       // through requestSave; then what the gesture held back is read afresh.
-      win.setTimeout(() => this.safely(() => this.gestureEnded()), 0);
+      this.endLater();
     };
     const hidden = (): void => {
       if (doc.visibilityState === 'hidden') up();
@@ -520,6 +529,9 @@ export class CanvasLiveBinding implements BoundView {
    */
   capture(): void {
     if (!this.bound || this.applying || !this.ydoc) return;
+    // A drag that outlived the gesture has dropped: once its save is in,
+    // what it held is read afresh.
+    if (this.heldLate && !this.gesture) this.endLater();
     if (this.applyPending) this.applyRemoteNow();
     const value = valueOfCanvas(this.canvas);
     // A card bound live has its text carried in by its editor binding as it
@@ -570,7 +582,9 @@ export class CanvasLiveBinding implements BoundView {
     if (!this.bound || !this.ydoc) return;
     const canvas = this.canvas;
     const next = readCanvas(this.ydoc);
-    const plan = planDraw(this.held, next, this.gesture ? liveGeometry(canvas) : null);
+    const moving = movingGeometry(canvas, this.gesture);
+    if (moving && !this.gesture) this.heldLate = true;
+    const plan = planDraw(this.held, next, moving);
     if (!plan) return;
 
     this.applying = true;
@@ -614,7 +628,7 @@ export class CanvasLiveBinding implements BoundView {
       // middle of a gesture, though: `canvas.data` would take the dragged
       // nodes where they are now, and a save of that — nobody's edit — would
       // reach the file. The gesture's end saves instead.
-      if (this.gesture) this.saveOwed = true;
+      if (moving) this.saveOwed = true;
       else canvas.requestSave(false);
     } finally {
       this.applying = false;
@@ -623,9 +637,19 @@ export class CanvasLiveBinding implements BoundView {
   }
 
   /** Draw what the gesture held back, and save what was drawn during it. */
+  private endLater(): void {
+    const win = this.canvas.wrapperEl.ownerDocument.defaultView ?? window;
+    win.setTimeout(() => this.safely(() => this.gestureEnded()), 0);
+  }
+
   private gestureEnded(): void {
+    // Set again by applyRemoteNow if Obsidian is still dragging.
+    this.heldLate = false;
     this.applyRemoteNow();
     if (!this.saveOwed || this.gesture || !this.bound) return;
+    // Obsidian is still dragging (movingGeometry): its own drop saves, with
+    // what was drawn meanwhile in it.
+    if (movingGeometry(this.canvas, false)) return;
     this.saveOwed = false;
     this.applying = true;
     try {
@@ -664,20 +688,37 @@ function difference(a: CanvasValue, b: CanvasValue): number {
   return n;
 }
 
-/** Position and size of every node as the view has it right now, mid-gesture. */
-function liveGeometry(canvas: CanvasLike): Map<string, Record<string, number>> {
-  const out = new Map<string, Record<string, number>>();
-  for (const [id, n] of canvas.nodes) out.set(id, { x: n.x, y: n.y, width: n.width, height: n.height });
-  return out;
+/**
+ * Position and size, as the view has them now, of the nodes a gesture is
+ * moving or resizing: those Obsidian marks `DRAGGING_CLASS`, a group's members
+ * included. Marked nodes are held even once `gesture` is down: it falls on any
+ * pointerup, a blur or a hidden page, none of which need end Obsidian's drag —
+ * a second finger lifting does not — and a peer's delete drawn then would pull
+ * the node from under the drag. While `gesture` is up and nothing is marked —
+ * a press not yet a drag, a pan, or an Obsidian that stopped marking — every
+ * node, as if all of them might move: holding too much shows a peer's move
+ * late, but drawing a dragged node's removal would throw away the drag. Null
+ * when nothing is moving.
+ */
+function movingGeometry(canvas: CanvasLike, gesture: boolean): Map<string, Record<string, number>> | null {
+  const all = new Map<string, Record<string, number>>();
+  const moving = new Map<string, Record<string, number>>();
+  for (const [id, n] of canvas.nodes) {
+    const g = { x: n.x, y: n.y, width: n.width, height: n.height };
+    all.set(id, g);
+    if (n.nodeEl.classList.contains(DRAGGING_CLASS)) moving.set(id, g);
+  }
+  if (moving.size > 0) return moving;
+  return gesture ? all : null;
 }
 
 /**
  * What changed between what the view holds and what the document holds, by
  * record and by field. With `holdGeometry` (a gesture in progress), position
- * and size are held back for every node the view has: any of them may be
- * moving — a group drags its members — and a remote value drawn now would be
- * overwritten by the next pointer move anyway, or jump the node under the
- * pointer. Everything else is drawn now.
+ * and size are held back for the nodes it names — those the gesture moves
+ * (movingGeometry) — since a remote value drawn now would be overwritten by
+ * the next pointer move anyway, or jump the node under the pointer; and so is
+ * their removal. Everything else, other nodes' geometry included, is drawn now.
  */
 export function planDraw(
   held: CanvasValue,

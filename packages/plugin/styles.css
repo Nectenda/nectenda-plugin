@@ -768,6 +768,9 @@
 .nectenda-field { display: flex; flex-direction: column; gap: var(--nectenda-space-2); }
 .nectenda-field label { font-size: var(--font-ui-small); font-weight: 500; color: var(--nectenda-text-primary); }
 .nectenda-field-row { display: flex; gap: var(--nectenda-space-2); }
+/* A primary button is full width on its own line; beside a field it keeps its
+   own width, or it takes the whole row and leaves the field a sliver. */
+.nectenda-surface .nectenda-field-row > button.nectenda-primary { width: auto; flex: none; padding-inline: var(--nectenda-space-5); }
 
 .nectenda-signin input {
   flex: 1;
@@ -1110,4 +1113,25 @@
 .canvas-node.nectenda-peer-selected {
   outline: 2px solid var(--nectenda-peer-color, var(--text-accent));
   outline-offset: 3px;
+}
+
+/*
+ * The entry, cell or property a collaborator is on (WIRE-096, WIRE-097):
+ * outlined in their colour, inset so a neighbouring row or the table's own
+ * active-cell box does not cover it. An outline takes no space, so nothing
+ * under it moves while someone types there.
+ */
+.bases-td.nectenda-peer-focus,
+.bases-tr.nectenda-peer-focus,
+.bases-cards-property.nectenda-peer-focus,
+.metadata-property.nectenda-peer-focus {
+  outline: 2px solid var(--nectenda-peer-color, var(--text-accent));
+  outline-offset: -2px;
+  border-radius: var(--radius-s);
+}
+
+.bases-cards-item.nectenda-peer-focus,
+.bases-list-item.nectenda-peer-focus {
+  outline: 2px solid var(--nectenda-peer-color, var(--text-accent));
+  outline-offset: 2px;
 }

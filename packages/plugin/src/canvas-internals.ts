@@ -9,7 +9,7 @@
  *
  * 1. **Checked before use.** `checkCanvasShape` looks at every member the
  *    binding touches before it binds, and a canvas that fails is left on the
- *    disk path (canvas-view-guard.ts), which uses public API only — with a
+ *    disk path (text-view-guard.ts), which uses public API only — with a
  *    notice, so the fallback is never silent.
  * 2. **Caught in use.** A hook that throws unbinds its view, the same way.
  * 3. **Tested against the real thing.** The e2e contract spec checks each
@@ -26,6 +26,23 @@ export const OBSIDIAN_CANVAS_READ_AGAINST = '1.13.7';
 
 export type CanvasData = { nodes: Record<string, unknown>[]; edges: Record<string, unknown>[] } & Record<string, unknown>;
 
+/**
+ * The class Obsidian puts on `nodeEl` of every node a gesture moves or
+ * resizes, for as long as it does, and of no other:
+ *
+ * - a selection drag (`handleSelectionDrag`, byte 3268148) marks each selected
+ *   node, and each node inside a selected group (`getContainingNodes`), at the
+ *   drag's start, and unmarks them in its `end` and `cancel`;
+ * - a node's resize (`onResizePointerdown`, byte 3290058) and a selection's
+ *   (byte 3203693) mark what they resize, and unmark it in `cleanup`.
+ *
+ * Dragging out a new node or an edge end moves only a temporary node, which is
+ * never in `canvas.nodes`; a pan or a box select moves none. Nothing is marked
+ * between the press and the drag threshold, before the drag reads where its
+ * nodes start.
+ */
+export const DRAGGING_CLASS = 'is-dragging';
+
 /** A node (`V7`, byte 3284384). */
 export interface CanvasNodeLike {
   id: string;
@@ -38,6 +55,7 @@ export interface CanvasNodeLike {
   /** A card whose embedded editor is open. Its text must not be set through `setText`. */
   isEditing: boolean;
   zIndex: number;
+  /** Carries `DRAGGING_CLASS` while a drag or resize moves the node. */
   nodeEl: HTMLElement;
   canvas: CanvasLike;
   getData(): Record<string, unknown>;

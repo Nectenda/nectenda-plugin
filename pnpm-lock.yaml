@@ -190,6 +190,9 @@ importers:
       y-protocols:
         specifier: ^1.0.6
         version: 1.0.7(yjs@13.6.32)
+      yaml:
+        specifier: 2.9.1
+        version: 2.9.1
       yjs:
         specifier: ^13.6.32
         version: 13.6.32
@@ -466,6 +469,11 @@ packages:
     peerDependencies:
       yjs: ^13.0.0
 
+  yaml@2.9.1:
+    resolution: {integrity: sha512-3NxN8+78OdzbT7C/WjGsyfPAtJaN3FNDsWxv7Y7mcDsT/oOmgW8BpyQQFFBnvZE3j9Y2Sdz1ULFLezL7Eb2yFw==}
+    engines: {node: '>= 14.6'}
+    hasBin: true
+
   yjs@13.6.32:
     resolution: {integrity: sha512-lfiJIIC4Xayt5ItynE407ehlE03pCjeOc4hkR4yxxvvNJ4kuiN25B0g+Qp8XagYz361LLL7DCzR5bvFJ81QKtQ==}
     engines: {node: '>=16.0.0', npm: '>=8.0.0'}
@@ -651,6 +659,8 @@ snapshots:
     dependencies:
       lib0: 0.2.117
       yjs: 13.6.32
+
+  yaml@2.9.1: {}
 
   yjs@13.6.32:
     dependencies:

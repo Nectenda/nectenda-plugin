@@ -3,11 +3,11 @@ import type { TimerHandle } from './timers';
 import { log } from './logger';
 
 /**
- * What the guard needs of an open canvas view. All of it is public API on
- * Obsidian's TextFileView — `data`, `file`, `save()`, `setViewData()` — and
- * nothing of the canvas's own internals.
+ * What the guard needs of an open view of a structured file — a canvas, a
+ * base. All of it is public API on Obsidian's TextFileView — `data`, `file`,
+ * `save()`, `setViewData()` — and nothing of either view's own internals.
  */
-export interface CanvasViewLike {
+export interface TextViewLike {
   data: string | null;
   file: { path: string } | null;
   save(clear?: boolean): Promise<void>;
@@ -20,14 +20,16 @@ export const LOAD_CHECK_MS = 1000;
 const REPAIR_GRACE_MS = 3000;
 
 /**
- * Makes writing a canvas file safe while the canvas is open (SAFE-A19).
+ * Makes writing a structured file safe while a view of it is open (SAFE-A19).
  *
- * Obsidian 1.13.7 reloads an open canvas when its file changes on disk, with
- * no merge (`TextFileView.onModify`; the three-way merge only runs for plain
- * text). Two things follow, both read from its source:
+ * Obsidian 1.13.7 reloads an open canvas, and an open base, when its file
+ * changes on disk, with no merge (`TextFileView.onModify`; the three-way merge
+ * only runs for plain text). Both save about 2 s after the first change of a
+ * burst, and both skip the reload while `saving`. Two things follow, both read
+ * from its source:
  *
- * 1. **An edit the view has not saved yet is discarded by the reload.** It
- *    saves about 2 s after the first change of a burst. So before every write
+ * 1. **An edit the view has not saved yet is discarded by the reload.** So
+ *    before every write
  *    the view is asked to save; StructuredSync then reads that save in and
  *    writes a file that holds both. `save()` writes nothing when nothing
  *    changed, so asking costs nothing.
@@ -48,10 +50,10 @@ const REPAIR_GRACE_MS = 3000;
  *
  * A view is trusted only while it shows this file: Obsidian reuses views
  * across files, and until the new file loads the view still holds the old
- * one's canvas (a copy of a canvas even shares its ids). And a view with no
- * data is a load in progress, never a canvas someone emptied.
+ * one's content (a copy of a canvas even shares its ids). And a view with no
+ * data is a load in progress, never a file someone emptied.
  */
-export class CanvasViewGuard implements StructuredSurface {
+export class TextViewGuard implements StructuredSurface {
   /** What each path's views held just before our last write. */
   private held = new Map<string, string>();
   /** Paths being repaired: the text their views held, for the repair's save. */
@@ -60,9 +62,9 @@ export class CanvasViewGuard implements StructuredSurface {
   private written = new Map<string, string>();
   private timers = new Map<string, TimerHandle>();
 
-  constructor(private views: () => CanvasViewLike[]) {}
+  constructor(private views: () => TextViewLike[]) {}
 
-  private viewsOf(localPath: string): CanvasViewLike[] {
+  private viewsOf(localPath: string): TextViewLike[] {
     return this.views().filter((v) => v.file?.path === localPath && typeof v.data === 'string' && v.data !== '');
   }
 
@@ -88,7 +90,7 @@ export class CanvasViewGuard implements StructuredSurface {
       const missed = this.viewsOf(localPath).filter((v) => v.data !== text);
       if (missed.length === 0) return;
       void this.repair(localPath, prior, missed, readBack).catch((err: unknown) => {
-        log.warn('Could not bring an open canvas up to date', { path: localPath, error: String(err) });
+        log.warn('Could not bring an open view up to date', { path: localPath, error: String(err) });
       });
     }, LOAD_CHECK_MS));
   }
@@ -102,10 +104,10 @@ export class CanvasViewGuard implements StructuredSurface {
   private async repair(
     localPath: string,
     prior: string,
-    views: CanvasViewLike[],
+    views: TextViewLike[],
     readBack?: () => Promise<string>,
   ): Promise<void> {
-    log.warn('An open canvas did not load a remote change; reading its copy in against what it held', {
+    log.warn('An open view did not load a remote change; reading its copy in against what it held', {
       path: localPath,
     });
     this.repairing.set(localPath, prior);

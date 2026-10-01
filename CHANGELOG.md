@@ -4,6 +4,38 @@ Every release of the Nectenda plugin, newest first. Each release on GitHub also
 carries the SHA-256 of its `main.js`, so you can check that the plugin you are
 running is the source you read — see the README.
 
+## 0.4.0 — 1 October 2026
+
+### Added
+- **Bases merge.** Two people changing different filters, formulas or views of one base both keep their changes instead of one getting a conflict copy.
+- In a shared base you can see who else has it open, which view they are on, and which row, cell or card they are on.
+- **Note properties merge property by property.** Edited on two devices at once, a Kanban card dragged to two lanes lands in one of them, and the other choice is kept as a conflict copy, instead of the property becoming a mix of both.
+- In a note's Properties panel you can see which property a collaborator is editing.
+- An attachment skipped on this device now shows a "Download on this device" button in the note, which goes away once the file arrives.
+
+### Fixed
+- **A property you changed before restarting could be lost without a conflict copy** when another vault changed it just as the note reconnected.
+- Collaborators' cursors and your typing could drift out of place in a note after a sign-in refresh, until you switched notes and back.
+- While you drag a card on a live canvas, other people's moves of other cards now show straight away instead of waiting for you to let go.
+- A card you are dragging on a live canvas can no longer be deleted out from under your drag by someone else if your window loses focus or a second finger lifts mid-drag.
+- Turning the share link off or on, changing someone's role and publishing a folder's name failed with "Failed to fetch". They now work.
+- An organisation's owner now sees Replace… and Turn off… for the share link as soon as the page opens, not only Copy.
+- When the server needs a newer plugin, the status icon now says "Update the plugin to keep syncing" instead of Connected. When an organisation refuses this device, it says "Device limit reached".
+- The box for the code from your email, on the sign-in screen, is now wide enough to show the code you type.
+- Buttons for hard-to-undo actions, such as turning off sync or starting over, now use Obsidian's current destructive style.
+
+### Known
+- **Everyone sharing a base should update to 0.4.0.** A collaborator on an earlier version still syncs bases as whole files. Their edits reach you as conflict copies beside the base, and yours do not reach them. Nothing is lost, but the base does not merge until they update.
+- A collaborator on 0.3.0 or earlier still edits properties as text. Their edits are taken in, but if they and someone on 0.4.0 set the same property at once, the 0.4.0 value wins. The note as it stood is backed up first.
+- When two people change the same presentation setting of a base at once, such as its sort or column order, one value is kept with no conflict copy. Filters, formulas and grouping still get a conflict copy.
+- Column widths in a base are each vault's own, and a base whose filters reach outside the shared folder shows different rows in each vault.
+- If a collaborator moves a card while you are dragging it, your drop wins its position.
+- Collaborators still on 0.1.5 or earlier will appear to have no cursor. Their edits sync normally.
+- iOS is untested on a device. It should work, since it is the same JavaScript as Android, but nobody has run it on an iPhone, so it is not claimed.
+- On Android, all vaults in the app share one secret store: signing one vault in signs them all in.
+- There is no read-only membership. Everyone in a shared folder can edit it.
+- Not audited. The client ships unminified and the build is reproducible, so the claim is checkable, but no third party has checked it.
+
 ## 0.3.0 — 30 September 2026
 
 ### Added

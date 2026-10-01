@@ -65,6 +65,41 @@ export type Gesture =
   | { surface: 'canvas'; kind: 'connect'; from: string; side?: string; x: number; y: number };
 
 /**
+ * Which view of a file a person is on, where a file has several (WIRE-096).
+ *
+ * One shape for every layout of a base — table, cards, list, map, Obsidian
+ * 1.14's kanban, a view a plugin registers — because in every layout the view
+ * is named, and an entry is one file. Only the drawing differs per layout, and
+ * a client that cannot draw a layout still shows the person.
+ *
+ * `focus` is the entry the person is on, and the property within it: a
+ * table's active cell, or the card or list item under the pointer. Its `path`
+ * names only a file inside the same shared folder, relative to it: a base can
+ * list notes from outside the folder, and naming one to collaborators would
+ * leak it.
+ */
+export type ViewPresence = {
+  surface: 'bases';
+  name: string;
+  type: string;
+  focus?: { path: string; property?: string };
+} | PropertiesPresence;
+
+/**
+ * The property someone has focused in a note's Properties panel (WIRE-097).
+ *
+ * The panel's inputs are not CodeMirror, so the caret says nothing while
+ * someone types a property; this does. `focus` has the shape a base's has, so
+ * a panel row, a Bases cell and a card all say "who is on this property" the
+ * same way. `path` is the note itself, relative to the shared folder, and a
+ * receiver draws it only on that note.
+ */
+export type PropertiesPresence = {
+  surface: 'properties';
+  focus: { path: string; property: string };
+};
+
+/**
  * The state as written. `cursor` is y-codemirror's and keeps its shape and
  * name, because y-codemirror reads it by that name; this type only says it is
  * there. Text surfaces keep using it rather than `selection`. On a canvas it is
@@ -80,6 +115,8 @@ export interface PresenceV1 {
   selection: Selection | null;
   /** Optional on the wire: absent reads as null, and a client older than it ignores it. */
   gesture: Gesture | null;
+  /** Optional on the wire, as `gesture` is. */
+  view: ViewPresence | null;
 }
 
 const isObject = (v: unknown): v is Record<string, unknown> =>
@@ -165,6 +202,28 @@ function readGesture(v: unknown): Gesture | null {
   return null;
 }
 
+/** A path that stays inside the shared folder: relative, and never climbing out. */
+const isInsidePath = (p: unknown): p is string =>
+  isStr(p) && p !== '' && !p.startsWith('/') && !p.split('/').includes('..');
+
+function readView(v: unknown): ViewPresence | null {
+  if (!isObject(v)) return null;
+  if (v.surface === 'properties') {
+    // Nothing else to show without the focus, so an unreadable one is no view.
+    if (!isObject(v.focus) || !isInsidePath(v.focus.path) || !isStr(v.focus.property) || v.focus.property === '') return null;
+    return { surface: 'properties', focus: { path: v.focus.path, property: v.focus.property } };
+  }
+  if (v.surface !== 'bases') return null;
+  if (!isStr(v.name) || !isStr(v.type)) return null;
+  const out: ViewPresence = { surface: 'bases', name: v.name, type: v.type };
+  // A focus this client cannot read is dropped on its own; the person still shows.
+  if (isObject(v.focus) && isInsidePath(v.focus.path)) {
+    out.focus = { path: v.focus.path };
+    if (isStr(v.focus.property)) out.focus.property = v.focus.property;
+  }
+  return out;
+}
+
 /**
  * Read an opened presence state into the fields this version understands.
  *
@@ -182,5 +241,6 @@ export function readPresence(state: unknown): PresenceV1 | null {
     viewport: readViewport(state.viewport),
     selection: readSelection(state.selection),
     gesture: readGesture(state.gesture),
+    view: readView(state.view),
   };
 }

@@ -1,4 +1,5 @@
 import type * as Y from 'yjs';
+import { basesCodec } from './bases-codec';
 import { canvasCodec } from './canvas-codec';
 
 /**
@@ -73,6 +74,39 @@ export interface StructuredCodec {
    * order, is not a change, and treating it as one rewrites the file under them.
    */
   equal(a: unknown, b: unknown): boolean;
+  /**
+   * The Obsidian view type that shows this format (`canvas`, `bases`). Open
+   * views of that type are flushed before a write and watched after it
+   * (SAFE-A19, text-view-guard.ts).
+   */
+  readonly viewType?: string;
+  /**
+   * Padding bucket for this format's sealed presence (CRYPTO-113), when its
+   * presence state is larger than the default bucket holds.
+   */
+  readonly presencePadBytes?: number;
+  /**
+   * The value to write, given the document's value and what disk holds now
+   * (`null` if unreadable or empty). For a format with keys that are each
+   * vault's own (SAFE-A21): put this vault's values for those keys back from
+   * disk, so a write never replaces them with another vault's. `equal` must
+   * then ignore those keys, or every write differs. Absent: write the
+   * document's value as it is.
+   */
+  withLocal?(docValue: unknown, diskValue: unknown): unknown;
+  /**
+   * Whether a concurrent overwrite of `key` in the root map `root` is only a
+   * matter of presentation — a sort, a size — that may converge on one value
+   * without a conflict copy (SAFE-A22). It is still logged. Must be false for
+   * anything that holds someone's writing, and for any key the codec does not
+   * know. Absent: nothing is.
+   */
+  presentationOnly?(root: string, key: string): boolean;
+  /**
+   * Whether writing over `text` would drop something the value cannot carry —
+   * YAML comments, say — so that the file must be backed up first (SAFE-A13).
+   */
+  dropsOnRewrite?(text: string): boolean;
 }
 
 /**
@@ -86,6 +120,7 @@ export interface StructuredCodec {
  */
 export const STRUCTURED_FORMATS: Readonly<Record<string, StructuredCodec>> = {
   '.canvas': canvasCodec,
+  '.base': basesCodec,
 };
 
 /** The codec for a file extension, or null. */

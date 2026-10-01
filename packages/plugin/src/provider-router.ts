@@ -207,6 +207,9 @@ export class ProviderRouter implements SyncProvider {
     else if (all.includes('signed-out')) next = 'signed-out';
     else if (all.includes('suspended')) next = 'suspended';
     else if (all.includes('device-limit')) next = 'device-limit';
+    // Too old for the server. Left out, it fell through to "connected", and a
+    // refused plugin showed green while nothing synced.
+    else if (all.includes('update-required')) next = 'update-required';
     else if (all.includes('disconnected')) next = 'disconnected';
     else if (all.includes('moving')) next = 'moving';
     else if (all.includes('restarting')) next = 'restarting';

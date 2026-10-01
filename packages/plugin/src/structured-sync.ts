@@ -4,7 +4,7 @@ import { loadSeqCheckpoint, saveSeqCheckpoint } from './seq-checkpoint';
 import { idbStoreName } from './idb-name';
 import { backupLocalFile, writeConflictCopy } from './local-backup';
 import { codecForFormat, codecForPath, type StructuredCodec } from './structured-formats';
-import { CANVAS_PRESENCE_PAD_BYTES, PRESENCE_PAD_BYTES } from './presence-seal';
+import { PRESENCE_PAD_BYTES } from './presence-seal';
 import type { DocIndex } from './doc-index';
 import type { SyncProvider } from './provider-router';
 import type { Awareness } from 'y-protocols/awareness';
@@ -49,7 +49,7 @@ function insideDeleted(type: Y.AbstractType<unknown>): boolean {
  * snapshot. A delete set cannot: a merged delta carries the sender's whole
  * set, including entries its own merge discarded unseen.
  */
-function madeOnTopOf(doc: Y.Doc, later: Y.Item, earlier: Y.Item): boolean {
+export function madeOnTopOf(doc: Y.Doc, later: Y.Item, earlier: Y.Item): boolean {
   let cur: Y.Item | null = later;
   for (let hops = 0; cur?.origin && hops < 10_000; hops++) {
     const o: Y.ID = cur.origin;
@@ -89,6 +89,22 @@ function lostUnseen(state: StructuredDocState, item: Y.Item): boolean {
   const successor = item.right;
   if (!successor) return false;
   return !madeOnTopOf(state.ydoc, successor, item);
+}
+
+/**
+ * The key, if `item` was an overwritten entry of a root map that its codec
+ * calls presentation-only (SAFE-A22), or null. Only a plain overwrite
+ * qualifies: an entry inside a deleted container held whatever it held.
+ */
+function presentationOnly(state: StructuredDocState, item: Y.Item): string | null {
+  const codec = state.codec;
+  if (!codec.presentationOnly || item.parentSub === null) return null;
+  const parent = item.parent as Y.AbstractType<unknown>;
+  if (insideDeleted(parent)) return null;
+  for (const [name, type] of state.ydoc.share) {
+    if (type === parent) return codec.presentationOnly(name, item.parentSub) ? item.parentSub : null;
+  }
+  return null;
 }
 
 /**
@@ -164,7 +180,7 @@ export interface StructuredDocState {
  * our write, or miss our write entirely and later save its stale copy back,
  * which would read as the user reverting the remote change (SAFE-A19). The
  * surface is how StructuredSync asks the view, without knowing what it is.
- * The canvas one is canvas-view-guard.ts; a live binding to the view would be
+ * The canvas one is text-view-guard.ts; a live binding to the view would be
  * another.
  */
 export interface StructuredSurface {
@@ -401,10 +417,10 @@ export class StructuredSync {
           {
             beforeRemoteUpdate: () => this.noteAcknowledged(state),
           },
-          // A canvas state is larger, and a card caret larger again: sealed in
-          // one bucket that holds both, so length does not say who is typing
-          // in a card (presence-seal.ts, WIRE-095).
-          { presencePadBytes: state.codec.format === 'canvas' ? CANVAS_PRESENCE_PAD_BYTES : PRESENCE_PAD_BYTES },
+          // A format whose presence is larger (a canvas pointer and card
+          // caret) names its own bucket, so length does not say what someone
+          // is doing (presence-seal.ts, CRYPTO-113, WIRE-095).
+          { presencePadBytes: state.codec.presencePadBytes ?? PRESENCE_PAD_BYTES },
         );
       } catch (err) {
         log.warn('Could not subscribe this structured file; it is not connected', {
@@ -523,7 +539,18 @@ export class StructuredSync {
       Y.iterateDeletedStructs(tr, tr.deleteSet, (struct) => {
         if (!(struct instanceof Y.Item)) return;
         if (!state.ourClients.has(struct.id.client)) return;
-        if (lostUnseen(state, struct)) lost++;
+        if (!lostUnseen(state, struct)) return;
+        const quiet = presentationOnly(state, struct);
+        if (quiet) {
+          // A sort, a size: one value wins and no copy is made (SAFE-A22).
+          // Logged, so the value that lost can still be found.
+          const lostValue: unknown = struct.content.getContent()[0];
+          log.info('A concurrent change replaced a view setting made here', {
+            path: state.localPath, key: quiet, lost: lostValue,
+          });
+          return;
+        }
+        lost++;
       });
       if (lost > 0) this.keepLostLocalVersion(state, lost);
       this.checkHandOff(state);
@@ -994,6 +1021,14 @@ export class StructuredSync {
           // made while Obsidian was closed looks exactly like a file the
           // last session never finished writing — so the file is kept aside.
           await backupLocalFile(this.vault, state.localPath, disk);
+        } else if (state.codec.dropsOnRewrite?.(disk)) {
+          // The file holds something the document cannot carry — YAML
+          // comments, say — and the write would drop it. Kept first: the user
+          // wrote it, and nothing else would (SAFE-A13).
+          await backupLocalFile(
+            this.vault, state.localPath, disk,
+            'A structured file held content a remote change cannot keep — backed up the local copy',
+          );
         } else if (disk !== state.lastSyncedText) {
           // Changed on disk since we last looked, and not yet read in: the
           // modify event has not arrived, or it did and could not be applied
@@ -1013,7 +1048,15 @@ export class StructuredSync {
         }
       }
 
-      const text = state.codec.serialise(state.codec.read(state.ydoc));
+      // This vault's own keys (SAFE-A21) come back from disk, not from the
+      // document: read again, since a backup above may have let a save in.
+      const docValue = state.codec.read(state.ydoc);
+      let outValue = docValue;
+      if (state.codec.withLocal) {
+        const now = parsed?.ok ? parsed.value : null;
+        outValue = state.codec.withLocal(docValue, now);
+      }
+      const text = state.codec.serialise(outValue);
       log.debug('Writing a structured document to disk', { path: state.localPath, bytes: text.length });
       state.writingText = text;
       try {

@@ -323,7 +323,7 @@ export class StartOverModal extends Modal {
       });
     new Setting(this.contentEl).addButton((btn) => {
       button = btn;
-      btn.setButtonText('Start over in 7 days').setWarning().setDisabled(true).onClick(() => {
+      btn.setButtonText('Start over in 7 days').setDestructive().setDisabled(true).onClick(() => {
         if (!startOverReady(typed, this.email)) return;
         this.settle(true);
         this.close();
@@ -953,7 +953,7 @@ export class ConfirmModal extends Modal {
     this.contentEl.createEl('p', { text: this.text.body });
     new Setting(this.contentEl)
       .addButton((b) => b.setButtonText(this.text.cancel).onClick(() => this.answer(false)))
-      .addButton((b) => b.setButtonText(this.text.confirm).setWarning().onClick(() => this.answer(true)));
+      .addButton((b) => b.setButtonText(this.text.confirm).setDestructive().onClick(() => this.answer(true)));
   }
 
   private answer(proceed: boolean): void {

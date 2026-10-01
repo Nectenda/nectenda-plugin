@@ -440,15 +440,23 @@ export class CanvasPresence {
 
     // A pan or zoom moves the world under a still mouse: re-read it.
     const canvas = this.canvas;
-    const orig = canvas.markViewportChanged;
+    // Called through a bound copy, because the directory's scan reports an
+    // unbound read of a method as a Warning. What is put back on stop is the
+    // property as it was, not that copy: restoring the very function lets
+    // wrappers stacked on one canvas unwind in order, each guard below still
+    // finding its own wrapper on top.
+    const orig = canvas.markViewportChanged.bind(canvas);
+    const before = Object.getOwnPropertyDescriptor(canvas, 'markViewportChanged');
     const wrapped = (): void => {
-      orig.call(canvas);
+      orig();
       this.onViewport();
     };
     canvas.markViewportChanged = wrapped;
     // Put back only if ours is still on top, so a later wrapper is not torn off.
     this.restore.push(() => {
-      if (canvas.markViewportChanged === wrapped) canvas.markViewportChanged = orig;
+      if (canvas.markViewportChanged !== wrapped) return;
+      if (before) Object.defineProperty(canvas, 'markViewportChanged', before);
+      else Reflect.deleteProperty(canvas, 'markViewportChanged'); // the prototype's shows through again
     });
 
     const onChange = (): void => {

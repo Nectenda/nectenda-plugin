@@ -1,4 +1,5 @@
 import type { StructuredCodec } from './structured-formats';
+import { CANVAS_PRESENCE_PAD_BYTES } from './presence-seal';
 import {
   applyCanvas, canonical, normaliseCanvas, readCanvas, type CanvasRecord, type CanvasValue,
 } from './canvas-model';
@@ -154,6 +155,11 @@ function meaning(v: CanvasValue): string {
 export const canvasCodec: StructuredCodec = {
   format: 'canvas',
   version: 1,
+  viewType: 'canvas',
+  // A canvas state is larger, and a card caret larger again: sealed in one
+  // bucket that holds both, so length does not say who is typing in a card
+  // (presence-seal.ts, WIRE-095).
+  presencePadBytes: CANVAS_PRESENCE_PAD_BYTES,
 
   parse(text) {
     let raw: unknown;

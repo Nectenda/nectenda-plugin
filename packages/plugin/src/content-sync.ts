@@ -11,7 +11,8 @@ import type { SyncProvider } from './provider-router';
 import { idbStoreName } from './idb-name';
 import { log } from './logger';
 import { seedDocument } from './seed-update';
-import { backupLocalFile } from './local-backup';
+import { backupLocalFile, writeConflictCopy } from './local-backup';
+import { FrontmatterSync } from './frontmatter-sync';
 
 const WRITE_DEBOUNCE = 500;
 /** Backoff step when the local file does not exist yet; multiplied by attempt. */
@@ -31,6 +32,9 @@ const BATCH_DELAY = 200;
  * literals silently disagreeing about the flags that decide whether a file is
  * overwritten.
  */
+/** Where a note's document remembers the client ids it wrote properties under. */
+const FRONTMATTER_CLIENTS_KEY = 'nectenda-frontmatter-clients';
+
 export interface FileDocState {
   docName: string;
   sharedFolderId: string;
@@ -73,6 +77,10 @@ export interface FileDocState {
   hasSyncedOnce: boolean;
   ignoreNextModify: boolean;
   observer: ((event: Y.YTextEvent, transaction: Y.Transaction) => void) | null;
+  /** The note's properties, merged per property. See frontmatter-sync.ts. */
+  frontmatter: FrontmatterSync | null;
+  /** Its listener for the provider's `synced:<doc>`, removed with it. */
+  frontmatterOnSynced: (() => void) | null;
 }
 
 /**
@@ -114,6 +122,8 @@ export interface ContentSyncDeps {
   noteMoved?(sharedFolderId: string, fromPath: string, toPath: string): void;
   /** A note deleted or moved out, so a size record goes with it. */
   noteGone?(sharedFolderId: string, relativePath: string): void;
+  /** Tell the user something. Optional so a test need not; logged regardless. */
+  notify?(message: string): void;
 }
 
 /** One document as `ContentSync.trackedDocs` reports it. */
@@ -387,6 +397,8 @@ export class ContentSync {
       hasSyncedOnce: false,
       ignoreNextModify: false,
       observer: null,
+      frontmatter: null,
+      frontmatterOnSynced: null,
     };
 
     this.fileDocs.set(docName, state);
@@ -451,6 +463,11 @@ export class ContentSync {
       state.observer = observer;
       ytext.observe(observer);
 
+      // Properties merged per property, beside the text. Attached here, after
+      // IndexedDB has loaded, so its first reading of the note is the restored
+      // one and not an empty document. See frontmatter-sync.ts.
+      this.attachFrontmatter(state);
+
       // Reconcile disk against the document once, now.
       //
       // The observer only fires on *changes*. A document can arrive already
@@ -499,6 +516,7 @@ export class ContentSync {
         await this.seedIfEmpty(state);
         state.hasSyncedOnce = true;
         this.changed();
+        state.frontmatter?.onSynced();
         if (!state.editorActive) this.scheduleDiskWrite(state);
       };
       const onFirstSync = (): void => {
@@ -519,6 +537,57 @@ export class ContentSync {
     } else {
       idbProvider.once('synced', startSync);
     }
+  }
+
+  /**
+   * Start merging this note's properties per property.
+   *
+   * Everything it does to the vault goes through the same helpers text sync
+   * uses, so a conflict copy or a backup of a note looks the same whichever
+   * part of sync made it. They are fired, not awaited: the caller is inside a
+   * Yjs transaction, which cannot wait, and the text each is given was read
+   * before it returns.
+   */
+  private attachFrontmatter(state: FileDocState): void {
+    const { docName } = state;
+    const fm = new FrontmatterSync(state.ydoc, state.ytext, {
+      docName,
+      relativePath: state.relativePath,
+      isSynced: () => state.hasSyncedOnce && this.provider.isSynced(docName),
+      keepConflictCopy: (text) => {
+        void writeConflictCopy(this.vault, state.localPath, text).then((copy) => {
+          if (!copy) return;
+          this.deps.notify?.(
+            `Nectenda: a property of "${state.relativePath}" was changed in two places at once. ` +
+            'Your version was kept as a conflict copy beside it.',
+          );
+        });
+      },
+      backup: (text, reason) => { void this.backupLocalFile(state.localPath, text, reason); },
+      notify: (message) => this.deps.notify?.(message),
+      loadClients: async () => {
+        const raw = (await state.idbProvider.get(FRONTMATTER_CLIENTS_KEY)) as string | undefined | null;
+        const ids = raw ? (JSON.parse(raw) as unknown) : [];
+        return Array.isArray(ids) ? ids.filter((id): id is number => typeof id === 'number') : [];
+      },
+      // Returned, not caught: FrontmatterSync forgets an id whose save failed,
+      // so its next write tries again.
+      saveClients: async (ids) => {
+        await state.idbProvider.set(FRONTMATTER_CLIENTS_KEY, JSON.stringify(ids));
+      },
+    });
+    const onSynced = (): void => fm.onSynced();
+    state.frontmatter = fm;
+    state.frontmatterOnSynced = onSynced;
+    fm.attach();
+    this.provider.on(`synced:${docName}`, onSynced);
+  }
+
+  private detachFrontmatter(state: FileDocState): void {
+    if (state.frontmatterOnSynced) this.provider.off(`synced:${state.docName}`, state.frontmatterOnSynced);
+    state.frontmatter?.detach();
+    state.frontmatter = null;
+    state.frontmatterOnSynced = null;
   }
 
   /** See `local-backup.ts`. A method so the call sites below stay as they were. */
@@ -707,6 +776,7 @@ export class ContentSync {
 
     if (state.writeTimer) window.clearTimeout(state.writeTimer);
     if (state.observer) state.ytext.unobserve(state.observer);
+    this.detachFrontmatter(state);
     this.provider.unsubscribe(docName);
     void state.idbProvider.destroy().catch((err: unknown) => {
       log.warn('IndexedDB teardown failed', { error: String(err) });

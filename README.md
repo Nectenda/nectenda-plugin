@@ -2,6 +2,8 @@
 
 **End-to-end encrypted real-time collaborative editing for [Obsidian](https://obsidian.md).**
 
+![Two people editing one Obsidian note and one canvas at the same time: each one's named pointer, caret and selection shown to the other, with cards moved, resized, linked and typed in at once.](https://nectenda.com/assets/hero/readme.webp)
+
 Live cursors, offline editing, shared folders and attachments — on a server that
 **cannot read your notes**. Content is encrypted on your device before it is
 sent; the server stores ciphertext it has no key for, and document paths are

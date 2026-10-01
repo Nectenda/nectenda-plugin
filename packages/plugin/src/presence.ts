@@ -131,4 +131,19 @@ export function initials(name: string): string {
 export interface Person {
   name: string;
   color: string;
+  /** Which view of the file they are on, where a file has several (a base's views, WIRE-096). */
+  where?: string;
+  /** The property they have focused in the note's Properties panel (WIRE-097). */
+  editing?: string;
+}
+
+/**
+ * A circle's title: the name, which identifies them on hover, then where in
+ * the file they are — the view of a base (WIRE-096), or the property they are
+ * editing in a note's panel (WIRE-097), whose inputs no caret shows.
+ */
+export function presenceTitle(person: Person): string {
+  if (person.editing !== undefined) return `${person.name} — editing "${person.editing}"`;
+  if (person.where !== undefined) return `${person.name} — on "${person.where}"`;
+  return person.name;
 }

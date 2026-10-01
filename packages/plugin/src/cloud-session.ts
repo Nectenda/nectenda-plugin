@@ -3,6 +3,7 @@ import { ShardClient, IdentityError, type DeviceFields, type ShardSession } from
 import { log } from './logger';
 import { serverFetch } from './client-version.js';
 import { apiBaseUrl } from '@nectenda/shared';
+import type { ConnectionStatus } from './header-status';
 
 /**
  * What the plugin keeps about a Nectenda Cloud sign-in, and how it turns an
@@ -65,6 +66,56 @@ export function deviceOf(report: NonNullable<ShardSession['device']>): NonNullab
  */
 export function syncsHere(m: Pick<StoredMembership, 'accountStatus' | 'token' | 'device'>): boolean {
   return m.accountStatus !== 'moved' && !!m.token && m.device?.enrolled !== false;
+}
+
+/**
+ * Whether this vault syncs a folder from an organisation that refused this
+ * device. Such a membership has no connection at all (`syncsHere`), so the
+ * provider's aggregate never hears about it.
+ */
+export function refusedHere(
+  memberships: ReadonlyArray<Pick<StoredMembership, 'id' | 'device'>>,
+  mappings: ReadonlyArray<{ membershipId?: string }>,
+): boolean {
+  const refused = new Set(memberships.filter((m) => m.device?.enrolled === false).map((m) => m.id));
+  return mappings.some((f) => !!f.membershipId && refused.has(f.membershipId));
+}
+
+/**
+ * The connection state to show. The provider's aggregate, except that a
+ * folder whose organisation refused this device makes it the device limit: its
+ * connection was dropped rather than left refusing, so the aggregate is of the
+ * others, and said "Connected" while that folder synced nothing. Only a state
+ * worse than the device limit, one the person must act on first, stands.
+ */
+export function shownConnection(
+  status: ConnectionStatus,
+  memberships: ReadonlyArray<Pick<StoredMembership, 'id' | 'device'>>,
+  mappings: ReadonlyArray<{ membershipId?: string }>,
+): ConnectionStatus {
+  if (status === 'signed-out' || status === 'suspended') return status;
+  return refusedHere(memberships, mappings) ? 'device-limit' : status;
+}
+
+/**
+ * The connection state to record after a membership refresh, from the
+ * provider's own. Not yet connected is "offline" (it is connecting); a state
+ * the person must act on is kept as it is. It once fell to "disconnected",
+ * so a refresh that finished after the server refused this build replaced
+ * "Update the plugin to keep syncing" with a plain disconnect.
+ */
+export function afterRefresh(status: string | undefined): ConnectionStatus {
+  switch (status) {
+    case 'connected': return 'connected';
+    case 'connecting': return 'offline';
+    case 'idle': return 'idle';
+    case 'update-required':
+    case 'device-limit':
+    case 'suspended':
+    case 'signed-out':
+      return status;
+    default: return 'disconnected';
+  }
 }
 
 export function membershipId(shardId: string, accountId: string): string {

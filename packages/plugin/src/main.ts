@@ -44,7 +44,7 @@ import { DEFAULT_SETTINGS, DEFAULT_IDENTITY_URL, type NectendaSettings } from '.
 import { type ChangeReason, type PaneSection, sectionsFor, REFRESH_COALESCE_MS, PANE_POLL_MS, ChangeFanout, SectionGenerations } from './pane-refresh';
 import { foldersSyncingLine, migrateStatusPlaces, formatBytes, describeAge, ambiguousNames, storageSummary, forgetUnmappedRecords, membershipShape, organisationSummary, organisationWarning, pageName, type FolderServer, pagesKey, type SentInviteStatus, sentInviteStatus, sentInviteDescription, shouldCreateFirstOrganisation } from './pane-summaries';
 import { newPkce, pollForResult, type SignInResult } from './auth-flow';
-import { establishMemberships, enrolNewSeats, membershipId, type StoredMembership, syncsHere, deviceOf } from './cloud-session';
+import { establishMemberships, enrolNewSeats, membershipId, type StoredMembership, syncsHere, deviceOf, shownConnection, afterRefresh } from './cloud-session';
 import { ObsidianVaultAdapter } from './obsidian-vault';
 import { PROVIDER_LABELS, PROVIDER_ORDER, providerMark, providerStartUrl, type ProviderName } from './provider-marks';
 import { nectendaMark, nectendaWordmark } from './brand-marks';
@@ -72,8 +72,10 @@ import { MultiplexedProvider } from './multiplexed-provider';
 import { ContentSync } from './content-sync';
 import { StructuredSync } from './structured-sync';
 import { STRUCTURED_FORMATS } from './structured-formats';
-import { CanvasViewGuard } from './canvas-view-guard';
+import { TextViewGuard } from './text-view-guard';
 import { CanvasLiveManager, bindingForCanvas, type CanvasLiveBinding } from './canvas-live';
+import { BASES_PRESENCE_TICK_MS, BasesPresence, basesViewLike, type BasesViewLike } from './bases-presence';
+import { PropertyFocus } from './property-focus';
 import type { CanvasViewInternal } from './canvas-internals';
 import { canvasCardBinding } from './canvas-card-binding';
 import { PendingEdits } from './pending-edits';
@@ -108,7 +110,7 @@ import { getOrCreateDeviceId } from './device';
 import { DEFAULT_MAX_BLOB_BYTES } from '@nectenda/shared';
 import { VaultWatcher } from './vault-watcher';
 import { log, setLogSink, setVerboseLogging } from './logger';
-import { initials, type Person } from './presence';
+import { initials, presenceTitle, type Person } from './presence';
 import { serverFetch } from './client-version.js';
 
 
@@ -334,11 +336,14 @@ export default class NectendaPlugin extends Plugin {
   provider: ProviderRouter | null = null;
   contentSync: ContentSync | null = null;
   structuredSync: StructuredSync | null = null;
-  private canvasViewGuard: CanvasViewGuard | null = null;
+  private textViewGuard: TextViewGuard | null = null;
   /** Open canvases bound live to their documents (canvas-live.ts). */
   private canvasLive: CanvasLiveManager | null = null;
   /** Header reports for live canvases, by view, for the active one to repaint. */
   private canvasReporters = new Map<unknown, () => void>();
+  /** Who has each open base open, and on which view (bases-presence.ts, WIRE-096). */
+  private basesPresence: BasesPresence | null = null;
+  private propertyFocus: PropertyFocus | null = null;
   /** Each live canvas view's presence, for "go to" from the presence circles. */
   private canvasPresences = new Map<unknown, CanvasPresence>();
   editorBridge: EditorBridge | null = null;
@@ -505,7 +510,7 @@ export default class NectendaPlugin extends Plugin {
     // Obsidian's icons above, before the ribbon asks for it.
     this.headerStatus = new HeaderStatus({
       app: this.app,
-      connection: () => this.connectionStatus,
+      connection: () => this.shownConnection(),
       statusIndex: () => this.statusIndex(),
       peopleInActiveNote: () => this.presentPeople,
       invites: () => this.settings.pendingInvites?.length ?? 0,
@@ -538,6 +543,8 @@ export default class NectendaPlugin extends Plugin {
     this.registerEvent(this.app.workspace.on('layout-change', () => {
       this.refreshStatusUi();
       this.canvasLive?.refresh();
+      this.basesPresence?.refresh();
+      this.propertyFocus?.later();
     }));
     this.registerEvent(this.app.workspace.on('active-leaf-change', (leaf) => {
       // Remembered because the inspector takes focus when it opens, and from
@@ -546,11 +553,33 @@ export default class NectendaPlugin extends Plugin {
       this.refreshStatusUi();
       this.canvasLive?.refresh();
       if (leaf?.view) this.canvasReporters.get(leaf.view)?.();
+      this.basesPresence?.refresh();
+      // Later, not now: the editor bridge binds the new note on this same
+      // event, and the focus goes out on the note it binds.
+      this.propertyFocus?.later();
     }));
     this.registerEvent(this.app.workspace.on('file-open', () => {
       this.refreshStatusUi();
       this.canvasLive?.refresh();
+      this.basesPresence?.refresh();
+      this.propertyFocus?.later();
     }));
+    // Which property of the Properties panel has focus (WIRE-097): its inputs
+    // are not the editor, so only the document's focus events say.
+    this.registerDomEvent(document, 'focusin', () => this.propertyFocus?.later());
+    this.registerDomEvent(document, 'focusout', () => this.propertyFocus?.later());
+    // A property changed rebuilds the panel's rows, and with them the marks.
+    this.registerEvent(this.app.metadataCache.on('changed', () => this.propertyFocus?.later()));
+    // Picking another view inside a base changes only the leaf's state, which
+    // no workspace event is documented to report: checked on a short tick
+    // instead. Only a change is sent (WIRE-091), so an idle tick costs a parse
+    // of each open base and nothing on the wire.
+    this.registerInterval(window.setInterval(() => {
+      this.basesPresence?.refresh();
+      // A backstop for a panel rebuilt with no event this sees, and for a
+      // focus dropped when the bridge replaced the note's state on binding.
+      this.propertyFocus?.sync();
+    }, BASES_PRESENCE_TICK_MS));
     this.registerView(INSPECTOR_VIEW, (leaf) => createInspectorView(
       leaf,
       this.inspectorDeps(),
@@ -1673,11 +1702,7 @@ export default class NectendaPlugin extends Plugin {
     // Read the provider's own word for it rather than collapsing everything
     // that is not yet connected into "disconnected": straight after a reconcile
     // it is connecting, and saying otherwise for that moment was a lie.
-    const status = this.provider?.status();
-    if (status === 'connected') this.updateStatus('connected');
-    else if (status === 'connecting') this.updateStatus('offline');
-    else if (status === 'idle') this.updateStatus('idle');
-    else this.updateStatus('disconnected');
+    this.updateStatus(afterRefresh(this.provider?.status()));
     if (enrol) this.reportRefusedDevice(memberships);
     this.notifyChange('memberships');
     // A seat taken or an invitation claimed shows up here first, so this is
@@ -1687,6 +1712,9 @@ export default class NectendaPlugin extends Plugin {
 
   /** Bring the live connections into line with the stored memberships. */
   private reconcileConnections(): void {
+    // A membership refused or re-admitted changes what the icons show even
+    // when no socket changes (shownConnection).
+    this.refreshStatusUi();
     if (!this.provider) return;
     const wanted = new Map(this.buildConnections().map((c) => [c.id, c]));
     for (const live of this.provider.list()) {
@@ -2416,7 +2444,11 @@ export default class NectendaPlugin extends Plugin {
           : src;
         if (!state.isSkipped(mapping.sharedFolderId, relative)) continue;
 
-        const notice = embed.createDiv({ cls: 'nectenda-surface nectenda-skipped-attachment' });
+        // Beside the embed, not inside it: Obsidian loads the embed after
+        // post-processors run and replaces its contents with its own "could
+        // not be found", which took this with it the moment it was drawn.
+        const notice = createDiv({ cls: 'nectenda-surface nectenda-skipped-attachment' });
+        embed.after(notice);
         notice.createDiv({
           text: `${relative} was not downloaded to this device.`,
           cls: 'setting-item-description',
@@ -2425,7 +2457,16 @@ export default class NectendaPlugin extends Plugin {
         button.onclick = () => {
           button.disabled = true;
           button.setText('Downloading...');
-          void this.retryAttachment(mapping.sharedFolderId, relative);
+          // Beside the embed, nothing redraws this once the file arrives: it
+          // goes itself when the download works, and offers again when not.
+          void this.retryAttachment(mapping.sharedFolderId, relative).then((ok) => {
+            if (ok) {
+              notice.remove();
+            } else {
+              button.disabled = false;
+              button.setText('Download on this device');
+            }
+          });
         };
       }
     });
@@ -2570,16 +2611,17 @@ export default class NectendaPlugin extends Plugin {
   }
 
   /** Try a skipped attachment again, from settings or from the note itself. */
-  async retryAttachment(folderId: string, relativePath: string): Promise<void> {
+  async retryAttachment(folderId: string, relativePath: string): Promise<boolean> {
     await this.deviceState?.retry(folderId, relativePath);
     const entry = this.fileSync?.getBlobEntry(folderId, relativePath);
     if (!entry) {
       new Notice('Nectenda: that attachment is no longer shared.');
-      return;
+      return false;
     }
     new Notice(`Nectenda: downloading "${relativePath}"...`);
     const ok = await this.blobSync?.download(folderId, relativePath, entry);
     if (!ok) new Notice(`Nectenda: "${relativePath}" could not be downloaded.`);
+    return !!ok;
   }
 
   /**
@@ -2825,6 +2867,7 @@ export default class NectendaPlugin extends Plugin {
       checkNoteSize: (folderId, path, bytes) => this.oversizedNotes.check(folderId, path, bytes),
       noteMoved: (folderId, from, to) => this.oversizedNotes.move(folderId, from, to),
       noteGone: (folderId, path) => this.oversizedNotes.forget(folderId, path),
+      notify: (message) => new Notice(message, 10000),
     }, this.provider, vaultAdapter);
     // A file whose subscribe was refused for want of a connection is retried
     // when one appears, rather than waiting for something to touch it again.
@@ -2836,11 +2879,18 @@ export default class NectendaPlugin extends Plugin {
       this.structuredSync?.retryUnplaced();
     });
 
-    // Files merged key by key: `.canvas` today (canvas-codec.ts). An open
-    // canvas is asked to save before its file is replaced, and checked for
-    // having loaded the write (canvas-view-guard.ts, SAFE-A19).
-    this.canvasViewGuard?.dispose();
-    this.canvasViewGuard = new CanvasViewGuard(() => this.app.workspace.getLeavesOfType('canvas')
+    // Files merged key by key: `.canvas` and `.base` (structured-formats.ts).
+    // An open view of one is asked to save before its file is replaced, and
+    // checked for having loaded the write (text-view-guard.ts, SAFE-A19).
+    // Every view type a registered format names is watched; a view that is not
+    // a TextFileView is not one the guard can flush, and the contract spec
+    // fails if Obsidian stops making these views TextFileViews.
+    const guardedViewTypes = [...new Set(Object.values(STRUCTURED_FORMATS)
+      .map((codec) => codec.viewType)
+      .filter((t): t is string => typeof t === 'string'))];
+    this.textViewGuard?.dispose();
+    this.textViewGuard = new TextViewGuard(() => guardedViewTypes
+      .flatMap((type) => this.app.workspace.getLeavesOfType(type))
       .map((leaf) => leaf.view)
       .filter((view): view is TextFileView => view instanceof TextFileView));
     this.structuredSync = new StructuredSync({
@@ -2849,7 +2899,7 @@ export default class NectendaPlugin extends Plugin {
       vaultKey: () => this.vaultKey,
       formats: STRUCTURED_FORMATS,
       notify: (message) => new Notice(message, 10000),
-      surface: this.canvasViewGuard,
+      surface: this.textViewGuard,
     }, this.provider, vaultAdapter);
 
     // An open canvas of a shared file is bound live (canvas-live.ts): the
@@ -2874,6 +2924,26 @@ export default class NectendaPlugin extends Plugin {
     // Canvases already open: no workspace event will say so. It keeps trying
     // until each one's document has connected.
     this.canvasLive.refresh();
+
+    this.basesPresence?.dispose();
+    const basesViews = (): (BasesViewLike & { view: TextFileView })[] => this.app.workspace.getLeavesOfType('bases')
+      .map((leaf) => leaf.view)
+      .filter((view): view is TextFileView => view instanceof TextFileView)
+      .map((view) => basesViewLike(view));
+    this.basesPresence = new BasesPresence({
+      structured,
+      views: basesViews,
+      active: () => {
+        const view = this.app.workspace.getActiveViewOfType(TextFileView);
+        return view && view.getViewType() === 'bases' ? basesViews().find((v) => v.view === view) ?? null : null;
+      },
+      username: () => this.presenceName(),
+      userColor,
+      report: (people) => this.updatePresence(people),
+      folderRoot: (path) => this.folderRootOf(path),
+      notify: (m) => new Notice(m, 10000),
+    });
+    this.basesPresence.refresh();
 
     // File operations sync (meta docs)
     this.fileSync = new FileSync({
@@ -2956,6 +3026,17 @@ export default class NectendaPlugin extends Plugin {
       this.updatePresence(people);
     });
     this.editorBridge.start();
+
+    this.propertyFocus?.dispose();
+    const bridge = this.editorBridge;
+    this.propertyFocus = new PropertyFocus({
+      bound: () => bridge.boundPresence(),
+      panes: (path) => this.app.workspace.getLeavesOfType('markdown')
+        .flatMap((leaf) => leaf.view instanceof MarkdownView && leaf.view.file?.path === path ? [leaf.view.containerEl] : []),
+      folderRoot: (path) => this.folderRootOf(path),
+      activeElement: () => document.activeElement,
+    });
+    this.propertyFocus.sync();
 
     // Connect meta docs and content sync for all mapped folders.
     //
@@ -3079,10 +3160,12 @@ export default class NectendaPlugin extends Plugin {
     // Live canvases let go first: they hold documents about to be destroyed.
     this.canvasLive?.dispose();
     this.canvasLive = null;
+    this.basesPresence?.dispose();
+    this.basesPresence = null;
     this.structuredSync?.disconnectAll();
     this.structuredSync = null;
-    this.canvasViewGuard?.dispose();
-    this.canvasViewGuard = null;
+    this.textViewGuard?.dispose();
+    this.textViewGuard = null;
     // Before the provider goes, so every in-flight transfer is aborted while
     // the state it would write into still exists. void-fired teardown racing
     // async work has caused at least four bugs in this codebase.
@@ -3092,6 +3175,8 @@ export default class NectendaPlugin extends Plugin {
     this.fileSync = null;
     this.folderIndicator?.stop();
     this.folderIndicator = null;
+    this.propertyFocus?.dispose();
+    this.propertyFocus = null;
     this.editorBridge?.stop();
     this.editorBridge = null;
     this.provider?.destroy();
@@ -3191,6 +3276,15 @@ export default class NectendaPlugin extends Plugin {
       }
     }
     this.notifyChange('structure');
+  }
+
+  /**
+   * The connection state the icons and the pane show: `connectionStatus`,
+   * unless a folder here belongs to an organisation that refused this device,
+   * whose connection is dropped and so is in no aggregate (cloud-session.ts).
+   */
+  shownConnection(): ConnectionStatus {
+    return shownConnection(this.connectionStatus, this.settings.memberships, this.settings.folderMappings);
   }
 
   updateStatus(status: ConnectionStatus): void {
@@ -3550,8 +3644,7 @@ export default class NectendaPlugin extends Plugin {
       dot.style.backgroundColor = person.color;
       // The name is the true identifier; the colour is only the fast read.
       dot.setAttr('aria-label', `Go to ${person.name}`);
-      // The title stays the bare name: it is what identifies them on hover.
-      dot.setAttr('title', person.name);
+      dot.setAttr('title', presenceTitle(person));
       dot.addClass('mod-clickable');
       dot.addEventListener('click', () => this.goToPerson(person.name));
     }
@@ -3571,8 +3664,21 @@ export default class NectendaPlugin extends Plugin {
    */
   private goToPerson(name: string): void {
     const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+    const other = view ? null : this.app.workspace.getActiveViewOfType(TextFileView);
+    if (other?.getViewType() === 'bases') {
+      // In a base: their view, through the leaf's public state.
+      const where = this.basesPresence?.viewOf(name) ?? null;
+      if (where === null) {
+        new Notice(`${name} is not on a view of this base right now.`);
+        return;
+      }
+      void other.setState({ ...other.getState(), viewName: where }, { history: false })
+        .then(() => this.basesPresence?.refresh())
+        .catch((err: unknown) => log.warn('Could not switch a base to a collaborator\'s view', { error: String(err) }));
+      return;
+    }
     if (!view) {
-      const canvas = this.app.workspace.getActiveViewOfType(TextFileView);
+      const canvas = other;
       const presence = canvas ? this.canvasPresences.get(canvas) : undefined;
       if (!presence?.goTo(name)) new Notice(`${name} is not pointing or typing on this canvas right now.`);
       return;
@@ -3590,6 +3696,15 @@ export default class NectendaPlugin extends Plugin {
     } else {
       view.editor.scrollIntoView({ from: pos, to: pos }, true);
     }
+  }
+
+  /**
+   * The local root of the shared folder a file is inside, or null. A focus is
+   * sent relative to it, and only for a file under it (WIRE-096, WIRE-097).
+   */
+  private folderRootOf(path: string): string | null {
+    const m = this.settings.folderMappings.find((mapping) => path.startsWith(mapping.localPath + '/'));
+    return m ? m.localPath : null;
   }
 
   /** The name this device shows to others in a note. */
@@ -4677,9 +4792,10 @@ export class NectendaSettingTab extends PluginSettingTab {
   private displayStatusLine(containerEl: HTMLElement): void {
     const folders = this.plugin.settings.folderMappings.length;
     const locked = this.plugin.settings.folderMappings.filter((m) => !this.plugin.folderCrypto.hasKeys(m.sharedFolderId)).length;
-    const parts = [CONNECTION_LABELS[this.plugin.connectionStatus], foldersSyncingLine(folders, locked)];
+    const shown = this.plugin.shownConnection();
+    const parts = [CONNECTION_LABELS[shown], foldersSyncingLine(folders, locked)];
     const row = new Setting(containerEl).setName('Status').setDesc(parts.join(' · '));
-    if (locked || PROBLEM_CONNECTIONS.has(this.plugin.connectionStatus)) row.descEl.addClass('mod-warning');
+    if (locked || PROBLEM_CONNECTIONS.has(shown)) row.descEl.addClass('mod-warning');
   }
 
   /** The first-run checklist: what is done, what is next. */
@@ -4761,7 +4877,8 @@ export class NectendaSettingTab extends PluginSettingTab {
   /** A folder row's value on the home pane: the one thing to know before opening it. */
   private folderSummary(m: FolderMapping): string {
     if (!this.plugin.folderCrypto.hasKeys(m.sharedFolderId)) return LABELS.needsPassphrase;
-    const status = this.plugin.connectionStatus;
+    // Per folder: only this folder's organisation decides whether it syncs.
+    const status = shownConnection(this.plugin.connectionStatus, this.plugin.settings.memberships, [m]);
     if (status === 'connected') return 'Syncing';
     return CONNECTION_LABELS[status];
   }
@@ -4816,7 +4933,7 @@ export class NectendaSettingTab extends PluginSettingTab {
     new Setting(c)
       .setName(LABELS.stopSyncingHere)
       .setDesc('This vault stops syncing the folder. Your notes stay where they are, and nobody else is affected. You can add it again later.')
-      .addButton((btn) => btn.setButtonText(LABELS.stopSyncingHere).setWarning().onClick(async () => {
+      .addButton((btn) => btn.setButtonText(LABELS.stopSyncingHere).setDestructive().onClick(async () => {
         this.plugin.settings.folderMappings = this.plugin.settings.folderMappings.filter((x) => x.sharedFolderId !== m.sharedFolderId);
         await this.plugin.saveSettings();
         this.plugin.refreshSync();
@@ -5056,7 +5173,11 @@ export class NectendaSettingTab extends PluginSettingTab {
       );
     const shareLinkRow = containerEl.createDiv();
     this.renderShareLinkRow(shareLinkRow, m, null);
-    void this.loadShareLinkRow(shareLinkRow, m);
+    // Once the page is in the document, not now: a page is drawn before
+    // Obsidian attaches it, and loadShareLinkRow takes a detached row for one
+    // an action left behind and drops it. Started here, it was never asked,
+    // and an owner saw Copy alone with no way to take a link back.
+    window.setTimeout(() => void this.loadShareLinkRow(shareLinkRow, m), 0);
     this.displaySentInvitations(containerEl, m.accountId);
   }
 
@@ -5132,7 +5253,7 @@ export class NectendaSettingTab extends PluginSettingTab {
         );
       } else if (action === 'off') {
         row.addButton((btn) =>
-          btn.setButtonText('Turn off…').setWarning().onClick(async () => {
+          btn.setButtonText('Turn off…').setDestructive().onClick(async () => {
             if (!(await this.confirmTurnOffShareLink(m.accountName))) return;
             try {
               await setShareLinkEnabled(server(), false, fetch);
@@ -6721,7 +6842,7 @@ export class NectendaSettingTab extends PluginSettingTab {
           .setName('Lost both the passphrase and the recovery key?')
           .setDesc('Nobody can decrypt what they protected, including us. You can start over with a new, empty account for this address.')
           .addButton((btn) =>
-            btn.setButtonText('Start over').setWarning().onClick(() => {
+            btn.setButtonText('Start over').setDestructive().onClick(() => {
               const email = this.plugin.settings.identity?.email;
               if (!email) return;
               new StartOverModal(this.app, email, (confirmed) => {

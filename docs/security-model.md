@@ -29,11 +29,11 @@ more than it should about where to push on a system nobody has audited yet.
 | Note and folder *paths* | **No** — document ids are HMACs of the path |
 | Attachment content | **No** — sealed in a chunked AEAD envelope |
 | Attachment filenames | **No** — they live inside the encrypted listing |
-| Structured file content and names | **No** — a file merged key by key (no format uses this yet) is a document like a note: the same ciphertext, an HMAC id, and its name inside the encrypted listing |
+| Structured file content and names | **No** — a file merged key by key (a canvas, a base) is a document like a note: the same ciphertext, an HMAC id, and its name inside the encrypted listing |
 | Your passphrase | **No** — on the hosted service, never sent in any form; a self-hosted server receives an independent derivation that cannot yield the key |
 | Your private key | **No** — stored wrapped, unwrappable only by your password |
 | Folder display names | **No** — sealed under the folder's content key |
-| Who is where in a note (presence) | **No** — names, colours and caret positions are sealed; that someone has a note open, and how often their presence changes, is visible |
+| Who is where in a note (presence) | **No** — names, colours, caret positions, which view and entry of a base someone is on, and which property they are editing are sealed; that someone has a note open, and how often their presence changes, is visible |
 | Who shares a folder with whom | **Yes** |
 | Sizes, timing, device and account records | **Yes** |
 
@@ -194,14 +194,21 @@ marketing.
   the server and relayed to everyone else with the note open. Its contents are
   sealed under the folder's content key and bound to that note, that
   participant and that moment, so the server can neither read a state nor move
-  it to another note. It is padded to a multiple of 512 bytes (1024 on a
-  canvas, whose states are larger), so its length does not show whether your
-  editor has focus, whether you are typing in a canvas card, or what moved (a
+  it to another note. It is padded to a multiple of 1024 bytes, so its
+  length does not show whether you have a caret, whether you are typing in a
+  canvas card or editing a property, or what moved (a
   very long canvas selection, or a drag of many cards at once, does still show
   that it is long). On an open canvas the same sealed state carries where your pointer
   is on the board, what you have selected, where your caret is in a card you
   are typing in, and a drag or connection you have not dropped yet — none of
-  it readable by the server. What the server does see is that a device has the
+  it readable by the server. In an open base it carries which of the base's
+  views you are on, by name and layout, and which entry you are on — the
+  table cell you have selected, or the card under your pointer — as that
+  note's path within the shared folder and, in a table, the property's name.
+  In an open note it carries the property you have focused in the
+  Properties panel, by name. All of it is sealed, and in the same 1024-byte
+  bucket, so the length shows neither which entry nor whether you are in the
+  panel, unless a path runs to some 600 characters. What the server does see is that a device has the
   note open (it knows that from the subscription anyway), and when and how
   often that device's presence changes. That rate can tell typing apart from
   moving a pointer. Hiding it would need cover traffic, which Nectenda does not
@@ -327,9 +334,12 @@ someone has read, they have.
   Content keys are not rotated today: a folder keeps its first key for its
   whole life, including after a member is removed, so a removed member's copy
   of the key would still open anything they could get hold of. What stops them
-  is the server no longer serving them, except that an attachment download
-  link it was already given stays valid for that link's lifetime, an hour by
-  default. Rotation is provided for in the key
+  is the server no longer serving them, from the moment of removal: a
+  connection they still hold open is sent nothing further from the folder
+  (WIRE-065). Until 30 September 2026 such a connection kept receiving new
+  updates until it next sent something (NEC-183). The one exception: an
+  attachment download link they were already given stays valid for that
+  link's lifetime, an hour by default. Rotation is provided for in the key
   format; even then it would limit the window, and it does not erase the past.
   The server also
   keeps earlier whole-document versions of each note, still as ciphertext
