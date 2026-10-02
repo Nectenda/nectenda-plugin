@@ -87,7 +87,7 @@ import { EditorBridge, presenceReporter, userColor } from './editor-bridge';
 import type { FolderMapping } from './editor-bridge';
 import { basenameOf, mappingCovering } from './folder-mapping';
 import { FolderIndicator } from './folder-indicator';
-import { FileStatusIndicator, buildStatusIndex } from './file-status-indicator';
+import { FileStatusIndicator, buildEntryStatus, buildStatusIndex } from './file-status-indicator';
 import { CONNECTION_LABELS, HEADER_ICON, HeaderStatus, PROBLEM_CONNECTIONS, countOthers, mayHide, registerHeaderIcon, type ConnectionStatus, type StatusPlaces } from './header-status';
 import { INSPECTOR_VIEW, createInspectorView, isInspector, type InspectorDeps } from './sync-inspector';
 import { KeyGrantService, nextGrantDelayMs, waitingKey } from './key-grants';
@@ -2942,6 +2942,13 @@ export default class NectendaPlugin extends Plugin {
       report: (people) => this.updatePresence(people),
       folderRoot: (path) => this.folderRootOf(path),
       notify: (m) => new Notice(m, 10000),
+      // The explorer's setting: one switch for every sync-status mark.
+      entryStatus: () => this.settings.fileStatusIcons ? buildEntryStatus({
+        mappings: () => this.settings.folderMappings,
+        trackedDocs: () => this.contentSync?.trackedDocs() ?? [],
+        docSyncState: (docName) => this.provider?.docSyncState(docName) ?? null,
+        structuredDocName: (path) => this.structuredSync?.docNameFor(path) ?? null,
+      }) : null,
     });
     this.basesPresence.refresh();
 
@@ -3293,6 +3300,11 @@ export default class NectendaPlugin extends Plugin {
     this.notifyChange('connection');
   }
 
+  /** The shared-entry dots in open bases, after the setting that gates them changed. */
+  redrawBasesShared(): void {
+    this.basesPresence?.redrawShared();
+  }
+
   /** A status lookup for one redraw, from the engine and provider as they stand. */
   private statusIndex(): ReturnType<typeof buildStatusIndex> {
     return buildStatusIndex({
@@ -3312,6 +3324,7 @@ export default class NectendaPlugin extends Plugin {
       this.statusUiTimer = null;
       this.headerStatus?.refresh();
       this.fileStatus?.refresh();
+      this.basesPresence?.redrawShared();
       for (const leaf of this.app.workspace.getLeavesOfType(INSPECTOR_VIEW)) {
         if (isInspector(leaf.view)) leaf.view.refresh();
       }
@@ -6913,13 +6926,14 @@ export class NectendaSettingTab extends PluginSettingTab {
       .setName('Show sync status in the file explorer')
       .setDesc(
         'Mark each note in a shared folder with whether the server has every change from this device. ' +
-          'Hover a mark to see what it means.',
+          'Hover a mark to see what it means. The same mark shows which entries of a shared base are shared.',
       )
       .addToggle((toggle) =>
         toggle.setValue(this.plugin.settings.fileStatusIcons).onChange(async (value) => {
           this.plugin.settings.fileStatusIcons = value;
           await this.plugin.saveSettings();
           this.plugin.fileStatus?.apply();
+          this.plugin.redrawBasesShared();
         }),
       );
 

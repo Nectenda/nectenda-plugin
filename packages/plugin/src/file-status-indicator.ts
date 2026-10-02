@@ -3,6 +3,7 @@ import type { DocSyncState } from './multiplexed-provider';
 import type { TrackedDoc } from './content-sync';
 import { describeStatus, fileSyncStatus, type FileSyncStatus } from './sync-status';
 import type { TimerHandle } from './timers';
+import { kindOf } from './blob-policy';
 
 /** Everything the per-file icons read. Live reads, never cached state. */
 export interface FileStatusDeps {
@@ -41,6 +42,37 @@ export function buildStatusIndex(deps: Pick<FileStatusDeps, 'mappings' | 'tracke
     const state = doc?.placed ? deps.docSyncState(doc.docName) : null;
     const status = fileSyncStatus(state, doc?.hasSyncedOnce ?? false);
     return { status, label: describeStatus(status, state) };
+  };
+}
+
+/**
+ * What a shared file's mark in a Bases view says: the explorer's status for a
+ * note, the same status for a canvas or base from its own document, and
+ * `attachment` for anything else in a shared folder. Attachments sync through
+ * the blob engine, which has no per-file state yet, so their mark says only
+ * "shared" — calling one confirmed would be a claim nothing has checked.
+ */
+export type EntryStatus = FileSyncStatus | 'attachment';
+
+export function buildEntryStatus(
+  deps: Pick<FileStatusDeps, 'mappings' | 'trackedDocs' | 'docSyncState'> & {
+    /** The document a connected canvas or base is bound to; null when it has none yet. */
+    structuredDocName(path: string): string | null;
+  },
+): (path: string) => EntryStatus | null {
+  const notes = buildStatusIndex(deps);
+  const roots = deps.mappings().map((m) => m.localPath);
+  return (path: string) => {
+    if (!roots.some((r) => path.startsWith(`${r}/`))) return null;
+    switch (kindOf(path)) {
+      case 'text': return notes(path)?.status ?? null;
+      case 'structured': {
+        const docName = deps.structuredDocName(path);
+        return fileSyncStatus(docName ? deps.docSyncState(docName) : null);
+      }
+      case 'blob': return 'attachment';
+      default: return null;
+    }
   };
 }
 

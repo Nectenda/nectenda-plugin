@@ -168,7 +168,9 @@ export interface NectendaSettings {
   showPointers: boolean;
   /**
    * Mark each note in a shared folder with its sync status in the file
-   * explorer. On by default: "is this note syncing?" had no answer without it.
+   * explorer, and each shared entry of a shared base with the same mark
+   * (bases-shared-marks.ts). On by default: "is this note syncing?" had no
+   * answer without it.
    */
   fileStatusIcons: boolean;
   /**

@@ -4,6 +4,26 @@ Every release of the Nectenda plugin, newest first. Each release on GitHub also
 carries the SHA-256 of its `main.js`, so you can check that the plugin you are
 running is the source you read — see the README.
 
+## 0.4.1 — 2 October 2026
+
+### Added
+- In a shared base, each entry that is shared carries the same sync mark as the file explorer: at the start of its row in a table, in the corner of a card, before the bullet in a list. Only marked entries can show where a collaborator is; an entry without one is in your vault only, even if its name matches one that is shared.
+
+### Fixed
+- In a base's cards and table views, the outline showing which entry a collaborator is on no longer lingers on the wrong entry while you scroll.
+
+### Known
+- **Everyone sharing a base should be on 0.4.0 or later.** A collaborator on an earlier version still syncs bases as whole files. Their edits reach you as conflict copies beside the base, and yours do not reach them. Nothing is lost, but the base does not merge until they update.
+- A collaborator on 0.3.0 or earlier still edits properties as text. Their edits are taken in, but if they and someone on 0.4.0 set the same property at once, the 0.4.0 value wins. The note as it stood is backed up first.
+- When two people change the same presentation setting of a base at once, such as its sort or column order, one value is kept with no conflict copy. Filters, formulas and grouping still get a conflict copy.
+- Column widths in a base are each vault's own, and a base whose filters reach outside the shared folder shows different rows in each vault. Entries without the shared mark are that vault's own.
+- If a collaborator moves a card while you are dragging it, your drop wins its position.
+- Collaborators still on 0.1.5 or earlier will appear to have no cursor. Their edits sync normally.
+- iOS is untested on a device. It should work, since it is the same JavaScript as Android, but nobody has run it on an iPhone, so it is not claimed.
+- On Android, all vaults in the app share one secret store: signing one vault in signs them all in.
+- There is no read-only membership. Everyone in a shared folder can edit it.
+- Not audited. The client ships unminified and the build is reproducible, so the claim is checkable, but no third party has checked it.
+
 ## 0.4.0 — 1 October 2026
 
 ### Added

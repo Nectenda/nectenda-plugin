@@ -428,6 +428,73 @@
 .nectenda-file-status.nectenda-file-error::before { content: '!'; }
 
 /*
+ * The same mark on each shared entry of a shared base (bases-shared-marks.ts),
+ * so it is visible which entries a collaborator has, and so whose presence can
+ * show. A pseudo-element on Obsidian's own row, card or list item, never a
+ * child: the table rebuilds a row's children as it scrolls. Each of the three
+ * is `position: absolute` in Obsidian 1.13.7, so the dot places against it.
+ *
+ * Where: in a table, the row's leading gutter, so it is there whichever
+ * columns are shown; on a card, the top-right corner, ringed in the card's
+ * background so it reads over a cover image; in a list, the gutter before the
+ * bullet. Above the cells, which are positioned too.
+ */
+.nectenda-shared-entry::after {
+  content: '';
+  position: absolute;
+  z-index: 1;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  box-sizing: border-box;
+  pointer-events: none;
+}
+/* Smaller in a table: the row has no gutter of its own, and the first cell's
+   text starts 8px in, so a 6px dot 1px from the edge clears it. */
+.bases-tr.nectenda-shared-entry::after {
+  width: 6px;
+  height: 6px;
+  inset-inline-start: 1px;
+  top: calc(50% - 3px);
+}
+.bases-cards-item.nectenda-shared-entry::after {
+  top: var(--size-4-2);
+  inset-inline-end: var(--size-4-2);
+  box-shadow: 0 0 0 2px var(--bases-cards-background, var(--background-primary));
+}
+.bases-list-item.nectenda-shared-entry::after {
+  inset-inline-start: calc(-1ch - 4px);
+  top: calc(var(--list-spacing, 0px) + (var(--line-height-normal) * 1em - 8px) / 2);
+}
+.nectenda-shared-entry.nectenda-shared-confirmed::after {
+  background-color: var(--color-green);
+  opacity: 0.8;
+}
+.nectenda-shared-entry.nectenda-shared-sending::after {
+  border: 2px solid var(--interactive-accent);
+}
+.nectenda-shared-entry.nectenda-shared-offline::after {
+  border: 2px solid var(--text-faint);
+}
+.nectenda-shared-entry.nectenda-shared-untracked::after {
+  border: 1px dashed var(--text-faint);
+}
+/* Shared, with no per-file state to report: filled, and faint. */
+.nectenda-shared-entry.nectenda-shared-attachment::after {
+  background-color: var(--text-faint);
+}
+.nectenda-shared-entry.nectenda-shared-error::after {
+  content: '!';
+  width: auto;
+  height: auto;
+  border-radius: 0;
+  color: var(--text-error);
+  font-weight: 700;
+  font-size: 0.8em;
+  line-height: 1;
+}
+
+/*
  * The Nectenda status icon, in whichever of its three places are switched on:
  * each note's header, the ribbon, the status bar. The same rules for all
  * three. The tone colours the mark; the label, the people number (bottom

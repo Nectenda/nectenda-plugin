@@ -8,6 +8,8 @@ import type { StructuredSync } from './structured-sync';
 import { log } from './logger';
 import { checkBasesShape, entryAtElement, layoutOf, layoutView, tableActive, wireProperty } from './bases-internals';
 import { FocusMarks, basesFocusMarks, relativeTo } from './bases-focus-draw';
+import { SharedMarks, sharedEntryMarks } from './bases-shared-marks';
+import type { EntryStatus } from './file-status-indicator';
 
 /**
  * Who has a base open, and which of its views they are on (WIRE-096).
@@ -98,6 +100,12 @@ export interface BasesPresenceDeps {
   folderRoot?(path: string): string | null;
   /** A notice, shown once per session when the Bases internals are not as read. */
   notify?(message: string): void;
+  /**
+   * The sync status of a shared file, for the dot on each shared entry
+   * (bases-shared-marks.ts), built once per redraw; null when the explorer's
+   * status marks are switched off, which turns these off too.
+   */
+  entryStatus?(): ((path: string) => EntryStatus | null) | null;
 }
 
 /** The entry this device is on in a base, as sent. */
@@ -144,6 +152,10 @@ export class BasesPresence {
   /** The listeners on the active base's layout, which say when its focus may have moved. */
   private listening: { host: object; stop: () => void } | null = null;
   private marks = new FocusMarks();
+  /** The shared-entry dots, per open base view: every open base has them, not only the active one. */
+  private shared = new Map<BasesViewLike, SharedMarks>();
+  /** A DOM watch on each open base, which redraws its marks when Obsidian re-renders an entry. */
+  private watched = new Map<BasesViewLike, { host: object; stop: () => void }>();
   private soon: number | null = null;
   private frame: number | null = null;
 
@@ -182,6 +194,91 @@ export class BasesPresence {
     if (activeHeld) this.reportNow(activeHeld);
     this.listen(active, activeLayout);
     this.draw();
+    this.drawShared([...open.values()].flat());
+  }
+
+  /**
+   * Redraw the shared-entry dots in every open base: on a sync status change,
+   * which moves a dot from a ring to filled as the explorer's does.
+   */
+  redrawShared(): void {
+    this.drawShared(this.deps.views().filter((v) => v.file));
+  }
+
+  /**
+   * The dots in each of `views`, and none left in a view no longer open. Each
+   * open base is also watched (`watch`), so a re-render redraws it at once.
+   */
+  private drawShared(views: BasesViewLike[]): void {
+    const statusOf = this.deps.entryStatus?.() ?? null;
+    for (const [v, m] of [...this.shared]) {
+      if (views.includes(v)) continue;
+      m.clear();
+      this.shared.delete(v);
+    }
+    for (const [v, w] of [...this.watched]) {
+      if (views.includes(v)) continue;
+      w.stop();
+      this.watched.delete(v);
+    }
+    for (const v of views) {
+      this.watch(v);
+      this.drawSharedIn(v, statusOf);
+    }
+  }
+
+  /**
+   * Redraw a base's marks whenever Obsidian re-renders its entries.
+   *
+   * The layouts recycle their elements: a card that showed one note is
+   * re-rendered for another as the view scrolls. A redraw timed from the
+   * scroll event — even a frame later — was not enough: the cards view also
+   * re-renders from an IntersectionObserver, whose callbacks run after the
+   * frame's, so a shared note's dot stayed on a recycled card showing an
+   * unshared one until the next tick took it off (found by the user). Watching
+   * the elements change is exact where any delay is a guess.
+   *
+   * `childList` only: a re-render replaces children, and the marks this draws
+   * are classes and a style property, so drawing them cannot set this off
+   * again. Called back after Obsidian's re-render has finished, as a
+   * microtask, so the layout's own record of its entries is already current.
+   */
+  private watch(view: BasesViewLike): void {
+    const host = this.broken ? null : hostOf(view, view.leaf ? layoutView(view.leaf()) : null);
+    const had = this.watched.get(view);
+    if ((had?.host ?? null) === host) return;
+    had?.stop();
+    this.watched.delete(view);
+    if (!host || typeof MutationObserver === 'undefined') return;
+    const observer = new MutationObserver(() => this.rerendered(view));
+    observer.observe(host, { childList: true, subtree: true });
+    this.watched.set(view, { host, stop: () => observer.disconnect() });
+  }
+
+  private rerendered(view: BasesViewLike): void {
+    if (!this.watched.has(view)) return;
+    if (this.deps.active() === view) this.draw();
+    this.drawSharedIn(view, this.deps.entryStatus?.() ?? null);
+  }
+
+  private stopWatching(): void {
+    for (const w of this.watched.values()) w.stop();
+    this.watched.clear();
+  }
+
+  private drawSharedIn(view: BasesViewLike, statusOf: ((path: string) => EntryStatus | null) | null): void {
+    const path = view.file?.path;
+    const layout = path && statusOf ? this.usableLayout(view) : null;
+    // Only a base in a shared folder has collaborators to see an entry with.
+    const root = layout && path ? this.deps.folderRoot?.(path) ?? null : null;
+    const marks = this.shared.get(view);
+    if (!layout || root === null || !statusOf) {
+      marks?.clear();
+      return;
+    }
+    const m = marks ?? new SharedMarks();
+    this.shared.set(view, m);
+    m.draw(sharedEntryMarks(layout, root, statusOf));
   }
 
   /** Redraw everyone's focus in the active base: after a scroll, or a change of who is where. */
@@ -227,6 +324,13 @@ export class BasesPresence {
     this.deps.notify?.('Nectenda: showing which entry collaborators are on in a base is unavailable with this version of Obsidian. Who has a base open still shows. Details are in the diagnostic log.');
     this.listen(null, null);
     this.marks.clear();
+    this.clearShared();
+    this.stopWatching();
+  }
+
+  private clearShared(): void {
+    for (const m of this.shared.values()) m.clear();
+    this.shared.clear();
   }
 
   /** The entry this device is on in a base's layout, folder-relative, or null. */
@@ -293,6 +397,7 @@ export class BasesPresence {
       this.frame = window.requestAnimationFrame(() => {
         this.frame = null;
         this.draw();
+        if (this.deps.active() === view) this.drawSharedIn(view, this.deps.entryStatus?.() ?? null);
       });
     };
     const on: [string, (e: Event) => void, boolean][] = [
@@ -336,6 +441,8 @@ export class BasesPresence {
     this.soon = null;
     this.listen(null, null);
     this.marks.clear();
+    this.clearShared();
+    this.stopWatching();
     for (const [path, held] of [...this.held]) this.release(path, held);
   }
 
