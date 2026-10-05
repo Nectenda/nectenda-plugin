@@ -183,6 +183,164 @@ export function replayEdits(
 }
 
 /**
+ * Bring a save made from `base` to `next` into a Y.Text that may have moved on
+ * since — `mergeTextEdit`, edit by edit instead of as one hunk.
+ *
+ * Needed for a view that rewrites the whole file on every save, as the Kanban
+ * plugin does: its save of one card can also drop the file's last newline, so
+ * the save as one hunk spans almost the whole file, and a collaborator's card
+ * that landed inside that span was put after the board's settings block — seen
+ * in the e2e (NEC-25). Taken edit by edit, each lands where it was made.
+ *
+ * The merge is by whole lines, then applied to the Y.Text character by
+ * character. Each line the save added or removed against `base` is placed in
+ * the current text through a line diff of `base` against it: a line goes
+ * after a collaborator's added at the same spot, a line they already removed
+ * is not removed again, and nothing either side wrote is dropped. A changed
+ * line is a removal and an addition, so a line both sides changed is kept in
+ * both versions. By lines, not characters, because characters coincide: a
+ * character merge built a new card partly from the `- [ ] ` of a card the
+ * collaborator had deleted, and their deletion left the new card broken
+ * (found by the fuzz test). The text that results is reached from the current
+ * text by a character diff, so what neither side touched keeps its identity.
+ *
+ * A `next` built on the current text rather than on `base` — a view that did
+ * load the change after all — would add the collaborator's lines a second
+ * time if replayed from `base`. It is taken to be built on the current text
+ * only if it holds every current line, in order (`holdsTheirLines`); then it
+ * is the result as it stands. Any other save is replayed, and at worst adds
+ * their lines twice — a copy to delete, never a loss.
+ *
+ * Identical lines cannot be told apart, so as in any three-way merge the same
+ * change made on both sides counts once: both removing a copy of one line
+ * removes one copy, and both adding the same line where a save holds all of
+ * theirs leaves it once. Every line anyone wrote is still there.
+ *
+ * False, with nothing applied, when a diff is too large to run or the texts
+ * have too many distinct lines; the caller falls back to `mergeTextEdit`.
+ */
+export function mergeEdits(ydoc: Y.Doc, ytext: Y.Text, base: string, next: string): boolean {
+  const current = ytext.toString();
+  if (current === base) {
+    applyMinimalDiff(ydoc, ytext, base, next);
+    return true;
+  }
+  const lines = new LineCodes();
+  const b = lines.encode(base);
+  const c = lines.encode(current);
+  const n = lines.encode(next);
+  if (b === null || c === null || n === null) return false;
+  const align = editScript(b, c);
+  const local = align ? editScript(b, n) : null;
+  if (!align || !local) return false;
+
+  let target: string;
+  if (holdsTheirLines(align, c, n)) {
+    target = next;
+  } else {
+    // Where each line of `base` is in the current text, as in replayEdits.
+    const docAt = new Array<number>(b.length + 1);
+    for (let i = 0, p = 0; i <= b.length; i++) {
+      p += align.inserted.get(i)?.length ?? 0;
+      docAt[i] = p;
+      if (i < b.length && !align.deleted.has(i)) p++;
+    }
+    const out = current.split('\n');
+    // Identical lines cannot be told apart, so a line we removed that the
+    // collaborator also removed a copy of is taken to be the same removal: at
+    // worst an identical card is left to remove again, never one too many
+    // taken (found by the fuzz test).
+    const theyRemoved = new Map<string, number>();
+    for (const i of align.deleted) theyRemoved.set(b[i], (theyRemoved.get(b[i]) ?? 0) + 1);
+    const points = [...new Set<number>([...local.inserted.keys(), ...local.deleted])].sort((x, y) => y - x);
+    for (const i of points) {
+      if (local.deleted.has(i) && align.deleted.has(i)) theyRemoved.set(b[i], (theyRemoved.get(b[i]) ?? 1) - 1);
+      else if (local.deleted.has(i) && (theyRemoved.get(b[i]) ?? 0) > 0) theyRemoved.set(b[i], theyRemoved.get(b[i])! - 1);
+      else if (local.deleted.has(i)) out.splice(docAt[i], 1);
+      const added = local.inserted.get(i);
+      if (added) out.splice(docAt[i], 0, ...lines.decode(added));
+    }
+    target = out.join('\n');
+  }
+  if (target === current) return true;
+  const ops = editScript(current, target);
+  if (ops) applyScript(ydoc, ytext, ops, (i) => i, () => false);
+  else applyMinimalDiff(ydoc, ytext, current, target);
+  return true;
+}
+
+/** Whole lines as single UTF-16 units from the private use area, so Myers can diff them. */
+class LineCodes {
+  private ids = new Map<string, string>();
+  private lines: string[] = [];
+
+  /** Null past 6400 distinct lines, which is as many as the area holds. */
+  encode(text: string): string | null {
+    let out = '';
+    for (const line of text.split('\n')) {
+      let id = this.ids.get(line);
+      if (id === undefined) {
+        if (this.lines.length >= 6400) return null;
+        id = String.fromCharCode(0xe000 + this.lines.length);
+        this.ids.set(line, id);
+        this.lines.push(line);
+      }
+      out += id;
+    }
+    return out;
+  }
+
+  decode(codes: string): string[] {
+    return Array.from(codes, (ch) => this.lines[ch.charCodeAt(0) - 0xe000]);
+  }
+}
+
+/**
+ * Whether `n` holds every line of the current text `c`, in order, while the
+ * collaborator did add lines: the save only adds to what they made, so it is
+ * taken to be built on it.
+ *
+ * Strict on purpose. Asking only whether the lines *they* added survive was
+ * fooled twice: two diffs picked different copies of an identical line, and a
+ * card they duplicated beside itself was dropped (found in the second review);
+ * and a card both sides added independently, at different places, was taken
+ * for one (found by the fuzz test). Identical lines cannot be told apart by
+ * content, so any save that removes a line goes the other way — replayed,
+ * where the worst case is their lines appearing twice.
+ */
+function holdsTheirLines(
+  align: { inserted: Map<number, string>; deleted: Set<number> },
+  c: string,
+  n: string,
+): boolean {
+  if (align.inserted.size === 0) return false;
+  const toNext = editScript(c, n);
+  return toNext !== null && toNext.deleted.size === 0;
+}
+
+/**
+ * Apply an edit script over `from`, each position mapped into the Y.Text by
+ * `at`. Highest first, so each step's positions are untouched by the ones
+ * after it. A deletion of a character `gone` says is no longer there is skipped.
+ */
+function applyScript(
+  ydoc: Y.Doc,
+  ytext: Y.Text,
+  script: { inserted: Map<number, string>; deleted: Set<number> },
+  at: (i: number) => number,
+  gone: (i: number) => boolean,
+): void {
+  const points = [...new Set<number>([...script.inserted.keys(), ...script.deleted])].sort((a, b) => b - a);
+  ydoc.transact(() => {
+    for (const i of points) {
+      if (script.deleted.has(i) && !gone(i)) ytext.delete(at(i), 1);
+      const text = script.inserted.get(i);
+      if (text) ytext.insert(at(i), text);
+    }
+  });
+}
+
+/**
  * Beyond this many edits a character diff is not attempted: its cost grows with
  * the square. The editor as the bind began and the document differ this much
  * only after a large remote change, and then the typing goes to a backup.

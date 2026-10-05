@@ -61,14 +61,21 @@ export async function backupLocalFile(
  * or backed-up one: the user has to be able to see that their work survived,
  * and both `.trash` and `.nectenda-backups` are easy to miss.
  */
+/** Extensions of more than one part, kept whole when a copy is named. */
+const COMPOUND_EXTENSIONS = ['.excalidraw.md'];
+
 export async function writeConflictCopy(
   vault: VaultAdapter,
   localPath: string,
   content: string,
 ): Promise<string | null> {
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-  const dot = localPath.lastIndexOf('.');
   const slash = localPath.lastIndexOf('/');
+  // A compound extension stays whole, so a drawing's copy is still a drawing:
+  // `Drawing (conflicted copy …).excalidraw.md`, which the Excalidraw plugin
+  // opens, rather than `Drawing.excalidraw (conflicted copy …).md` (NEC-41).
+  const compound = COMPOUND_EXTENSIONS.find((e) => localPath.toLowerCase().endsWith(e) && localPath.length - e.length > slash + 1);
+  const dot = compound ? localPath.length - compound.length : localPath.lastIndexOf('.');
   const base = dot > slash ? localPath.slice(0, dot) : localPath;
   const ext = dot > slash ? localPath.slice(dot) : '';
   // Same never-overwrite rule as the backups: two copies of one file in the

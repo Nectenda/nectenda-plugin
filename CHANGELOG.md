@@ -4,6 +4,44 @@ Every release of the Nectenda plugin, newest first. Each release on GitHub also
 carries the SHA-256 of its `main.js`, so you can check that the plugin you are
 running is the source you read — see the README.
 
+## 0.5.0 — 5 October 2026
+
+### Added
+- **Excalidraw drawings sync live.** A change in one vault appears in the other's open drawing within moments, merged shape by shape, with each person's pointer and selection shown on the canvas.
+- **Boards of the Kanban plugin (not the native bases Kanban) update live** for everyone, keep a card you are editing safe while others change the board, and show who is on the board and which card they are editing.
+- Two new settings, "Live sync for Excalidraw drawings" and "Live sync for Kanban boards", turn live updates off per plugin. Drawings and boards are still merged safely when saved.
+- The Nectenda icon now appears in the header of canvases, bases and Excalidraw drawings as well as notes, under the same "in each note's header" setting.
+- The diagnostic log keeps the previous session as `diag.prev.log`, so restarting Obsidian no longer erases the record of what happened just before.
+
+### Fixed
+- **Two people editing the same shape at once no longer corrupt a drawing.** When the edit that loses changed the shape's text, style, link or points, it is kept beside the original, grouped and labelled with who made it and when.
+- **A note you edited while sync was stopped is now merged when sync starts again,** instead of being overwritten by the other vaults' version. If both sides changed it, your copy is kept in `.nectenda-backups`. Drawings are treated the same way.
+- Files added just after Obsidian started could upload but never reach the other vault, until a restart. They now arrive.
+- Turning sync off and on no longer slows Obsidian down over time.
+- Canvases and bases now show their real sync status, green when in sync, in their header and in the file explorer, instead of always grey. Drawings do too.
+
+### Known
+- **Everyone sharing a drawing should update to 0.5.0.** A collaborator on an earlier version still sees it as a note and merges it as text. Their edits reach you as conflict copies beside the drawing, about one per save. Nothing is lost.
+- When two people move or resize the same shape at once, one move wins and the other is not kept.
+- A shape deleted offline, in a drawing that is not live, comes back if Obsidian is quit before it reconnects.
+- Live sync of drawings is tested against Excalidraw 2.27.3 and 2.28.1. An Excalidraw release that changes what Nectenda relies on falls back, with a notice, to syncing a drawing when it is saved, a few seconds behind.
+- A shape type one vault's Excalidraw does not know, such as a sticky note in an older Excalidraw, is kept but not shown there until that vault updates Excalidraw.
+- With live sync for drawings off, nobody is shown on a drawing.
+- While a drawing is open, its file can be up to a minute behind it. Nothing is lost, but another app reading the file sees changes late.
+- A Kanban board edited in the first second or so after Obsidian starts, before it has synced, is not merged: your edit is kept in `.nectenda-backups` with a notice, and the board shows it as gone until you restore it from there.
+- Two people moving the same Kanban card, or changing the same line, at the same moment can leave both versions on the board. The extra one can be deleted.
+- In a Kanban board torn out into its own window, a collaborator's change is not held back while you are editing a card.
+- **Everyone sharing a base should be on 0.4.0 or later.** A collaborator on an earlier version still syncs bases as whole files. Their edits reach you as conflict copies beside the base, and yours do not reach them. Nothing is lost, but the base does not merge until they update.
+- A collaborator on 0.3.0 or earlier still edits properties as text. Their edits are taken in, but if they and someone on 0.4.0 set the same property at once, the 0.4.0 value wins. The note as it stood is backed up first.
+- When two people change the same presentation setting of a base at once, such as its sort or column order, one value is kept with no conflict copy. Filters, formulas and grouping still get a conflict copy.
+- Column widths in a base are each vault's own, and a base whose filters reach outside the shared folder shows different rows in each vault. Entries without the shared mark are that vault's own.
+- If a collaborator moves a card while you are dragging it, your drop wins its position.
+- Collaborators still on 0.1.5 or earlier will appear to have no cursor. Their edits sync normally.
+- iOS is untested on a device. It should work, since it is the same JavaScript as Android, but nobody has run it on an iPhone, so it is not claimed.
+- On Android, all vaults in the app share one secret store: signing one vault in signs them all in.
+- There is no read-only membership. Everyone in a shared folder can edit it.
+- Not audited. The client ships unminified and the build is reproducible, so the claim is checkable, but no third party has checked it.
+
 ## 0.4.1 — 2 October 2026
 
 ### Added

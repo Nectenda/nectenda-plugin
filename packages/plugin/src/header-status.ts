@@ -1,4 +1,4 @@
-import { addIcon, MarkdownView, Menu, setIcon, type App } from 'obsidian';
+import { addIcon, ItemView, Menu, setIcon, type App } from 'obsidian';
 import type { FileStatusView } from './file-status-indicator';
 
 /** The connection states the plugin reports, as `updateStatus` receives them. */
@@ -249,6 +249,33 @@ export function renderIcon(el: HTMLElement, state: HeaderState): void {
 }
 
 /**
+ * The views whose header carries the icon: a note, a canvas, a base, a
+ * drawing. All are files Nectenda syncs, each in a view of its own, and the
+ * setting says "in each note's header" for all of them; it used to be notes
+ * only (NEC-210). By view type, since the Excalidraw plugin's view class is
+ * not ours.
+ */
+export const HEADER_VIEW_TYPES: readonly string[] = ['markdown', 'canvas', 'bases', 'excalidraw'];
+
+/** What the header icon needs of a view. */
+export interface HeaderView {
+  file?: { path: string } | null;
+  addAction(icon: string, title: string, callback: (evt: MouseEvent) => unknown): HTMLElement;
+  getViewType(): string;
+}
+
+/**
+ * Whether `view` is one whose header carries the icon. A tab not yet shown
+ * since Obsidian started holds a deferred view with no file and no header to
+ * add to; it gets its icon once it loads.
+ */
+export function isHeaderView(view: unknown): view is HeaderView {
+  const v = view as Partial<HeaderView> | null | undefined;
+  return !!v && typeof v.addAction === 'function' && typeof v.getViewType === 'function'
+    && HEADER_VIEW_TYPES.includes(v.getViewType()) && typeof v.file?.path === 'string';
+}
+
+/**
  * The Nectenda status, in up to three places: each note's header, the ribbon
  * and the status bar. Which are shown is the person's choice; all of them are
  * the same icon, coloured the same, labelled the same, and open the same menu.
@@ -261,8 +288,8 @@ export function renderIcon(el: HTMLElement, state: HeaderState): void {
  * its ribbon in a menu.
  */
 export class HeaderStatus {
-  private actions = new WeakMap<MarkdownView, HTMLElement>();
-  private views = new Set<MarkdownView>();
+  private actions = new WeakMap<HeaderView, HTMLElement>();
+  private views = new Set<HeaderView>();
   private ribbon: HTMLElement | null = null;
   private statusBar: HTMLElement | null = null;
 
@@ -292,8 +319,14 @@ export class HeaderStatus {
     this.refresh();
   }
 
+  /** The active note, canvas or drawing, if one is. */
+  private activeView(): HeaderView | null {
+    const view = this.deps.app.workspace.getActiveViewOfType(ItemView);
+    return isHeaderView(view) ? view : null;
+  }
+
   private activePath(): string | null {
-    return this.deps.app.workspace.getActiveViewOfType(MarkdownView)?.file?.path ?? null;
+    return this.activeView()?.file?.path ?? null;
   }
 
   private stateFor(path: string | null, others: string[], statusOf = this.deps.statusIndex()): HeaderState {
@@ -309,13 +342,13 @@ export class HeaderStatus {
 
   refresh(): void {
     const statusOf = this.deps.statusIndex();
-    const active = this.deps.app.workspace.getActiveViewOfType(MarkdownView);
+    const active = this.activeView();
     const people = this.deps.peopleInActiveNote();
     if (this.deps.places().header) {
-      const live = new Set<MarkdownView>();
-      for (const leaf of this.deps.app.workspace.getLeavesOfType('markdown')) {
-        const view = leaf.view;
-        if (!(view instanceof MarkdownView)) continue;
+      const live = new Set<HeaderView>();
+      for (const type of HEADER_VIEW_TYPES) for (const leaf of this.deps.app.workspace.getLeavesOfType(type)) {
+        const view: unknown = leaf.view;
+        if (!isHeaderView(view)) continue;
         live.add(view);
         const path = view.file?.path ?? null;
         this.renderHeader(view, this.stateFor(path, view === active ? people : [], statusOf));
@@ -345,7 +378,7 @@ export class HeaderStatus {
     this.statusBar = null;
   }
 
-  private renderHeader(view: MarkdownView, state: HeaderState): void {
+  private renderHeader(view: HeaderView, state: HeaderState): void {
     let el = this.actions.get(view);
     if (!el || !el.isConnected) {
       el = view.addAction(HEADER_ICON, 'Nectenda', (evt) => this.openMenu(evt, view.file?.path ?? null, view));
@@ -357,8 +390,8 @@ export class HeaderStatus {
   }
 
   /** The one menu, for any of the three places. `view` is set for a header icon, which speaks for its own note. */
-  private openMenu(evt: MouseEvent, path: string | null, view?: MarkdownView): void {
-    const active = this.deps.app.workspace.getActiveViewOfType(MarkdownView);
+  private openMenu(evt: MouseEvent, path: string | null, view?: HeaderView): void {
+    const active = this.activeView();
     const people = !view || view === active ? this.deps.peopleInActiveNote() : [];
     const state = this.stateFor(path, people);
     const folder = path ? this.deps.folderFor(path) : null;

@@ -1,9 +1,11 @@
 import { IndexeddbPersistence } from 'y-indexeddb';
 import * as Y from 'yjs';
 import { loadSeqCheckpoint, saveSeqCheckpoint } from './seq-checkpoint';
+import { guardRunaway } from './runaway-guard';
 import { idbStoreName } from './idb-name';
 import { backupLocalFile, writeConflictCopy } from './local-backup';
-import { codecForFormat, codecForPath, type StructuredCodec } from './structured-formats';
+import { codecForFormat, codecForPath, type SettleOutcome, type StructuredCodec } from './structured-formats';
+import { deriveSeedClientId } from './seed-update';
 import { PRESENCE_PAD_BYTES } from './presence-seal';
 import type { DocIndex } from './doc-index';
 import type { SyncProvider } from './provider-router';
@@ -31,6 +33,34 @@ export interface ConnectOptions {
 
 /** IndexedDB key for how far this vault's work is known to have reached the server. */
 const ACKED_KEY = 'nectenda-structured-acked';
+/**
+ * The origin of a codec's settle transaction (SAFE-A27). Its own changes are
+ * not settled again: they are the settling.
+ */
+const SETTLE_ORIGIN = 'structured-settle';
+/** This file's record of what disk and document last agreed on (SAFE-A30). */
+const AGREED_KEY = 'nectenda-structured-agreed';
+/** Text sync's record of what disk and document last agreed on (content-sync.ts, SAFE-A30). */
+const TEXT_AGREED_KEY = 'nectenda-agreed-text';
+/** The text versions an older client wrote after a file left text sync, already kept (SAFE-A28). */
+const TEXT_KEPT_KEY = 'nectenda-text-kept';
+/**
+ * The same, in the document: one entry per text version some vault has kept,
+ * so the others do not keep it again. Only ever true; read by no codec.
+ */
+const TEXT_KEPT_ROOT = 'textKept';
+
+/** A short name for a text, for TEXT_KEPT_ROOT: its length and two FNV-1a hashes. */
+function textMark(text: string): string {
+  let a = 0x811c9dc5;
+  let b = 0x01000193;
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i);
+    a = Math.imul(a ^ c, 0x01000193) >>> 0;
+    b = Math.imul(b ^ c, 0x811c9dc5) >>> 0;
+  }
+  return `${text.length}:${a.toString(36)}:${b.toString(36)}`;
+}
 
 /** Whether a shared type, or anything it sits inside, has been deleted. */
 function insideDeleted(type: Y.AbstractType<unknown>): boolean {
@@ -143,6 +173,14 @@ export interface StructuredDocState {
   ourClients: Set<number>;
   /** Which of those have been written to the stored history. */
   recordedClients: Set<number>;
+  /** A settle is queued for after the current transaction (SAFE-A27). */
+  settleQueued?: boolean;
+  /**
+   * The text disk and document last agreed on, as an earlier session recorded
+   * it (SAFE-A30): what tells a file left behind from a file edited while this
+   * vault was not syncing it. Null when nothing was recorded.
+   */
+  agreedAtConnect?: string | null;
   /**
    * Per client id of ours, the clock up to which our entries are known to be on
    * the server. See `noteAcknowledged` and `lostUnseen`.
@@ -152,6 +190,8 @@ export interface StructuredDocState {
   mayFill: boolean;
   /** A conflict copy being written; disk writes wait for it. */
   keeping: Promise<void>;
+  /** The last save kept aside as another file's content (see `keepForeign`). */
+  foreignKept?: string;
   /** Why this client refuses to touch the file, or null. See `handOffReason`. */
   handedOff: string | null;
   /** So an unreadable file is announced once, not on every save. */
@@ -222,6 +262,13 @@ export interface BoundView {
   baseFor(value: unknown): unknown;
   /** What the view shows now, serialised as the file would be. */
   shownText(): string | null;
+  /**
+   * Read a save of the view in, the binding deciding how — in place of
+   * `holds` and `baseFor`. For a binding that compares by version rather
+   * than keeping a history of what its view held (excalidraw-live.ts): it is
+   * then the one writer of the file's content while bound.
+   */
+  readInSave?: (value: unknown) => void;
 }
 
 /** How `bindView` went. Anything but `bound` leaves the file on the disk path. */
@@ -245,6 +292,21 @@ export interface StructuredSyncDeps {
   notify(message: string): void;
   /** Open views of structured files, if there are any to consult. See StructuredSurface. */
   surface?: StructuredSurface;
+  /**
+   * Whether someone is mid-edit in an open view of the file that is not bound
+   * — typing in a drawing's text, holding the pointer down in it. The write
+   * waits, the change held in the document, until the edit ends (SAFE-A26):
+   * what is mid-edit is in no file yet, and the view's reload would lose it.
+   */
+  editInProgress?(localPath: string): boolean;
+  /**
+   * What an open view of the file knows that its save does not say. For a
+   * drawing: the elements it deleted, which Excalidraw for Obsidian leaves out
+   * of the file instead of writing them deleted. Taken from the view that
+   * holds them — never inferred from what a save lacks, since a view that
+   * never loaded an element lacks it too. `current` is the document now.
+   */
+  withViewDeletes?(localPath: string, saved: unknown, current: unknown): unknown;
 }
 
 /**
@@ -360,6 +422,13 @@ export class StructuredSync {
     }
 
     const ydoc = new Y.Doc();
+    // The roots onTransaction tells apart, defined before anything is loaded.
+    // A root first met in an update is a placeholder in `share` until it is
+    // asked for by type, and the asking replaces it: a transaction that
+    // created it would then name an object `share` no longer holds, and a
+    // check against `share.get` would miss it.
+    ydoc.getMap(META_ROOT);
+    if (codec.fromText) ydoc.getText('content');
     const idbProvider = new IndexeddbPersistence(idbStoreName(this.deps.vaultKey(), docName), ydoc);
     const state: StructuredDocState = {
       docName,
@@ -425,6 +494,8 @@ export class StructuredSync {
       } catch (err) {
         log.warn('Could not subscribe this structured file; it is not connected', {
           path: state.localPath, error: String(err),
+          // Where, too: a stack overflow here said only its own name.
+          stack: err instanceof Error ? (err.stack ?? '').split('\n').slice(1, 16).map((l) => l.trim()).join(' | ') : undefined,
         });
         this.abandonUnsubscribed(state, folderLocalPath);
         return;
@@ -464,6 +535,12 @@ export class StructuredSync {
 
   private async loadOurClients(state: StructuredDocState): Promise<void> {
     try {
+      const agreed = (await state.idbProvider.get(AGREED_KEY)) as unknown;
+      state.agreedAtConnect = typeof agreed === 'string' ? agreed : null;
+    } catch {
+      state.agreedAtConnect = null; // reads as "never recorded", which keeps more
+    }
+    try {
       const raw = (await state.idbProvider.get(CLIENTS_KEY)) as string | undefined | null;
       if (raw) {
         const ids = JSON.parse(raw) as unknown;
@@ -475,6 +552,7 @@ export class StructuredSync {
           }
         }
       }
+      log.debug('Client ids this vault wrote a file under', { path: state.localPath, now: state.ydoc.clientID, known: [...state.ourClients] });
       // Anything malformed reads as "nothing acknowledged", which only ever
       // keeps more.
       const acked = (await state.idbProvider.get(ACKED_KEY)) as string | undefined | null;
@@ -511,6 +589,7 @@ export class StructuredSync {
     state.ourClients.add(id);
     state.recordedClients.add(id);
     const ids = JSON.stringify([...state.ourClients]);
+    log.debug('Recording a client id this vault writes a file under', { path: state.localPath, id });
     void Promise.resolve(state.idbProvider.set(CLIENTS_KEY, ids)).catch((err: unknown) => {
       state.recordedClients.delete(id);
       log.warn('Could not record that this vault edited a file', {
@@ -534,6 +613,19 @@ export class StructuredSync {
    * entry, which the sender's own merge discarded without anyone seeing it.
    */
   private onTransaction(state: StructuredDocState, tr: Y.Transaction): void {
+    // Whatever changed the document — a remote update, a disk read-in, a bound
+    // view — may have left two versions of one record to settle (SAFE-A27).
+    if (tr.origin !== SETTLE_ORIGIN && tr.changed.size > 0) this.queueSettle(state);
+    // An older client's edit of the text, after the takeover. Not a change that
+    // also stamped the document: that is a fill, or a snapshot of the whole
+    // log arriving at once, and an older client never writes the stamp.
+    if (tr.origin === REMOTE_ORIGIN && state.codec.fromText && this.isStamped(state)) {
+      const changed = [...tr.changed.keys()];
+      if (changed.includes(state.ydoc.share.get('content') as never)
+        && !changed.includes(state.ydoc.share.get(META_ROOT) as never)) {
+        this.keepTextVersion(state);
+      }
+    }
     if (tr.origin === REMOTE_ORIGIN) {
       let lost = 0;
       Y.iterateDeletedStructs(tr, tr.deleteSet, (struct) => {
@@ -591,6 +683,120 @@ export class StructuredSync {
     const record = JSON.stringify([...state.acknowledged]);
     void Promise.resolve(state.idbProvider.set(ACKED_KEY, record)).catch((err: unknown) => {
       log.debug('Could not record acknowledged work', { path: state.localPath, error: String(err) });
+    });
+  }
+
+  /**
+   * Disk and document were just seen to agree on `text`: note it, for the echo
+   * guard and the next diff, and for the next session (SAFE-A30). Only ever
+   * text the disk held while the document held all of it — never a fill from
+   * another source the file may be behind.
+   */
+  private agree(state: StructuredDocState, text: string): void {
+    state.lastSyncedText = text;
+    void Promise.resolve(state.idbProvider.set(AGREED_KEY, text)).catch((err: unknown) => {
+      log.warn('Could not record what a structured file agreed on with its document', {
+        path: state.localPath, error: String(err),
+      });
+    });
+  }
+
+  /**
+   * Settle, once the transaction that called for it is over: a transaction
+   * cannot be opened from inside another's observers.
+   */
+  private queueSettle(state: StructuredDocState): void {
+    if (!state.codec.settle || state.settleQueued) return;
+    state.settleQueued = true;
+    queueMicrotask(() => {
+      state.settleQueued = false;
+      if (this.docs.get(state.docName) !== state) return;
+      this.settle(state);
+    });
+  }
+
+  /**
+   * Let the codec settle what concurrent edits left behind (SAFE-A27): for
+   * Excalidraw, two versions of one element, one of them this vault's that
+   * lost. Only this vault's own entries are its to decide — `isOurs` — so each
+   * losing version is kept, or converged, by its author alone.
+   */
+  private settle(state: StructuredDocState): void {
+    // Inside Yjs's own transaction cleanup: a throw there would break it, so
+    // a runaway settle stops here, logged, instead.
+    try {
+      guardRunaway('settling concurrent edits', { path: state.localPath });
+    } catch {
+      return;
+    }
+    const codec = state.codec;
+    if (!codec.settle || state.handedOff || !this.isStamped(state)) return;
+    let outcome: SettleOutcome | null = null;
+    try {
+      state.ydoc.transact(() => {
+        outcome = codec.settle!(state.ydoc, (root, key) => {
+          const item = (state.ydoc.getMap(root) as unknown as { _map: Map<string, Y.Item> })._map.get(key);
+          return item !== undefined && !item.deleted && state.ourClients.has(item.id.client);
+        });
+      }, SETTLE_ORIGIN);
+    } catch (err) {
+      log.error('Could not settle concurrent edits', { path: state.localPath, error: String(err) });
+      return;
+    }
+    const done = outcome as SettleOutcome | null;
+    if (!done) return;
+    for (const c of done.converged ?? []) {
+      // Nothing anyone wrote was lost, but the value that lost is logged so it
+      // can still be found (SAFE-A22).
+      log.info('A concurrent change won over an edit made here; nothing written was lost', {
+        path: state.localPath, id: c.id, why: c.why, lost: c.lost,
+      });
+    }
+    const kept = done.kept ?? [];
+    if (kept.length === 0) return;
+    log.warn('A concurrent change won over edits made here; kept them in the drawing', {
+      path: state.localPath, kept,
+    });
+    this.deps.notify(
+      `Nectenda: "${state.relativePath}" was changed in two places at once. ` +
+      `Your version of ${kept.length === 1 ? 'one shape was' : `${kept.length} shapes were`} kept beside the original, labelled "Kept by Nectenda".`,
+    );
+  }
+
+  /**
+   * A client that predates the format edited the file as text, after this
+   * vault took it over from text (SAFE-A28). That edit cannot merge into the
+   * structured document; its text is kept as a conflict copy beside the file,
+   * once per version — remembered in the document's store, so a restart does
+   * not copy it again, and in the document itself, so another vault does not
+   * either. (Two vaults keeping the same version within the same moment still
+   * both do: a second copy, never a missing one.)
+   */
+  private keepTextVersion(state: StructuredDocState): void {
+    const text = state.ydoc.getText('content').toString();
+    if (text.trim() === '') return;
+    state.keeping = state.keeping.then(async () => {
+      const kept = (await state.idbProvider.get(TEXT_KEPT_KEY)) as unknown;
+      if (kept === text) return;
+      const keptIn = state.ydoc.getMap<boolean>(TEXT_KEPT_ROOT);
+      const mark = textMark(text);
+      if (keptIn.get(mark) === true) {
+        await state.idbProvider.set(TEXT_KEPT_KEY, text);
+        return;
+      }
+      const copy = await writeConflictCopy(this.vault, state.localPath, text);
+      if (!copy) return;
+      state.ydoc.transact(() => keptIn.set(mark, true), LOCAL_ORIGIN);
+      await state.idbProvider.set(TEXT_KEPT_KEY, text);
+      log.warn('An older client changed a file this version syncs as structured; kept its version as a conflict copy', {
+        path: state.localPath, copy,
+      });
+      this.deps.notify(
+        `Nectenda: "${state.relativePath}" was changed by a member on an older version of Nectenda. ` +
+        'Their version was kept as a conflict copy beside it.',
+      );
+    }).catch((err: unknown) => {
+      log.error('Could not keep a text version an older client wrote', { path: state.localPath, error: String(err) });
     });
   }
 
@@ -701,6 +907,10 @@ export class StructuredSync {
   private async seedIfEmpty(state: StructuredDocState): Promise<void> {
     if (this.isStamped(state)) return;
     if (!state.mayFill) return;
+    if (state.codec.fromText) {
+      await this.seedFromText(state);
+      return;
+    }
     if (!this.vault.isFile(state.localPath)) return;
     const disk = await this.vault.read(state.localPath);
     if (disk.trim() === '') return;
@@ -714,8 +924,104 @@ export class StructuredSync {
       this.stampMeta(state);
       state.codec.apply(state.ydoc, parsed.value, null);
     }, LOCAL_ORIGIN);
-    state.lastSyncedText = disk;
+    this.agree(state, disk);
     log.debug('Filled a structured document from its file', { path: state.localPath });
+  }
+
+  /**
+   * Fill a document for a format that took its files over from text
+   * (SAFE-A28).
+   *
+   * The document is the one text sync followed — same name, same store — so it
+   * already holds the note as text, merged across every vault that synced it.
+   * That text is the fill, not this vault's file, which may be behind it. Every
+   * vault taking the file over fills from the same merged text, under an
+   * identity derived from it (seed-update.ts): two vaults doing it at once
+   * write one fill, not two.
+   *
+   * The file is then compared with what text sync last agreed with it
+   * (SAFE-A30): a file changed since is an edit, read in against that text; a
+   * file equal to it is only behind, and the next write brings it up to date.
+   * With nothing to tell the two apart, the first write keeps the file aside
+   * before replacing it (SAFE-A2).
+   *
+   * A file never synced as text — a drawing new to the folder — has no text;
+   * it fills from the file, under the same derived identity.
+   *
+   * The text is read before, and the fill applied after, awaits on the file
+   * and a hash. An older client's edit landing in between is neither in the
+   * fill, which parsed the text before it, nor kept by `onTransaction`, which
+   * keeps only an edit to a stamped document: it was in neither the drawing
+   * nor a copy. So a fill whose text has moved keeps the newer text as a copy,
+   * as it would an older client's edit a moment later. Not filling again from
+   * the newer text instead: two vaults would then fill from different texts,
+   * under different identities, and the note above the drawing would be
+   * filled twice (SAFE-A28).
+   */
+  private async seedFromText(state: StructuredDocState): Promise<void> {
+    const merged = state.ydoc.getText('content').toString();
+    const disk = this.vault.isFile(state.localPath) ? await this.vault.read(state.localPath) : '';
+    const source = merged.trim() !== '' ? merged : disk;
+    if (source.trim() === '') return;
+    const parsed = state.codec.parse(source);
+    if (!parsed.ok) {
+      this.announceUnparseable(state, parsed.error);
+      return;
+    }
+    const seedDoc = new Y.Doc();
+    seedDoc.clientID = await deriveSeedClientId(state.docName, `${state.codec.format}\u0000${source}`);
+    seedDoc.transact(() => {
+      const meta = seedDoc.getMap<unknown>(META_ROOT);
+      meta.set('format', state.codec.format);
+      meta.set('version', state.codec.version);
+      state.codec.apply(seedDoc, parsed.value, null);
+    });
+    const update = Y.encodeStateAsUpdate(seedDoc);
+    seedDoc.destroy();
+    if (this.isStamped(state)) return; // filled by the server while preparing
+    const moved = state.ydoc.getText('content').toString() !== merged;
+    // No origin: local work, pushed — not the derived identity's to own, so a
+    // later overwrite of it is not taken for an edit of this vault's lost.
+    Y.applyUpdate(state.ydoc, update);
+    // Stamped now, so anything later reaches onTransaction; what moved before
+    // is kept here, read in the same synchronous step as the stamp.
+    if (moved) {
+      log.info('An older client changed the text while it was being filled from; keeping the newer text', {
+        path: state.localPath,
+      });
+      this.keepTextVersion(state);
+    }
+    // The base for this file's next read-in is what the file and the document
+    // last agreed on — never the merged text, which this file may never have
+    // held. A file behind the merged text, read in against it, reads as the
+    // user reverting every change it is behind by, and wins (SAFE-A27's
+    // versions do not protect it: the read-in writes them as new edits). So:
+    // the file when it is what filled the document, and otherwise nothing
+    // until the record below says what it is. With nothing, the first write
+    // keeps the file aside (SAFE-A2) and a view waits to bind.
+    state.lastSyncedText = source === disk ? disk : null;
+    log.debug('Filled a structured document from text', {
+      path: state.localPath, from: source === merged ? 'merged text' : 'file',
+    });
+    if (source === merged && disk !== '' && disk !== merged) {
+      const agreed = (await state.idbProvider.get(TEXT_AGREED_KEY)) as unknown;
+      if (typeof agreed === 'string' && agreed !== disk) {
+        const base = this.parseOrNull(state, agreed);
+        const edit = state.codec.parse(disk);
+        if (base !== null && edit.ok) {
+          log.info('A file taken over from text was edited since it last agreed with its text; reading the edit in', {
+            path: state.localPath,
+          });
+          state.ydoc.transact(() => state.codec.apply(state.ydoc, edit.value, base), LOCAL_ORIGIN);
+          this.agree(state, disk);
+        }
+      } else if (typeof agreed === 'string') {
+        // Only behind: the file is what was agreed, and the document is newer.
+        // That agreement is the file's base, and the next write replaces it.
+        state.lastSyncedText = agreed;
+        state.firstWriteChecked = true;
+      }
+    }
   }
 
   private announceUnparseable(state: StructuredDocState, error: string): void {
@@ -743,7 +1049,12 @@ export class StructuredSync {
       // Our own write coming back, or nothing new. Compared by content rather
       // than by a one-shot flag: a flag armed for a write that produced no
       // event swallows the next real edit.
-      if (disk === state.lastSyncedText || disk === state.writingText) return;
+      if (disk === state.lastSyncedText || disk === state.writingText) {
+        log.debug('A structured file changed to what was last written or agreed; nothing to read in', {
+          path: state.localPath, as: disk === state.writingText ? 'writing' : 'agreed',
+        });
+        return;
+      }
 
       if (state.boundViews.size > 0) {
         this.readInBoundSave(state, disk);
@@ -776,11 +1087,14 @@ export class StructuredSync {
           this.stampMeta(state);
           state.codec.apply(state.ydoc, parsed.value, null);
         }, LOCAL_ORIGIN);
-        state.lastSyncedText = disk;
+        this.agree(state, disk);
         return;
       }
 
       if (this.readIn(state, disk, parsed.value)) {
+        // Said, because a save that was never read in and one read in with
+        // nothing to show for it looked the same in the log (NEC-216).
+        log.debug('Read a save of a structured file in', { path: state.localPath, bytes: disk.length });
         // The document may now differ from the file — remote changes the file
         // had not received yet survive the diff against the base — so bring
         // the file up to date.
@@ -806,6 +1120,27 @@ export class StructuredSync {
   }
 
   /**
+   * Whether two changes to `base` touch different things: applied in either
+   * order, through the codec as a read-in would apply them, they read the
+   * same. Worked out in scratch documents, so it knows nothing of any codec's
+   * keys and changes nothing.
+   */
+  private commutes(state: StructuredDocState, base: unknown, a: unknown, b: unknown): boolean {
+    const run = (first: unknown, second: unknown): unknown => {
+      const scratch = new Y.Doc();
+      try {
+        state.codec.apply(scratch, base, null);
+        state.codec.apply(scratch, first, base);
+        state.codec.apply(scratch, second, base);
+        return state.codec.read(scratch);
+      } finally {
+        scratch.destroy();
+      }
+    };
+    return state.codec.equal(run(a, b), run(b, a));
+  }
+
+  /**
    * Bring an edit made on disk into the document, diffed against its base.
    * False when there is no base to diff against — see onLocalModify.
    *
@@ -817,10 +1152,20 @@ export class StructuredSync {
    * Synchronous from the caller's read to `lastSyncedText`, so two callers that
    * read the same text cannot both apply it.
    */
-  private readIn(state: StructuredDocState, disk: string, value: unknown): boolean {
+  private readIn(state: StructuredDocState, disk: string, saved: unknown): boolean {
     const current = state.codec.read(state.ydoc);
+    const value = this.withViewDeletes(state, saved, current);
+    // Handled, not read in: the caller's write then puts this file's own
+    // content back, after the backup (it waits on `keeping`). Judged with
+    // what the view deleted: a drawing cleared and drawn afresh saves only
+    // new shapes, and without its deletes it read as another drawing's, so
+    // the user's redraw went to the backup (found in review).
+    if (this.isForeign(state, value)) {
+      this.keepForeign(state, disk);
+      return true;
+    }
     if (state.codec.equal(value, current)) {
-      state.lastSyncedText = disk;
+      this.agree(state, disk);
       this.deps.surface?.ingested(state.localPath, disk);
       return true;
     }
@@ -834,7 +1179,7 @@ export class StructuredSync {
       });
     }
     state.ydoc.transact(() => state.codec.apply(state.ydoc, value, base), LOCAL_ORIGIN);
-    state.lastSyncedText = disk;
+    this.agree(state, disk);
     this.deps.surface?.ingested(state.localPath, disk);
     return true;
   }
@@ -857,9 +1202,25 @@ export class StructuredSync {
       if (parsed) this.announceUnparseable(state, parsed.error);
       return;
     }
+    if (this.isForeign(state, this.withViewDeletes(state, parsed.value, state.codec.read(state.ydoc)))) {
+      // Another tab, reused for this file, saved what it showed before. The
+      // bound view's own next save puts this file's content back.
+      this.keepForeign(state, disk);
+      return;
+    }
     const views = [...state.boundViews];
-    if (views.some((v) => v.holds(parsed.value)) || state.codec.equal(parsed.value, state.codec.read(state.ydoc))) {
-      state.lastSyncedText = disk;
+    if (state.codec.equal(parsed.value, state.codec.read(state.ydoc))) {
+      this.agree(state, disk);
+      return;
+    }
+    const reader = views.find((v) => v.readInSave);
+    if (reader?.readInSave) {
+      reader.readInSave(parsed.value);
+      this.agree(state, disk);
+      return;
+    }
+    if (views.some((v) => v.holds(parsed.value))) {
+      this.agree(state, disk);
       return;
     }
     log.warn('An open view saved a change its live binding had not carried; reading it in', {
@@ -867,7 +1228,52 @@ export class StructuredSync {
     });
     const base = views[0].baseFor(parsed.value);
     state.ydoc.transact(() => state.codec.apply(state.ydoc, parsed.value, base), LOCAL_ORIGIN);
-    state.lastSyncedText = disk;
+    this.agree(state, disk);
+  }
+
+  private isForeign(state: StructuredDocState, value: unknown): boolean {
+    try {
+      return state.codec.foreign?.(value, state.ydoc) === true;
+    } catch (err) {
+      log.warn('Could not tell whether a save is another file\'s', { path: state.localPath, error: String(err) });
+      return false;
+    }
+  }
+
+  /**
+   * A save that is another file's content under this path: Obsidian reuses a
+   * view for another file, and the view takes the new path before it loads
+   * the new file, so a save in that moment writes the old file's content
+   * here. Read in, it carried one drawing's every shape into another, for
+   * every vault (the hardness run, twice). It is not read in, nor taken as
+   * agreed; it is kept in .nectenda-backups — it could be someone's work —
+   * once per content, with a notice, and the file is written back.
+   */
+  private keepForeign(state: StructuredDocState, disk: string): void {
+    log.warn('A save held another file\'s content, as a tab reused for another file saves before it loads; kept it in .nectenda-backups and did not read it in', {
+      path: state.localPath,
+    });
+    if (state.foreignKept === disk) return;
+    state.foreignKept = disk;
+    state.keeping = state.keeping.then(async () => {
+      await backupLocalFile(this.vault, state.localPath, disk, 'A save held another file\'s content — backed it up and did not sync it');
+      this.deps.notify(
+        `Nectenda: "${state.relativePath}" was saved holding another file's content, as a tab switched files. ` +
+        'That was not synced; the copy is in .nectenda-backups.',
+      );
+    }).catch((err: unknown) => {
+      log.error('Could not keep a save that held another file\'s content', { path: state.localPath, error: String(err) });
+    });
+  }
+
+  /** A save, with what its open view deleted and the save left out (see the dep). */
+  private withViewDeletes(state: StructuredDocState, saved: unknown, current: unknown): unknown {
+    try {
+      return this.deps.withViewDeletes?.(state.localPath, saved, current) ?? saved;
+    } catch (err) {
+      log.warn('Could not read what an open view deleted; reading its save in as it is', { path: state.localPath, error: String(err) });
+      return saved;
+    }
   }
 
   /** What a bound view shows, if one is bound. */
@@ -960,6 +1366,14 @@ export class StructuredSync {
     // A bound view owns the file while it is open; see bindView.
     if (state.boundViews.size > 0) return;
 
+    // Someone is mid-edit in an open view: the change waits in the document,
+    // which loses nothing, and is written once the edit ends (SAFE-A26).
+    if (this.deps.editInProgress?.(state.localPath)) {
+      log.info('Holding a remote change while an edit is in progress in an open view', { path: state.localPath });
+      this.scheduleDiskWrite(state);
+      return;
+    }
+
     try {
       // An open view may hold an edit it has not saved. Replacing the file
       // under it would discard that edit when it reloads, so it saves first,
@@ -978,8 +1392,87 @@ export class StructuredSync {
         if (this.docs.get(state.docName) !== state || state.boundViews.size > 0) return;
       }
 
-      let disk = await this.vault.read(state.localPath);
-      let parsed = disk.trim() === '' ? null : state.codec.parse(disk);
+      const disk = await this.vault.read(state.localPath);
+      const parsed = disk.trim() === '' ? null : state.codec.parse(disk);
+
+      // The first write of a connect, with what disk and document agreed on
+      // last session known (SAFE-A30): a file equal to it is only behind, and
+      // is written over without a copy; a file that differs is an edit made
+      // while this vault was not syncing it, read in against it — merged key
+      // by key, so remote changes that arrived meanwhile stay as well. Without
+      // the record, SAFE-A2 below keeps the file aside instead.
+      const agreed = state.agreedAtConnect ?? null;
+      if (!state.firstWriteChecked && state.lastSyncedText === null && agreed !== null && parsed?.ok) {
+        state.lastSyncedText = agreed;
+        const base = disk === agreed ? null : this.parseOrNull(state, agreed);
+        let clash = false;
+        if (base !== null && !state.codec.equal(state.codec.read(state.ydoc), base)) {
+          // Both moved. The record is written after the file, not with it — a
+          // quit between the two, or a view's save on close after unload,
+          // leaves it behind the file — and a merge against a record that old
+          // reads the file's catch-up as edits, reverting what arrived since,
+          // on every vault and with no copy anywhere: the work it reverts was
+          // delivered, so SAFE-A14 does not keep it. So the file is kept aside
+          // first, as a note's is, and merged only where the two changed
+          // different things (SAFE-A30).
+          await backupLocalFile(
+            this.vault, state.localPath, disk,
+            'A structured file changed while it was not being synced, and so did its document — backed up the local copy before merging',
+          );
+          if ((await this.vault.read(state.localPath)) !== disk) {
+            state.lastSyncedText = null;
+            this.scheduleDiskWrite(state);
+            return;
+          }
+          const current = state.codec.read(state.ydoc);
+          clash = !this.commutes(state, base, current, this.withViewDeletes(state, parsed.value, current));
+        }
+        if (disk === agreed) {
+          state.firstWriteChecked = true;
+        } else if (clash && state.codec.mergeOnClash && base !== null
+          && this.readIn(state, disk, state.codec.mergeOnClash(parsed.value, base))) {
+          // A clash, in a format with a part that merges safely even so — a
+          // drawing's elements, by version, a lost edit kept beside the
+          // original. That part is merged; the rest stays as the document has
+          // it, and the file as it was is in the backup just taken. Keeping
+          // the whole file aside instead left a drawing's offline work in
+          // .nectenda-backups when one element of it had also changed
+          // elsewhere (found by the hardness run).
+          state.firstWriteChecked = true;
+          // Unless the read-in kept it aside as another file's content
+          // (keepForeign), which says so itself: then nothing was merged.
+          if (state.foreignKept !== disk) {
+            log.warn('A structured file and its document both changed while it was not synced; merged what merges safely and kept the file in .nectenda-backups', {
+              path: state.localPath,
+            });
+            this.deps.notify(
+              `Nectenda: "${state.relativePath}" was changed here while sync was stopped, and also elsewhere. ` +
+              'The changes were merged, and this copy as it was is in .nectenda-backups.',
+            );
+          }
+        } else if (clash) {
+          // The file and the document changed the same thing, and a record
+          // that may lag cannot say which came later. The document stands;
+          // the file's version is in the backup just taken, so the file is
+          // accounted for and the write below may replace it.
+          state.lastSyncedText = disk;
+          state.firstWriteChecked = true;
+          log.warn('A structured file and its document both changed the same thing while it was not synced; kept the file in .nectenda-backups and left the document as it is', {
+            path: state.localPath,
+          });
+          this.deps.notify(
+            `Nectenda: "${state.relativePath}" was changed here while sync was stopped, in a part that was also changed elsewhere. ` +
+            'This copy was kept in .nectenda-backups.',
+          );
+        } else if (this.readIn(state, disk, parsed.value)) {
+          state.firstWriteChecked = true;
+          log.info('A structured file changed while it was not being synced; merged the change in', {
+            path: state.localPath,
+          });
+        } else {
+          state.lastSyncedText = null;
+        }
+      }
 
       // Changed on disk since we last agreed and not read in yet — typically
       // the save just asked for. Read it in now, against its base, rather than
@@ -987,10 +1480,9 @@ export class StructuredSync {
       // do moments later, and the write below then carries both. The first
       // write of a connect is not this case: SAFE-A2 keeps that file aside.
       if (parsed?.ok && state.firstWriteChecked && disk !== state.lastSyncedText) {
-        if (this.readIn(state, disk, parsed.value)) {
-          disk = state.lastSyncedText ?? disk;
-          parsed = state.codec.parse(disk);
-        }
+        // Read in (and agreed, so disk is the agreed text already), or kept
+        // aside as another file's: either way the write below goes ahead.
+        this.readIn(state, disk, parsed.value);
       }
       const value = state.codec.read(state.ydoc);
 
@@ -998,7 +1490,7 @@ export class StructuredSync {
       // it would churn the user's formatting and, with a serialiser that is
       // not quite stable, never stop.
       if (parsed?.ok && state.codec.equal(parsed.value, value)) {
-        state.lastSyncedText = disk;
+        this.agree(state, disk);
         // Disk and document agree: from here a difference is an edit made
         // since, with this as its base — not the unknown file SAFE-A2 is for.
         state.firstWriteChecked = true;
@@ -1015,6 +1507,10 @@ export class StructuredSync {
             this.vault, state.localPath, disk,
             'A structured file could not be read when a change arrived — backed up the local copy',
           );
+        } else if (disk === state.foreignKept) {
+          // Another file's content, kept already (keepForeign): the write
+          // waits on `keeping`, so the copy is in .nectenda-backups by now.
+          await state.keeping;
         } else if (firstWrite && disk !== state.lastSyncedText) {
           // SAFE-A2: the first write of a connect meeting a file that differs
           // from the document. Either side may be the newer one — an edit
@@ -1064,7 +1560,7 @@ export class StructuredSync {
       } finally {
         state.writingText = null;
       }
-      state.lastSyncedText = text;
+      this.agree(state, text);
       // Including a write over an empty placeholder, which the branches above
       // never see: the file now says what the document says.
       state.firstWriteChecked = true;
@@ -1137,6 +1633,12 @@ export class StructuredSync {
    * unfilled document is not an empty canvas (SAFE-A3), and a binding that
    * drew it would blank the view (Relay 4261d1b9).
    */
+  /** Whether a write of this document to its file is scheduled or running. */
+  writePending(docName: string): boolean {
+    const state = this.docs.get(docName);
+    return !!state && (state.writeTimer !== null || state.writeInFlight === true);
+  }
+
   bindView(docName: string, view: BoundView, shown: unknown): BindResult {
     const state = this.docs.get(docName);
     if (!state) return 'unknown';

@@ -17,6 +17,7 @@ import { replayEdits } from './text-merge';
 import type { PendingEdits } from './pending-edits';
 import { resolveMapping, type FolderMapping } from './folder-mapping';
 import type { EditorWiring } from './editor-wiring';
+import { kindOf } from './blob-policy';
 
 /** The CodeMirror view inside an Obsidian editor. Internal API, hence the reach. */
 function editorViewOf(view: MarkdownView): EditorView | null {
@@ -504,6 +505,15 @@ export class EditorBridge {
     }
 
     const { sharedFolderId, relativePath } = resolved;
+
+    // A Markdown-named file another sync owns (an Excalidraw drawing, which
+    // the plugin shows as Markdown for a moment before its own view) is not a
+    // note: text sync never takes it (SAFE-A28), and structured sync has its
+    // document subscribed under the same name. Waiting for that subscription
+    // found it at once, retried, found no text document, and so on until the
+    // stack overflowed — inside the structured subscribe, so the drawing never
+    // connected. It has its own live binding; this one leaves it alone.
+    if (kindOf(relativePath) === 'structured') return;
     // Usually synchronous: a folder's paths are derived when it connects. But
     // a file can be opened before that finishes — measured at 2ms early — and a
     // rename produces a path that has never been derived at all. Deriving and

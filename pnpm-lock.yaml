@@ -178,6 +178,9 @@ importers:
       lib0:
         specifier: ^0.2.97
         version: 0.2.117
+      lz-string:
+        specifier: ^1.5.0
+        version: 1.5.0
       obsidian:
         specifier: latest
         version: 1.13.1(@codemirror/state@6.7.5)(@codemirror/view@6.43.12)
@@ -424,6 +427,10 @@ packages:
     engines: {node: '>=16'}
     hasBin: true
 
+  lz-string@1.5.0:
+    resolution: {integrity: sha512-h5bgJWpxJNswbU7qCrV0tIKQCaS3blPDrqKWx+QxzuzL1zGUzij9XCWLrSLsJPu5t+eWA/ycetzYAO5IOMcWAQ==}
+    hasBin: true
+
   moment@2.29.4:
     resolution: {integrity: sha512-5LC9SOxjSc2HF6vO2CyuTDNivEdoz2IvyJJGj6X8DJ0eFyfszE0QiEd+iXmBvUP3WHxSjFH/vIsA0EN00cgr8w==}
 
@@ -623,6 +630,8 @@ snapshots:
   lib0@0.2.117:
     dependencies:
       isomorphic.js: 0.2.5
+
+  lz-string@1.5.0: {}
 
   moment@2.29.4: {}
 

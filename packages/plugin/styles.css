@@ -1202,3 +1202,58 @@
   outline: 2px solid var(--nectenda-peer-color, var(--text-accent));
   outline-offset: 2px;
 }
+
+/*
+ * The card or list a collaborator is on, on a board of the Kanban plugin
+ * (WIRE-098, kanban-presence.ts): an outline in their colour and their name on
+ * a tag. The name comes from a data attribute, so drawing it adds no element
+ * to the board.
+ *
+ * The tag sits inside the corner, not above the edge: Kanban clips a card to
+ * its box (`overflow: hidden`), and a tag hung over the top edge was cut off
+ * whole, leaving only the outline — which is drawn outside the box and so
+ * survives the clip.
+ */
+.kanban-plugin__item.nectenda-peer-focus,
+.kanban-plugin__lane.nectenda-peer-focus {
+  position: relative;
+  outline: 2px solid var(--nectenda-peer-color, var(--text-accent));
+  outline-offset: 1px;
+}
+
+.kanban-plugin__item.nectenda-peer-focus {
+  border-radius: var(--radius-s);
+}
+
+.kanban-plugin__item.nectenda-peer-focus[data-nectenda-focus]::after,
+.kanban-plugin__lane.nectenda-peer-focus[data-nectenda-focus]::after {
+  content: attr(data-nectenda-focus);
+  position: absolute;
+  top: 0;
+  right: 0;
+  z-index: 1;
+  max-width: 70%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 0 6px;
+  border-radius: 0 0 0 var(--radius-s);
+  background: var(--nectenda-peer-color, var(--text-accent));
+  color: var(--text-on-accent);
+  font-size: var(--font-ui-smaller);
+  line-height: 1.5;
+  pointer-events: none;
+}
+
+/* A list's header holds its menu at the top right: its tag goes to the bottom instead. */
+.kanban-plugin__lane.nectenda-peer-focus[data-nectenda-focus]::after {
+  top: auto;
+  bottom: 0;
+  border-radius: var(--radius-s) 0 6px 0;
+}
+
+/* Clicks pass through the tag; hovering fades it, so a card's own buttons under it can be seen. */
+.kanban-plugin__item.nectenda-peer-focus:hover::after,
+.kanban-plugin__lane.nectenda-peer-focus:hover::after {
+  opacity: 0.25;
+}

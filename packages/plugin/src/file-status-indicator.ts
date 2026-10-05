@@ -14,6 +14,11 @@ export interface FileStatusDeps {
   docSyncState(docName: string): DocSyncState | null;
   /** The setting. Off means no icon anywhere. */
   enabled(): boolean;
+  /**
+   * The document a drawing, canvas or base is bound to, through structured
+   * sync; null when it has none yet. Without it such a file has no status.
+   */
+  structuredDocName?(path: string): string | null;
 }
 
 export interface FileStatusView {
@@ -31,13 +36,25 @@ export interface FileStatusView {
  * rather than skipped, because "this note is not syncing" is the answer the
  * icon exists to give.
  */
-export function buildStatusIndex(deps: Pick<FileStatusDeps, 'mappings' | 'trackedDocs' | 'docSyncState'>): (path: string) => FileStatusView | null {
+export function buildStatusIndex(
+  deps: Pick<FileStatusDeps, 'mappings' | 'trackedDocs' | 'docSyncState' | 'structuredDocName'>,
+): (path: string) => FileStatusView | null {
   const roots = deps.mappings().map((m) => m.localPath);
   const byPath = new Map<string, TrackedDoc>();
   for (const d of deps.trackedDocs()) byPath.set(d.localPath, d);
   return (path: string) => {
-    if (!path.endsWith('.md')) return null;
     if (!roots.some((r) => path.startsWith(`${r}/`))) return null;
+    // A drawing, canvas or base syncs through structured sync, not the text
+    // engine whose documents are tracked above. A drawing's name ends in .md
+    // like a note's, so it was looked up there, never found, and called
+    // untracked — grey in its header however in sync it was (NEC-41).
+    if (deps.structuredDocName && kindOf(path) === 'structured') {
+      const docName = deps.structuredDocName(path);
+      const state = docName ? deps.docSyncState(docName) : null;
+      const status = fileSyncStatus(state);
+      return { status, label: describeStatus(status, state) };
+    }
+    if (!path.endsWith('.md')) return null;
     const doc = byPath.get(path);
     const state = doc?.placed ? deps.docSyncState(doc.docName) : null;
     const status = fileSyncStatus(state, doc?.hasSyncedOnce ?? false);

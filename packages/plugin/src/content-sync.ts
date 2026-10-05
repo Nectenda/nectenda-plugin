@@ -1,7 +1,8 @@
 import { IndexeddbPersistence } from 'y-indexeddb';
 import { loadSeqCheckpoint, saveSeqCheckpoint } from './seq-checkpoint';
 import * as Y from 'yjs';
-import { applyMinimalDiff } from './text-merge';
+import { applyMinimalDiff, mergeEdits, mergeTextEdit } from './text-merge';
+import type { StructuredSurface } from './structured-sync';
 import type { Awareness } from 'y-protocols/awareness';
 import type { DocIndex } from './doc-index';
 import type { FolderMapping } from './folder-mapping';
@@ -13,8 +14,16 @@ import { log } from './logger';
 import { seedDocument } from './seed-update';
 import { backupLocalFile, writeConflictCopy } from './local-backup';
 import { FrontmatterSync } from './frontmatter-sync';
+import { kindOf } from './blob-policy';
 
 const WRITE_DEBOUNCE = 500;
+/**
+ * The write delay for a note open in another plugin's view. Its changes come
+ * a whole save at a time, not a keystroke at a time, so there is little to
+ * gather, and the half second was most of what was left of the lag once the
+ * sender saved early (note-view-save.ts). The edit hold still comes first.
+ */
+const VIEW_WRITE_DEBOUNCE = 100;
 /** Backoff step when the local file does not exist yet; multiplied by attempt. */
 const WRITE_RETRY_DELAY = 400;
 const MAX_WRITE_RETRIES = 5;
@@ -34,6 +43,8 @@ const BATCH_DELAY = 200;
  */
 /** Where a note's document remembers the client ids it wrote properties under. */
 const FRONTMATTER_CLIENTS_KEY = 'nectenda-frontmatter-clients';
+/** Where a note's document remembers the text disk and document last agreed on (SAFE-A30). */
+const AGREED_KEY = 'nectenda-agreed-text';
 
 export interface FileDocState {
   docName: string;
@@ -67,6 +78,19 @@ export interface FileDocState {
   idbHadData: boolean;
   /** First-sync conflict is checked once per connect, not on every write. */
   firstSyncChecked: boolean;
+  /**
+   * The text disk and document last agreed on, as an earlier session recorded
+   * it, read from IndexedDB at connect (SAFE-A30). Null when nothing was ever
+   * recorded — a note new to this vault, or one last synced by a version that
+   * did not record it.
+   *
+   * It is what tells a file left behind by the document (disk equals it: the
+   * document is newer, write it) from a file changed while this vault was not
+   * syncing it (disk differs from it: an edit nobody has seen, merge it). The
+   * two look identical otherwise, and taking the second for the first
+   * overwrote the edit without a trace.
+   */
+  agreedAtConnect: string | null;
   /**
    * Whether the server has confirmed this document at least once.
    *
@@ -124,7 +148,27 @@ export interface ContentSyncDeps {
   noteGone?(sharedFolderId: string, relativePath: string): void;
   /** Tell the user something. Optional so a test need not; logged regardless. */
   notify?(message: string): void;
+  /**
+   * Open views of a note that are not Obsidian's own editor — a board of the
+   * Kanban plugin, or any other plugin's view of a `.md` file. Obsidian reloads
+   * such a view on every change to the file with no merge, so it is asked to
+   * save before a write and checked for having loaded it (SAFE-A19), and a
+   * write waits while someone is typing or dragging in it (SAFE-A26).
+   * text-view-guard.ts. Optional: without it, notes are written as before.
+   */
+  surface?: TextViewSurface;
 }
+
+/** What `ContentSync` asks of the open views of a note. See `ContentSyncDeps.surface`. */
+export interface TextViewSurface extends StructuredSurface {
+  /** Whether an edit is in progress in an open view of the file, so a write should wait. */
+  editInProgress(localPath: string): boolean;
+  /** Whether any view of the file is open. */
+  hasViews(localPath: string): boolean;
+}
+
+/** How many times a write is retried when an open view could not save first. */
+const MAX_SURFACE_RETRIES = 5;
 
 /** One document as `ContentSync.trackedDocs` reports it. */
 export interface TrackedDoc {
@@ -165,6 +209,29 @@ export class ContentSync {
    * for anything else in it.
    */
   private scannedFolders: Set<string> = new Set();
+  /** Documents whose write is waiting for an edit in an open view to end (SAFE-A26). */
+  private heldForEdit: Set<string> = new Set();
+  /** Writes retried because an open view could not save first, by document. */
+  private surfaceRetries: Map<string, number> = new Map();
+  /**
+   * The text of our own last write, by document, until its modify event is
+   * seen. That event is skipped only if the file still says exactly this: a
+   * save that landed between our write and its event is someone's edit, and
+   * skipping it on a flag alone discarded it (SAFE-A19).
+   */
+  private ownWrite: Map<string, string> = new Map();
+  /**
+   * The text disk and document were last seen to agree on, by document: what
+   * a save made on top of the file was built on. A collaborator's change sits
+   * in the document for the write debounce before reaching disk, and a save
+   * landing in that window, diffed against the document, read as the user
+   * reverting it. Merged against this instead, both are kept. Dropped whenever
+   * an editor binds or lets go, since the editor saves without this seeing it;
+   * with no entry, a save is diffed against the document as before.
+   */
+  private diskBase: Map<string, string> = new Map();
+  /** The last save kept aside for want of a base, by document, so it is kept once. */
+  private keptAside: Map<string, string> = new Map();
 
   /**
    * Told when a document is attached, detached, placed, or bound to an editor,
@@ -310,7 +377,24 @@ export class ContentSync {
     }
   }
 
+  /** Paths already said to be another sync's, so the log says it once. */
+  private saidNotFollowing = new Set<string>();
+
   connectFile(sharedFolderId: string, localPath: string, relativePath: string): void {
+    // A Markdown-named file another codec owns — an Excalidraw drawing — is
+    // never text here, whoever asks: the folder scan, the listing, the watcher
+    // and the editor all come through this one method. Its document is the same
+    // document structured sync follows (the name is derived from the path), and
+    // two syncs writing one file is two writers (SAFE-A28).
+    if (kindOf(relativePath) === 'structured') {
+      // Once per path: this is asked on every listing change, for every file,
+      // and said each time it buried the rest of the diagnostic log.
+      if (!this.saidNotFollowing.has(relativePath)) {
+        this.saidNotFollowing.add(relativePath);
+        log.debug('Not following a file another sync owns as text', { relativePath });
+      }
+      return;
+    }
     // Here rather than in each caller: sharing, joining, launch, create, a
     // move into the folder and a rename within it all arrive through this one
     // method. Before the gate below, which returns early for a note already
@@ -394,6 +478,7 @@ export class ContentSync {
       lastSyncedContent: null,
       idbHadData: false,
       firstSyncChecked: false,
+      agreedAtConnect: null,
       hasSyncedOnce: false,
       ignoreNextModify: false,
       observer: null,
@@ -532,11 +617,58 @@ export class ContentSync {
       }
     };
 
+    // What disk and document last agreed on is read before anything can write
+    // the file: the first write of a connect is exactly the one that needs it
+    // (SAFE-A30). Read after IndexedDB has loaded, from the same store.
+    const begin = (): void => {
+      void this.readAgreed(state).then(() => {
+        if (this.fileDocs.get(docName) === state) startSync();
+      });
+    };
     if (idbProvider.synced) {
-      startSync();
+      begin();
     } else {
-      idbProvider.once('synced', startSync);
+      idbProvider.once('synced', begin);
     }
+  }
+
+  /**
+   * Read what an earlier session recorded disk and document last agreed on.
+   * Anything unreadable reads as "never recorded", which only ever keeps more.
+   */
+  private async readAgreed(state: FileDocState): Promise<void> {
+    try {
+      const raw = (await state.idbProvider.get(AGREED_KEY)) as unknown;
+      state.agreedAtConnect = typeof raw === 'string' ? raw : null;
+    } catch (err) {
+      state.agreedAtConnect = null;
+      log.warn('Could not read what this note last agreed on with its file', {
+        path: state.localPath, error: String(err),
+      });
+    }
+  }
+
+  /**
+   * Disk and document were just seen to hold the same text: note it, here and
+   * for the next session (SAFE-A30).
+   *
+   * Only ever called with text read from disk and equal to the document — never
+   * with what the file is about to say. A record ahead of the file would make a
+   * stale file read as an edit, and merging that "edit" reverts what it lacks.
+   */
+  private agreed(state: FileDocState, text: string): void {
+    this.diskBase.set(state.docName, text);
+    this.recordAgreed(state, text);
+  }
+
+  /** The record half of `agreed`: for the next session, in IndexedDB. */
+  private recordAgreed(state: FileDocState, text: string): void {
+    if (!state.idbProvider) return;
+    void Promise.resolve(state.idbProvider.set(AGREED_KEY, text)).catch((err: unknown) => {
+      log.warn('Could not record what this note agreed on with its file', {
+        path: state.localPath, error: String(err),
+      });
+    });
   }
 
   /**
@@ -735,6 +867,7 @@ export class ContentSync {
   private abandonUnsubscribed(state: FileDocState, sharedFolderId: string, folderLocalPath: string): void {
     this.fileDocs.delete(state.docName);
     this.folderFiles.get(sharedFolderId)?.delete(state.docName);
+    this.forgetWrites(state.docName);
     if (state.writeTimer) window.clearTimeout(state.writeTimer);
     if (state.observer) state.ytext.unobserve(state.observer);
     void state.idbProvider.destroy().catch((err: unknown) => {
@@ -785,7 +918,30 @@ export class ContentSync {
 
     this.fileDocs.delete(docName);
     this.folderFiles.get(state.sharedFolderId)?.delete(docName);
+    this.forgetWrites(docName);
     this.changed();
+  }
+
+  private forgetWrites(docName: string): void {
+    this.heldForEdit.delete(docName);
+    this.surfaceRetries.delete(docName);
+    this.ownWrite.delete(docName);
+    this.diskBase.delete(docName);
+    this.keptAside.delete(docName);
+  }
+
+  /**
+   * An edit in an open view of `localPath` has ended: write the remote change
+   * that waited for it (SAFE-A26). The write asks the view to save first, so
+   * what the edit committed goes in alongside it.
+   */
+  editEnded(localPath: string): void {
+    for (const state of this.fileDocs.values()) {
+      if (state.localPath !== localPath || !this.heldForEdit.has(state.docName)) continue;
+      this.heldForEdit.delete(state.docName);
+      log.info('An edit in an open view ended; writing the remote change it held', { path: localPath });
+      this.scheduleDiskWrite(state);
+    }
   }
 
   disconnectFolder(sharedFolderId: string): void {
@@ -842,6 +998,22 @@ export class ContentSync {
   }
 
 
+  /**
+   * A synced note's document name and awareness, for presence in a view that
+   * is not the editor (text-view-presence.ts). Takes nothing over, unlike
+   * `acquireDoc`: such a view never writes the document, and ContentSync stays
+   * the one writing its file. Null when the note is not connected, or not yet
+   * subscribed.
+   */
+  awarenessFor(localPath: string): { docName: string; awareness: Awareness } | null {
+    for (const state of this.fileDocs.values()) {
+      if (state.localPath !== localPath) continue;
+      const awareness = this.provider.getAwareness(state.docName);
+      return awareness ? { docName: state.docName, awareness } : null;
+    }
+    return null;
+  }
+
   /** EditorBridge calls this when closing a file — ContentSync resumes background sync */
   releaseDoc(docName: string): void {
     this.setEditorBound(docName, false);
@@ -859,6 +1031,15 @@ export class ContentSync {
     const state = this.fileDocs.get(docName);
     if (!state) return;
     state.editorActive = bound;
+    // While bound the editor writes the file itself, unseen here, so what disk
+    // and document agree on is unknown. On letting go it is the document's
+    // text: the binding kept the editor and document identical, and the file
+    // is the editor's save of it (or about to be). Leaving it unknown kept a
+    // board's save aside and wrote the board back over it, and diffed the
+    // editor's own closing save against the document, reverting any change
+    // that arrived meanwhile (both found in the second review).
+    if (bound) this.diskBase.delete(docName);
+    else this.diskBase.set(docName, state.ytext.toString());
     this.changed();
     if (bound && state.writeTimer) {
       window.clearTimeout(state.writeTimer);
@@ -980,50 +1161,144 @@ export class ContentSync {
     // how a note grows past the limit, and a trim is how it comes back under.
     this.checkNoteSize(sharedFolderId, state.localPath, relativePath);
 
-    // If we wrote this change ourselves, skip
+    // If we wrote this change ourselves, skip — but only if the file still says
+    // what we wrote. A view's save can land between our write and this event,
+    // and taking the flag alone as "ours" dropped that save without a trace.
+    let checkOwn: string | undefined;
     if (state.ignoreNextModify) {
       state.ignoreNextModify = false;
+      checkOwn = this.ownWrite.get(docName);
+      this.ownWrite.delete(docName);
+      if (checkOwn === undefined) return;
+    }
+
+    // If editor is active, yCollab handles sync. Its save is still noted when
+    // it says what the document says, so that what disk and document agree on
+    // never lags a file the document already holds (SAFE-A30): a stale record
+    // would read that file as an edit made elsewhere at the next connect.
+    if (state.editorActive) {
+      try {
+        const saved = await this.vault.read(state.localPath);
+        // Recorded for the next session only. While bound, this session's
+        // base stays unknown on purpose — see setEditorBound.
+        if (saved === state.ytext.toString()) this.recordAgreed(state, saved);
+      } catch {
+        // Only a record; the next agreement makes it.
+      }
       return;
     }
 
-    // If editor is active, yCollab handles sync
-    if (state.editorActive) return;
-
     try {
       const content = await this.vault.read(state.localPath);
-      const current = state.ytext.toString();
-      if (content !== current) {
-        // An empty file does not empty the document until this vault has seen
-        // the two agree at least once.
-        //
-        // FileSync creates a placeholder the moment the folder listing names a
-        // note, and Obsidian's modify event for that empty file can arrive
-        // *after* the content does. One millisecond after, in the run that
-        // found this: the document received all 42 characters from the server
-        // and this handler deleted them again, read the empty placeholder as
-        // an edit, and pushed the deletion — so the vault that wrote the note
-        // applied it and blanked its own copy too. A note was destroyed in
-        // both vaults by the arrival of the note.
-        //
-        // `lastSyncedContent === null` is precisely "we have never reconciled
-        // this file against this document", which is the placeholder case.
-        // Once the file has held the document's content, emptying it is a real
-        // edit by a real person and is honoured.
-        if (content === '' && current !== '' && state.lastSyncedContent === null) {
-          log.debug('Ignoring an empty file that has never held this document', {
-            path: state.localPath, docChars: current.length,
-          });
-          return;
-        }
-        // Use minimal diff to preserve CRDT character identities.
-        // A destructive delete-all + insert-all would create tombstones
-        // that destroy concurrent changes from other clients.
-        applyMinimalDiff(state.ydoc, state.ytext, current, content);
-        this.adoptedText(state.localPath, content);
+      if (checkOwn !== undefined) {
+        if (content === checkOwn) return;
+        log.info('The file changed between our write and its modify event; reading the change in', {
+          path: state.localPath,
+        });
       }
+      this.readIn(state, content);
     } catch (err) {
       log.error('Failed to read file for sync', { path: state.localPath, error: String(err) });
     }
+  }
+
+  /**
+   * Take what the file says into the document. Synchronous from the caller's
+   * read, so two callers that read the same text cannot both apply it.
+   *
+   * A save from an open view that missed our last write is built on what that
+   * view held before it, and is merged against that, not against the document:
+   * diffed against the document, it would read as the user reverting a
+   * collaborator's change the view never showed, and send that to everyone
+   * (SAFE-A19).
+   */
+  private readIn(state: FileDocState, content: string): void {
+    const current = state.ytext.toString();
+    if (content === current) {
+      this.agreed(state, content);
+      this.deps.surface?.ingested(state.localPath, content);
+      return;
+    }
+    // An empty file does not empty the document until this vault has seen
+    // the two agree at least once.
+    //
+    // FileSync creates a placeholder the moment the folder listing names a
+    // note, and Obsidian's modify event for that empty file can arrive
+    // *after* the content does. One millisecond after, in the run that
+    // found this: the document received all 42 characters from the server
+    // and this handler deleted them again, read the empty placeholder as
+    // an edit, and pushed the deletion — so the vault that wrote the note
+    // applied it and blanked its own copy too. A note was destroyed in
+    // both vaults by the arrival of the note.
+    //
+    // `lastSyncedContent === null` is precisely "we have never reconciled
+    // this file against this document", which is the placeholder case.
+    // Once the file has held the document's content, emptying it is a real
+    // edit by a real person and is honoured.
+    if (content === '' && current !== '' && state.lastSyncedContent === null) {
+      log.debug('Ignoring an empty file that has never held this document', {
+        path: state.localPath, docChars: current.length,
+      });
+      return;
+    }
+    const viewBase = this.deps.surface?.baseFor(state.localPath) ?? null;
+    const base = viewBase ?? this.diskBase.get(state.docName) ?? null;
+    if (base === null && this.deps.surface?.hasViews(state.localPath)) {
+      // Another plugin's view saved, and nothing says what its save was built
+      // on — just after an editor let go of the note, before disk and document
+      // were seen to agree. Diffed against the document it could revert a
+      // collaborator's change for everyone; so the document is left as it is
+      // and the save kept aside, where the user can see it (found in review).
+      // The same save reaches here twice — from its modify event and from the
+      // write that follows — and is kept once.
+      if (this.keptAside.get(state.docName) === content) return;
+      this.keptAside.set(state.docName, content);
+      log.warn('A view saved a note with nothing known to merge its save against; keeping the save aside', {
+        path: state.localPath,
+      });
+      void this.backupLocalFile(
+        state.localPath, content,
+        'A note open in another view was saved before it could be merged — kept its copy',
+      ).catch((err: unknown) => log.error('Could not keep a view\'s save aside', { path: state.localPath, error: String(err) }));
+      // A backup sits in a folder Obsidian does not show: without this the
+      // change would just look gone from the board.
+      this.deps.notify?.(`Nectenda: a change to ${state.localPath} made in another view could not be merged yet, and was kept in .nectenda-backups.`);
+      this.scheduleDiskWrite(state);
+      return;
+    }
+    this.keptAside.delete(state.docName);
+    if (viewBase !== null) {
+      log.info('Reading in a save from a view that missed the last write, against what it held', {
+        path: state.localPath,
+      });
+    }
+    if (base !== null && base !== current) {
+      // A change the document has and the file has not yet — a collaborator's,
+      // waiting for its write — merged with the save, not reverted by it. Edit
+      // by edit: a view that rewrites the whole file on save (Kanban) makes one
+      // hunk of the whole file, and a collaborator's change inside it was put
+      // in the wrong place. One hunk only when the diff is too large to run.
+      if (!mergeEdits(state.ydoc, state.ytext, base, content)) {
+        // Too large to merge by lines. The one-change merge can misplace or
+        // fold away a collaborator's text, so the save is kept first.
+        log.warn('A save was too different from what it was built on to merge line by line; keeping it, then merging it as one change', {
+          path: state.localPath, baseBytes: base.length, saveBytes: content.length,
+        });
+        void this.backupLocalFile(
+          state.localPath, content,
+          'A save too large to merge line by line — kept its copy before merging it as one change',
+        ).catch((err: unknown) => log.error('Could not keep a large save aside', { path: state.localPath, error: String(err) }));
+        mergeTextEdit(state.ydoc, state.ytext, base, content);
+      }
+    } else {
+      // Use minimal diff to preserve CRDT character identities.
+      // A destructive delete-all + insert-all would create tombstones
+      // that destroy concurrent changes from other clients.
+      applyMinimalDiff(state.ydoc, state.ytext, current, content);
+    }
+    this.agreed(state, content);
+    this.deps.surface?.ingested(state.localPath, content);
+    this.adoptedText(state.localPath, content);
   }
 
   /** Check if a doc is managed by ContentSync */
@@ -1043,7 +1318,7 @@ export class ContentSync {
       void this.writeToDisk(state).catch((err: unknown) => {
         log.warn('Deferred disk write failed', { error: String(err) });
       });
-    }, WRITE_DEBOUNCE);
+    }, this.deps.surface?.hasViews(state.localPath) === true ? VIEW_WRITE_DEBOUNCE : WRITE_DEBOUNCE);
   }
 
   private async writeToDisk(state: FileDocState): Promise<void> {
@@ -1073,9 +1348,134 @@ export class ContentSync {
     }
     state.writeRetries = 0;
 
+    // An open view of the note that is not Obsidian's editor reloads on this
+    // write with no merge (SAFE-A19, SAFE-A26).
+    const surface = this.deps.surface;
+    if (surface) {
+      // Someone is typing or dragging in it: what they are doing is not in the
+      // file yet, and the reload would throw it away. The change waits in the
+      // document, which loses nothing; `editEnded` writes it.
+      if (surface.editInProgress(state.localPath)) {
+        // Held, but first note what disk and document agree on if nothing has
+        // yet: every save the edit makes is merged against it, and with none
+        // they were kept aside (found in the second review).
+        if (!this.diskBase.has(state.docName)) {
+          const disk = await this.vault.read(state.localPath);
+          if (disk === state.ytext.toString()) this.agreed(state, disk);
+        }
+        if (!this.heldForEdit.has(state.docName)) {
+          log.info('Holding a remote change while an edit is in progress in an open view', { path: state.localPath });
+        }
+        this.heldForEdit.add(state.docName);
+        return;
+      }
+      this.heldForEdit.delete(state.docName);
+      // An edit it has not saved would be discarded by the reload: it saves
+      // first, and the read below takes that save in. A view that cannot save
+      // is not written under.
+      try {
+        await surface.beforeWrite(state.localPath);
+        this.surfaceRetries.delete(state.docName);
+      } catch (err) {
+        const tries = (this.surfaceRetries.get(state.docName) ?? 0) + 1;
+        if (tries > MAX_SURFACE_RETRIES) {
+          this.surfaceRetries.delete(state.docName);
+          log.warn('An open view could not save before a remote change was written; leaving the change in the document until the note changes again', {
+            path: state.localPath, error: String(err),
+          });
+          return;
+        }
+        this.surfaceRetries.set(state.docName, tries);
+        log.warn('An open view could not save before a remote change was written; retrying', {
+          path: state.localPath, error: String(err),
+        });
+        this.scheduleDiskWrite(state);
+        return;
+      }
+      if (this.fileDocs.get(state.docName) !== state || state.editorActive) return;
+    }
+
     try {
+      let diskContent = await this.vault.read(state.localPath);
+      // The first write of a connect, meeting a file that differs from the
+      // document (SAFE-A30). Either side may be the newer: the document may
+      // hold remote changes the file never received, or the file may hold an
+      // edit made while this vault was not syncing it — sync stopped, Obsidian
+      // closed, a git pull. Only what the two last agreed on tells them apart.
+      // Taking every such file for a stale one is how an edit made while sync
+      // was stopped used to be overwritten without a trace (NEC-201).
+      if (!state.firstSyncChecked && diskContent !== '' && diskContent !== state.ytext.toString()) {
+        const agreed = state.agreedAtConnect;
+        if (agreed !== null && diskContent !== agreed) {
+          // Changed since they agreed: an edit nobody has seen.
+          state.firstSyncChecked = true;
+          const current = state.ytext.toString();
+          if (current !== agreed) {
+            // Both sides moved. Merged against what they agreed on, so remote
+            // changes that arrived meanwhile stay — but kept first too: if the
+            // record is older than the file's last state the document holds
+            // (a save the editor made and nobody noted), the merge would apply
+            // that save a second time. Duplicated lines and a copy beat a
+            // silent overwrite.
+            log.warn('A note changed on disk while it was not being synced, and so did its document; keeping the file, then merging it in', {
+              path: state.localPath, diskBytes: diskContent.length, docBytes: current.length, agreedBytes: agreed.length,
+            });
+            await this.backupLocalFile(
+              state.localPath, diskContent,
+              'A note changed here and elsewhere while it was not being synced — kept the local copy before merging',
+            );
+            if ((await this.vault.read(state.localPath)) !== diskContent) {
+              this.scheduleDiskWrite(state);
+              return;
+            }
+          } else {
+            log.info('A note changed on disk while it was not being synced; taking the change in', {
+              path: state.localPath, diskBytes: diskContent.length,
+            });
+          }
+          this.diskBase.set(state.docName, agreed);
+          this.readIn(state, diskContent);
+          diskContent = await this.vault.read(state.localPath);
+        } else if (agreed === null && state.idbHadData) {
+          // Synced here before, by a version that did not record what it agreed
+          // on: nothing says whether the file is stale or edited. Kept first —
+          // a stray backup costs a file, a wrong guess costs the edit.
+          state.firstSyncChecked = true;
+          log.warn('A note differs from its document with nothing recorded to merge it against; keeping the file first', {
+            path: state.localPath, diskBytes: diskContent.length,
+          });
+          await this.backupLocalFile(
+            state.localPath, diskContent,
+            'A note differed from its document with nothing recorded to merge against — kept the local copy',
+          );
+          if ((await this.vault.read(state.localPath)) !== diskContent) {
+            // Saved during the backup: start again, so that save is read in.
+            this.scheduleDiskWrite(state);
+            return;
+          }
+        }
+      }
+      // The file changed since we last agreed, and not read in yet — with a
+      // view open, typically the save just asked for. Read it in now: its
+      // modify event would do so moments after the write below had replaced
+      // it, and the write then carries both.
+      //
+      // Only against a known base. Without one — just after an editor let go
+      // of the note, which wrote the file itself unseen — the read-in diffs
+      // the file against the document and reverts every collaborator's change
+      // the file has not got yet, then sends that to everyone (found in
+      // review). The file is then the editor's text, which the document holds.
+      // With no base but a view open that may just have saved, it is read in
+      // too: `readIn` keeps such a save aside rather than guess.
+      const base = this.diskBase.get(state.docName);
+      const changed = base !== undefined
+        ? diskContent !== base
+        : surface?.hasViews(state.localPath) === true && diskContent !== state.lastSyncedContent;
+      if (surface && state.firstSyncChecked && changed && diskContent !== state.ytext.toString()) {
+        this.readIn(state, diskContent);
+        diskContent = await this.vault.read(state.localPath);
+      }
       const content = state.ytext.toString();
-      const diskContent = await this.vault.read(state.localPath);
 
       // Never blank a file on the strength of a document we have not heard
       // about yet. Reconciliation runs on connect, before any catch-up, so an
@@ -1095,6 +1495,7 @@ export class ContentSync {
         // content looks like, and this was the one silent step on that path.
         log.debug('Synced content already on disk', { path: state.localPath, bytes: content.length, hasSyncedOnce: state.hasSyncedOnce });
         state.lastSyncedContent = content;
+        this.agreed(state, content);
         return;
       }
 
@@ -1134,8 +1535,11 @@ export class ContentSync {
         path: state.localPath, diskBytes: diskContent.length, docBytes: content.length,
       });
       state.ignoreNextModify = true;
+      this.ownWrite.set(state.docName, content);
       await this.vault.write(state.localPath, content);
       state.lastSyncedContent = content;
+      this.agreed(state, content);
+      surface?.afterWrite(state.localPath, content, () => this.vault.read(state.localPath));
     } catch (err) {
       log.error('Failed to write synced content to disk', { path: state.localPath, error: String(err) });
     }

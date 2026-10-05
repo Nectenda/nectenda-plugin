@@ -41,8 +41,10 @@ export function kindOf(
 ): FileKind {
   const parts = path.split('/');
   if (parts.some((p) => p.startsWith('.'))) return 'ignore';
-  if (path.endsWith('.md')) return 'text';
+  // Before `.md`: a format that is a kind of Markdown note — an Excalidraw
+  // drawing, `.excalidraw.md` — is structured, not text (NEC-41).
   if (codecForPath(path, formats)) return 'structured';
+  if (path.endsWith('.md')) return 'text';
   return 'blob';
 }
 

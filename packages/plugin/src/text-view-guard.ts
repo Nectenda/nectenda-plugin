@@ -12,19 +12,130 @@ export interface TextViewLike {
   file: { path: string } | null;
   save(clear?: boolean): Promise<void>;
   setViewData(data: string, clear: boolean): void;
+  /** The view's own element, for `EditProbe`: whether an edit is in progress inside it. */
+  containerEl?: ElementLike | null;
+}
+
+/** The two things `EditProbe` asks of a DOM element. */
+export interface ElementLike {
+  contains(other: unknown): boolean;
+  closest?(selector: string): unknown;
+}
+
+/** The document `EditProbe` watches: its focus, and its pointer and focus events. */
+export interface DocumentLike {
+  readonly activeElement: unknown;
+  addEventListener(type: string, listener: (e: { target: unknown; buttons?: number }) => void, capture?: boolean): void;
+  removeEventListener(type: string, listener: (e: { target: unknown; buttons?: number }) => void, capture?: boolean): void;
 }
 
 /** How long after a write an open view must have loaded it. See `afterWrite`. */
 export const LOAD_CHECK_MS = 1000;
+/** How soon after a write the views are first looked at for having loaded it. */
+const QUICK_CHECK_MS = 150;
 /** How long a repair's save may take to be read in before its base is dropped. */
 const REPAIR_GRACE_MS = 3000;
+/**
+ * How often a held write is looked at again, in case the edit ended without an
+ * event saying so: an editor removed from the page does not always send
+ * `focusout`, and a pointer released outside the window sends no `pointerup`.
+ */
+export const HOLD_RECHECK_MS = 1000;
 
 /**
- * Makes writing a structured file safe while a view of it is open (SAFE-A19).
+ * Where typing goes. A checkbox, radio or button takes focus when clicked and
+ * keeps it, so they are left out: a ticked card would otherwise hold every
+ * remote change until the person happened to click elsewhere.
+ */
+const EDITABLE = [
+  'textarea', 'select', '[contenteditable=""]', '[contenteditable="true"]', '.cm-editor',
+  'input:not([type="checkbox"]):not([type="radio"]):not([type="button"]):not([type="submit"]):not([type="reset"])',
+].join(', ');
+
+/**
+ * Whether someone is in the middle of an edit inside a view (SAFE-A26): typing
+ * into one of its fields or editors, or holding the pointer down in it — a
+ * drag, or a click not yet released.
+ *
+ * Read from the DOM only, so it needs nothing of any plugin's internals and
+ * holds for any view. It exists because a view that renders a file the way the
+ * Kanban plugin does throws away what is on screen when the file reloads: a
+ * card's text being typed lives only in its editor until it is committed, and
+ * a card being dragged is mid-gesture. Obsidian's reload cannot ask either to
+ * save first — there is nothing saved yet to ask for — so the write that would
+ * cause the reload waits instead.
+ */
+export class EditProbe {
+  /** Where the pointer went down, until it comes up. */
+  private pressed: unknown = null;
+  private listeners = new Set<() => void>();
+  private stopListening: () => void;
+
+  constructor(private doc: DocumentLike) {
+    const down = (e: { target: unknown }): void => { this.pressed = e.target; };
+    const up = (): void => {
+      if (this.pressed === null) return;
+      this.pressed = null;
+      this.mayHaveEnded();
+    };
+    // A press whose release was never seen — let go outside the window, or
+    // the window left mid-press — ends with the next sign that no button is
+    // held: the pointer moving with none down, or a key typed (found in review).
+    const moved = (e: { target: unknown; buttons?: number }): void => {
+      if (e.buttons === 0) up();
+    };
+    // After the focus has moved, not as it leaves: `focusout` fires before
+    // `activeElement` names where it went.
+    const blurred = (): void => { window.setTimeout(() => this.mayHaveEnded(), 0); };
+    const on: [string, (e: { target: unknown; buttons?: number }) => void][] = [
+      ['pointerdown', down], ['pointerup', up], ['pointercancel', up], ['dragend', up], ['drop', up],
+      ['pointermove', moved], ['keydown', up], ['focusout', blurred],
+    ];
+    // Capturing, so a view that stops an event's propagation cannot hide it.
+    for (const [type, fn] of on) doc.addEventListener(type, fn, true);
+    this.stopListening = () => { for (const [type, fn] of on) doc.removeEventListener(type, fn, true); };
+  }
+
+  /** Whether an edit is in progress inside `el`. */
+  editingIn(el: ElementLike | null | undefined): boolean {
+    if (!el) return false;
+    const active = this.doc.activeElement;
+    if (active && el.contains(active) && isEditable(active)) return true;
+    return this.pressed !== null && el.contains(this.pressed);
+  }
+
+  /** Called whenever an edit may have ended: the guard then looks again. */
+  onMayHaveEnded(listener: () => void): () => void {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
+
+  private mayHaveEnded(): void {
+    for (const l of [...this.listeners]) l();
+  }
+
+  dispose(): void {
+    this.stopListening();
+    this.listeners.clear();
+    this.pressed = null;
+  }
+}
+
+function isEditable(el: unknown): boolean {
+  const found = (el as ElementLike | null)?.closest?.(EDITABLE);
+  return found !== undefined && found !== null;
+}
+
+/**
+ * Makes writing a file safe while a view of it is open (SAFE-A19): a canvas,
+ * a base, or another plugin's view of a note — a board of the Kanban plugin.
+ * One instance guards structured files, another notes; the note one also has
+ * an `EditProbe`, so a write can wait for an edit in progress (SAFE-A26).
  *
  * Obsidian 1.13.7 reloads an open canvas, and an open base, when its file
  * changes on disk, with no merge (`TextFileView.onModify`; the three-way merge
- * only runs for plain text). Both save about 2 s after the first change of a
+ * only runs for plain text, in its own markdown view — any other view of a
+ * note is reloaded the same way). Both save about 2 s after the first change of a
  * burst, and both skip the reload while `saving`. Two things follow, both read
  * from its source:
  *
@@ -61,8 +172,60 @@ export class TextViewGuard implements StructuredSurface {
   /** What we last wrote to each path whose load check is still pending. */
   private written = new Map<string, string>();
   private timers = new Map<string, TimerHandle>();
+  /** Paths whose write is being held for an edit in progress (SAFE-A26). */
+  private holding = new Set<string>();
+  private endedListeners = new Set<(localPath: string) => void>();
+  private recheck: TimerHandle | null = null;
+  private stopProbe: (() => void) | null = null;
 
-  constructor(private views: () => TextViewLike[]) {}
+  /**
+   * `probe`, when given, lets a writer ask whether an edit is in progress in
+   * an open view (`editInProgress`) and be told when it ends. Without one,
+   * nothing is ever held — canvas and bases, whose views keep no edit outside
+   * their `data`, are guarded without it.
+   */
+  constructor(private views: () => TextViewLike[], private probe?: EditProbe) {
+    this.stopProbe = probe?.onMayHaveEnded(() => this.checkHeld()) ?? null;
+  }
+
+  /**
+   * Whether a write of `localPath` should wait: someone is typing or dragging
+   * in an open view of it. A path found held is watched until the edit ends,
+   * and then every `onEditEnded` listener hears of it once.
+   */
+  editInProgress(localPath: string): boolean {
+    if (!this.probe) return false;
+    const editing = this.viewsOf(localPath).some((v) => this.probe!.editingIn(v.containerEl));
+    if (editing) {
+      this.holding.add(localPath);
+      this.recheck ??= window.setInterval(() => this.checkHeld(), HOLD_RECHECK_MS);
+    }
+    return editing;
+  }
+
+  /** Whether any view of `localPath` is open and has loaded it. */
+  hasViews(localPath: string): boolean {
+    return this.viewsOf(localPath).length > 0;
+  }
+
+  /** Told the path of each held write once its edit has ended, so it can be written. */
+  onEditEnded(listener: (localPath: string) => void): () => void {
+    this.endedListeners.add(listener);
+    return () => this.endedListeners.delete(listener);
+  }
+
+  private checkHeld(): void {
+    for (const path of [...this.holding]) {
+      const views = this.viewsOf(path);
+      if (views.some((v) => this.probe?.editingIn(v.containerEl))) continue;
+      this.holding.delete(path);
+      for (const l of [...this.endedListeners]) l(path);
+    }
+    if (this.holding.size === 0 && this.recheck !== null) {
+      window.clearInterval(this.recheck);
+      this.recheck = null;
+    }
+  }
 
   private viewsOf(localPath: string): TextViewLike[] {
     return this.views().filter((v) => v.file?.path === localPath && typeof v.data === 'string' && v.data !== '');
@@ -70,6 +233,7 @@ export class TextViewGuard implements StructuredSurface {
 
   async beforeWrite(localPath: string): Promise<void> {
     const views = this.viewsOf(localPath);
+    if (views.length > 0) log.debug('Asking open views to save before a write', { path: localPath, views: views.length });
     for (const v of views) await v.save();
     const after = this.viewsOf(localPath)[0]?.data;
     if (typeof after === 'string') this.held.set(localPath, after);
@@ -84,12 +248,47 @@ export class TextViewGuard implements StructuredSurface {
     this.written.delete(localPath);
     if (prior === undefined || this.viewsOf(localPath).length === 0) return;
     this.written.set(localPath, text);
+    this.scheduleCheck(localPath, text, prior, readBack);
+    // Obsidian reloads a view within moments of the write. Seen to have done
+    // so, a save it makes next is built on the write, and is merged against
+    // that — not against what it held before, which replayed the collaborator's
+    // change a second time for any save made inside the check's second (found
+    // in the second review). A view mid-save misses the reload, and is left to
+    // the check as before.
+    window.setTimeout(() => {
+      if (this.written.get(localPath) !== text) return;
+      const views = this.viewsOf(localPath);
+      if (views.length === 0 || views.some((v) => v.data !== text)) return;
+      this.written.delete(localPath);
+      this.held.set(localPath, text);
+      const timer = this.timers.get(localPath);
+      if (timer) window.clearTimeout(timer);
+      this.timers.delete(localPath);
+    }, QUICK_CHECK_MS);
+  }
+
+  /**
+   * `LOAD_CHECK_MS` from now, check the views of `localPath` loaded `text`, and
+   * repair any that did not. Not while an edit is in progress in one (SAFE-A26):
+   * the repair reloads the view, which is the very thing the hold keeps away
+   * from an edit (found in review). The check waits instead, keeping what the
+   * views held, so a save made meanwhile is still merged against that.
+   */
+  private scheduleCheck(localPath: string, text: string, prior: string, readBack?: () => Promise<string>): void {
     this.timers.set(localPath, window.setTimeout(() => {
       this.timers.delete(localPath);
+      if (this.probe && this.viewsOf(localPath).some((v) => this.probe!.editingIn(v.containerEl))) {
+        log.debug('Waiting for an edit to end before checking an open view loaded a write', { path: localPath });
+        this.scheduleCheck(localPath, text, prior, readBack);
+        return;
+      }
       this.written.delete(localPath);
       const missed = this.viewsOf(localPath).filter((v) => v.data !== text);
       if (missed.length === 0) return;
-      void this.repair(localPath, prior, missed, readBack).catch((err: unknown) => {
+      // What the views hold now: a save read in while the check waited moved
+      // it on from what they held at the write (found in the second review).
+      const base = this.held.get(localPath) ?? prior;
+      void this.repair(localPath, base, missed, readBack).catch((err: unknown) => {
         log.warn('Could not bring an open view up to date', { path: localPath, error: String(err) });
       });
     }, LOAD_CHECK_MS));
@@ -111,6 +310,7 @@ export class TextViewGuard implements StructuredSurface {
       path: localPath,
     });
     this.repairing.set(localPath, prior);
+    log.debug('Asking open views to save, for a repair', { path: localPath, views: views.length });
     window.setTimeout(() => {
       if (this.repairing.get(localPath) === prior) this.repairing.delete(localPath);
     }, REPAIR_GRACE_MS);
@@ -160,5 +360,11 @@ export class TextViewGuard implements StructuredSurface {
     this.timers.clear();
     this.held.clear();
     this.repairing.clear();
+    if (this.recheck !== null) window.clearInterval(this.recheck);
+    this.recheck = null;
+    this.stopProbe?.();
+    this.stopProbe = null;
+    this.holding.clear();
+    this.endedListeners.clear();
   }
 }

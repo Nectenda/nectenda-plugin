@@ -83,7 +83,25 @@ export type ViewPresence = {
   name: string;
   type: string;
   focus?: { path: string; property?: string };
-} | PropertiesPresence;
+} | PropertiesPresence | NoteViewPresence;
+
+/**
+ * Someone on a note that another plugin's view shows — a board of the Kanban
+ * plugin, say (WIRE-098). `type` is that view's type, so a receiver can name
+ * it; the person counts as on the note whatever view the receiver has it in.
+ *
+ * `focus` is the card they are on, on a Kanban board: its lane and its
+ * position in the lane, both counted from zero in the order the board draws
+ * them, and `key`, a short hash of the card's text. With no `item` it is the
+ * list itself, and `key` hashes the list's title. The board has no ids of its
+ * own, so a receiver finds the card or list by `key` first — positions move
+ * as cards are added — and by position only when none has that text.
+ */
+export type NoteViewPresence = {
+  surface: 'note-view';
+  type: string;
+  focus?: { lane: number; item?: number; key: string };
+};
 
 /**
  * The property someone has focused in a note's Properties panel (WIRE-097).
@@ -124,6 +142,7 @@ const isObject = (v: unknown): v is Record<string, unknown> =>
 const isNum = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
 const isStr = (v: unknown): v is string => typeof v === 'string';
 const optNum = (v: unknown): boolean => v === undefined || isNum(v);
+const isIndex = (v: unknown): v is number => isNum(v) && Number.isInteger(v) && v >= 0;
 
 function readUser(v: unknown): PresenceUser | null {
   if (!isObject(v)) return null;
@@ -212,6 +231,16 @@ function readView(v: unknown): ViewPresence | null {
     // Nothing else to show without the focus, so an unreadable one is no view.
     if (!isObject(v.focus) || !isInsidePath(v.focus.path) || !isStr(v.focus.property) || v.focus.property === '') return null;
     return { surface: 'properties', focus: { path: v.focus.path, property: v.focus.property } };
+  }
+  if (v.surface === 'note-view') {
+    if (!isStr(v.type) || v.type === '') return null;
+    const note: NoteViewPresence = { surface: 'note-view', type: v.type };
+    // A focus this client cannot read is dropped on its own; the person still shows.
+    const f = v.focus;
+    if (isObject(f) && isIndex(f.lane) && (f.item === undefined || isIndex(f.item)) && isStr(f.key) && f.key !== '' && f.key.length <= 16) {
+      note.focus = f.item === undefined ? { lane: f.lane, key: f.key } : { lane: f.lane, item: f.item, key: f.key };
+    }
+    return note;
   }
   if (v.surface !== 'bases') return null;
   if (!isStr(v.name) || !isStr(v.type)) return null;

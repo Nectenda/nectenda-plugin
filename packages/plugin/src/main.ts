@@ -54,7 +54,8 @@ import { DocIndex } from './doc-index';
 import { IDENTITY_KEY_PREFIX, createDeviceStore, createSecretStore, SECRET_IDS, type SecretStore } from './secret-store';
 import { describeDevice, describeInstall, getOrCreateInstallId, openVaultLabel, platformName, sealVaultLabel, type DeviceDescription } from './device';
 import { ErrorReports, isOurs } from './error-report';
-import { shouldWarnAboutStorage } from './blob-policy';
+import { rollLogFile } from './diag-log-file';
+import { kindOf, shouldWarnAboutStorage } from './blob-policy';
 import { joinWithin } from './vault-path';
 import {
   FolderCryptoRegistry,
@@ -72,7 +73,10 @@ import { MultiplexedProvider } from './multiplexed-provider';
 import { ContentSync } from './content-sync';
 import { StructuredSync } from './structured-sync';
 import { STRUCTURED_FORMATS } from './structured-formats';
-import { TextViewGuard } from './text-view-guard';
+import { TextViewGuard, EditProbe } from './text-view-guard';
+import { TextViewPresence, type NoteViewLike } from './text-view-presence';
+import { QuickSave } from './note-view-save';
+import { KANBAN_VIEW_TYPE } from './kanban-presence';
 import { CanvasLiveManager, bindingForCanvas, type CanvasLiveBinding } from './canvas-live';
 import { BASES_PRESENCE_TICK_MS, BasesPresence, basesViewLike, type BasesViewLike } from './bases-presence';
 import { PropertyFocus } from './property-focus';
@@ -81,6 +85,9 @@ import { canvasCardBinding } from './canvas-card-binding';
 import { PendingEdits } from './pending-edits';
 import { EditorWiring } from './editor-wiring';
 import { CanvasPresence } from './canvas-presence';
+import { DeleteWitness, ExcalidrawLiveManager, sharedDrawingViews, type ExcalidrawLib, type ExcalidrawLiveBinding, type ExcalidrawViewLike } from './excalidraw-live';
+import { ExcalidrawPresence } from './excalidraw-presence';
+import { setKeptBy } from './excalidraw-codec';
 import { OversizedNotes, describeOversizedNotes, type OversizedNote } from './oversized-notes';
 import { mib } from './sync-status';
 import { EditorBridge, presenceReporter, userColor } from './editor-bridge';
@@ -273,6 +280,22 @@ const ATTEST_INTERVAL_MS = 6 * 60 * 60 * 1000;
 export type { VerifyOutcome } from './identity-session';
 
 
+/** The view types saved early while "Live sync for Kanban boards" is on, and while it is off. */
+const KANBAN_ONLY: ReadonlySet<string> = new Set([KANBAN_VIEW_TYPE]);
+const NONE: ReadonlySet<string> = new Set();
+
+/**
+ * Another plugin's view of a note — a board of the Kanban plugin, say: a
+ * TextFileView of a `.md` that is not Obsidian's own editor. Guarded on write
+ * (SAFE-A19, SAFE-A26) and given presence (WIRE-098) whatever its type.
+ */
+function isOtherNoteView(view: unknown): view is TextFileView {
+  return view instanceof TextFileView && !(view instanceof MarkdownView) && view.file?.extension === 'md'
+    // A Markdown-named structured file — an Excalidraw drawing — is not a note
+    // here: it has its own guard, binding and presence (NEC-41, SAFE-A28).
+    && kindOf(view.file.path) !== 'structured';
+}
+
 export default class NectendaPlugin extends Plugin {
   settings: NectendaSettings = DEFAULT_SETTINGS;
   /**
@@ -337,12 +360,35 @@ export default class NectendaPlugin extends Plugin {
   contentSync: ContentSync | null = null;
   structuredSync: StructuredSync | null = null;
   private textViewGuard: TextViewGuard | null = null;
+  /** The guard for notes open in another plugin's view; see `startSync`. */
+  private noteViewGuard: TextViewGuard | null = null;
+  private editProbe: EditProbe | null = null;
   /** Open canvases bound live to their documents (canvas-live.ts). */
   private canvasLive: CanvasLiveManager | null = null;
   /** Header reports for live canvases, by view, for the active one to repaint. */
   private canvasReporters = new Map<unknown, () => void>();
+  /** Open Excalidraw drawings bound live to their documents (excalidraw-live.ts, NEC-41). */
+  excalidrawLive: ExcalidrawLiveManager | null = null;
+  /**
+   * What open drawings deleted, for the saves that leave it out. For the
+   * plugin's lifetime, not a sync session's: a delete made while sync was off
+   * is read in when it starts again.
+   */
+  private readonly deleteWitness = new DeleteWitness(() => this.openSharedDrawings());
+
+  /** Open drawings in shared folders, skipping tabs not yet loaded (see sharedDrawingViews). */
+  private openSharedDrawings(): ExcalidrawViewLike[] {
+    return sharedDrawingViews(
+      this.app.workspace.getLeavesOfType('excalidraw').map((leaf) => leaf.view),
+      (path) => this.folderRootOf(path) !== null,
+    );
+  }
   /** Who has each open base open, and on which view (bases-presence.ts, WIRE-096). */
   private basesPresence: BasesPresence | null = null;
+  /** Presence in another plugin's view of a note; see `startSync`. */
+  private textViewPresence: TextViewPresence | null = null;
+  /** Saves another plugin's view of a shared note soon after it changes (note-view-save.ts). */
+  private quickSave: QuickSave | null = null;
   private propertyFocus: PropertyFocus | null = null;
   /** Each live canvas view's presence, for "go to" from the presence circles. */
   private canvasPresences = new Map<unknown, CanvasPresence>();
@@ -543,8 +589,13 @@ export default class NectendaPlugin extends Plugin {
     this.registerEvent(this.app.workspace.on('layout-change', () => {
       this.refreshStatusUi();
       this.canvasLive?.refresh();
+      this.excalidrawLive?.refresh();
       this.basesPresence?.refresh();
+      this.textViewPresence?.later();
+      this.quickSave?.refresh();
       this.propertyFocus?.later();
+      // Sync on or off: a delete made while it is off is what this is for.
+      this.deleteWitness.watch();
     }));
     this.registerEvent(this.app.workspace.on('active-leaf-change', (leaf) => {
       // Remembered because the inspector takes focus when it opens, and from
@@ -552,8 +603,11 @@ export default class NectendaPlugin extends Plugin {
       if (leaf?.view instanceof MarkdownView && leaf.view.file) this.lastNotePath = leaf.view.file.path;
       this.refreshStatusUi();
       this.canvasLive?.refresh();
+      this.excalidrawLive?.refresh();
       if (leaf?.view) this.canvasReporters.get(leaf.view)?.();
       this.basesPresence?.refresh();
+      this.textViewPresence?.later();
+      this.quickSave?.refresh();
       // Later, not now: the editor bridge binds the new note on this same
       // event, and the focus goes out on the note it binds.
       this.propertyFocus?.later();
@@ -561,8 +615,13 @@ export default class NectendaPlugin extends Plugin {
     this.registerEvent(this.app.workspace.on('file-open', () => {
       this.refreshStatusUi();
       this.canvasLive?.refresh();
+      this.excalidrawLive?.refresh();
       this.basesPresence?.refresh();
+      this.textViewPresence?.later();
+      this.quickSave?.refresh();
       this.propertyFocus?.later();
+      // Sync on or off: a delete made while it is off is what this is for.
+      this.deleteWitness.watch();
     }));
     // Which property of the Properties panel has focus (WIRE-097): its inputs
     // are not the editor, so only the document's focus events say.
@@ -576,6 +635,8 @@ export default class NectendaPlugin extends Plugin {
     // of each open base and nothing on the wire.
     this.registerInterval(window.setInterval(() => {
       this.basesPresence?.refresh();
+      this.textViewPresence?.later();
+      this.quickSave?.refresh();
       // A backstop for a panel rebuilt with no event this sees, and for a
       // focus dropped when the bridge replaced the note's state on binding.
       this.propertyFocus?.sync();
@@ -2764,6 +2825,7 @@ export default class NectendaPlugin extends Plugin {
     // A clean shutdown is not a crash, so nothing may be left looking like one.
     void this.deviceState?.endAttempt();
     this.stopSync();
+    this.deleteWitness.dispose();
     this.oversizedNotes.dispose();
     if (this.statusUiTimer) window.clearTimeout(this.statusUiTimer);
     this.statusUiTimer = null;
@@ -2857,9 +2919,22 @@ export default class NectendaPlugin extends Plugin {
     this.provider.on('folder-gone', (id: unknown) => this.handleFolderGone(String(id)));
     this.provider.connect();
 
+    // A note open in another plugin's view — a board of the Kanban plugin, or
+    // any TextFileView of a `.md` that is not Obsidian's editor. Obsidian
+    // reloads it on our write with no merge, so it is asked to save first and
+    // checked for having loaded (SAFE-A19), and a write waits while someone
+    // types or drags in it (SAFE-A26). text-view-guard.ts. Found by walking
+    // the leaves rather than by view type, so a plugin this build has never
+    // heard of is guarded too.
+    this.noteViewGuard?.dispose();
+    this.editProbe?.dispose();
+    this.editProbe = new EditProbe(document);
+    this.noteViewGuard = new TextViewGuard(() => this.otherNoteViews(), this.editProbe);
+
     // Content sync for background file syncing
     const vaultAdapter = new ObsidianVaultAdapter(this.app.vault);
     this.contentSync = new ContentSync({
+      surface: this.noteViewGuard,
       hasKeys: (id) => this.folderCrypto.hasKeys(id),
       docIndex: this.docIndex,
       vaultKey: () => this.vaultKey,
@@ -2869,6 +2944,28 @@ export default class NectendaPlugin extends Plugin {
       noteGone: (folderId, path) => this.oversizedNotes.forget(folderId, path),
       notify: (message) => new Notice(message, 10000),
     }, this.provider, vaultAdapter);
+    const contentSync = this.contentSync;
+    this.noteViewGuard.onEditEnded((path) => contentSync.editEnded(path));
+    // A change in such a view reaches the document only once the view saves,
+    // which Obsidian puts off by two seconds; a Kanban board is saved sooner.
+    this.quickSave?.dispose();
+    this.quickSave = new QuickSave(() => this.otherNoteViews(), (path) => this.folderRootOf(path) !== null, () => (this.settings.liveKanban ? KANBAN_ONLY : NONE));
+    this.quickSave.refresh();
+    // Who is on a note in another plugin's view, and on a Kanban board which
+    // card (WIRE-098). text-view-presence.ts.
+    this.textViewPresence?.dispose();
+    this.textViewPresence = new TextViewPresence({
+      active: () => {
+        const view = this.app.workspace.getActiveViewOfType(TextFileView);
+        return isOtherNoteView(view) ? view as unknown as NoteViewLike : null;
+      },
+      awarenessFor: (path) => contentSync.awarenessFor(path),
+      username: () => this.presenceName(),
+      userColor,
+      report: (people) => this.updatePresence(people),
+      activeElement: () => document.activeElement,
+      kanbanFocus: () => this.settings.liveKanban,
+    });
     // A file whose subscribe was refused for want of a connection is retried
     // when one appears, rather than waiting for something to touch it again.
     // Without this it stayed unconnected — looking healthy, syncing nothing —
@@ -2900,6 +2997,20 @@ export default class NectendaPlugin extends Plugin {
       formats: STRUCTURED_FORMATS,
       notify: (message) => new Notice(message, 10000),
       surface: this.textViewGuard,
+      // An Excalidraw drawing that is not bound — live sync for drawings off,
+      // or a binding that fell back — is merged over disk, and the write waits
+      // while someone is typing or drawing in it (SAFE-A26).
+      editInProgress: (path) => {
+        const probe = this.editProbe;
+        if (!probe) return false;
+        return this.app.workspace.getLeavesOfType('excalidraw').some((leaf) => {
+          const view = leaf.view as unknown as { file?: { path: string } | null; containerEl?: HTMLElement; semaphores?: { isEditingText?: boolean } };
+          if (view.file?.path !== path) return false;
+          return view.semaphores?.isEditingText === true || (view.containerEl ? probe.editingIn(view.containerEl) : false);
+        });
+      },
+      // Live or not, a drawing's deletes are in no file: see DeleteWitness.
+      withViewDeletes: (path, saved, current) => this.deleteWitness.withViewDeletes(path, saved, current),
     }, this.provider, vaultAdapter);
 
     // An open canvas of a shared file is bound live (canvas-live.ts): the
@@ -2924,6 +3035,29 @@ export default class NectendaPlugin extends Plugin {
     // Canvases already open: no workspace event will say so. It keeps trying
     // until each one's document has connected.
     this.canvasLive.refresh();
+
+    // An open Excalidraw drawing is bound the same way, through the Excalidraw
+    // plugin's own API (excalidraw-live.ts, NEC-41) — unless the user turned
+    // live sync for drawings off, when it is merged on save instead.
+    setKeptBy(this.presenceName());
+    this.excalidrawLive?.dispose();
+    this.excalidrawLive = new ExcalidrawLiveManager({
+      structured,
+      readFile: async (path) => {
+        const file = this.app.vault.getAbstractFileByPath(path);
+        return file instanceof TFile ? await this.app.vault.read(file) : null;
+      },
+      lib: () => ((window as unknown as { ExcalidrawLib?: ExcalidrawLib }).ExcalidrawLib ?? null),
+      fellBack: () => undefined,
+      notify: (message) => new Notice(message, 10000),
+      enabled: () => this.settings.liveExcalidraw,
+      witness: this.deleteWitness,
+      views: () => this.openSharedDrawings(),
+      pluginVersion: (this.app as unknown as { plugins?: { manifests?: Record<string, { version?: string }> } })
+        .plugins?.manifests?.['obsidian-excalidraw-plugin']?.version,
+    });
+    this.excalidrawLive.onBound((binding) => this.startExcalidrawPresence(binding));
+    this.excalidrawLive.refresh();
 
     this.basesPresence?.dispose();
     const basesViews = (): (BasesViewLike & { view: TextFileView })[] => this.app.workspace.getLeavesOfType('bases')
@@ -3074,6 +3208,7 @@ export default class NectendaPlugin extends Plugin {
       trackedDocs: () => this.contentSync?.trackedDocs() ?? [],
       docSyncState: (docName) => this.provider?.docSyncState(docName) ?? null,
       enabled: () => this.settings.fileStatusIcons,
+      structuredDocName: (path) => this.structuredSync?.docNameFor(path) ?? null,
     });
     this.fileStatus.start();
     if (this.contentSync) this.contentSync.onStateChange = () => this.refreshStatusUi();
@@ -3131,8 +3266,9 @@ export default class NectendaPlugin extends Plugin {
       log.error('Diagnostic log could not be written', err);
     };
 
-    let queue: Promise<void> = adapter
-      .write(path, `=== session start ${new Date().toISOString()} ===\n`)
+    // The last session's file is kept as diag.prev.log, not written over: a
+    // reload otherwise wipes the record of what came just before it.
+    let queue: Promise<void> = rollLogFile(adapter, path, `=== session start ${new Date().toISOString()} ===\n`)
       .catch(failed);
     setLogSink((line) => {
       queue = queue
@@ -3141,10 +3277,10 @@ export default class NectendaPlugin extends Plugin {
             sinceCheck = 0;
             const stat = await adapter.stat(path);
             if (stat && stat.size > MAX_BYTES) {
-              // Truncate rather than rotate: a second file in the plugin
-              // folder is another thing to explain and another thing to
-              // forget to delete. The recent end is the useful end.
-              await adapter.write(path, `=== truncated at ${new Date().toISOString()} ===\n`);
+              // Rolled into diag.prev.log like a new session, rather than
+              // truncated: the end just written is the useful end, and
+              // truncating threw it away with the rest.
+              await rollLogFile(adapter, path, `=== continued at ${new Date().toISOString()} ===\n`);
             }
           }
           await adapter.append(path, line + '\n');
@@ -3167,12 +3303,22 @@ export default class NectendaPlugin extends Plugin {
     // Live canvases let go first: they hold documents about to be destroyed.
     this.canvasLive?.dispose();
     this.canvasLive = null;
+    this.excalidrawLive?.dispose();
+    this.excalidrawLive = null;
     this.basesPresence?.dispose();
     this.basesPresence = null;
+    this.textViewPresence?.dispose();
+    this.textViewPresence = null;
+    this.quickSave?.dispose();
+    this.quickSave = null;
     this.structuredSync?.disconnectAll();
     this.structuredSync = null;
     this.textViewGuard?.dispose();
     this.textViewGuard = null;
+    this.noteViewGuard?.dispose();
+    this.noteViewGuard = null;
+    this.editProbe?.dispose();
+    this.editProbe = null;
     // Before the provider goes, so every in-flight transfer is aborted while
     // the state it would write into still exists. void-fired teardown racing
     // async work has caused at least four bugs in this codebase.
@@ -3266,6 +3412,7 @@ export default class NectendaPlugin extends Plugin {
     // Structured files are placed by FileSync's reconcile when each listing
     // opens, so they are only torn down here, before it runs.
     this.canvasLive?.reset();
+    this.excalidrawLive?.reset();
     this.structuredSync?.disconnectAll();
     if (this.fileSync) {
       this.fileSync.disconnectAll();
@@ -3273,8 +3420,9 @@ export default class NectendaPlugin extends Plugin {
         this.fileSync.connectFolder(mapping.sharedFolderId, mapping.localPath);
       }
     }
-    // Open canvases bind again once their documents reconnect.
+    // Open canvases and drawings bind again once their documents reconnect.
     this.canvasLive?.refresh();
+    this.excalidrawLive?.refresh();
     if (this.contentSync) {
       this.contentSync.disconnectAll();
       for (const mapping of live) {
@@ -3311,6 +3459,7 @@ export default class NectendaPlugin extends Plugin {
       mappings: () => this.settings.folderMappings,
       trackedDocs: () => this.contentSync?.trackedDocs() ?? [],
       docSyncState: (docName) => this.provider?.docSyncState(docName) ?? null,
+      structuredDocName: (path) => this.structuredSync?.docNameFor(path) ?? null,
     });
   }
 
@@ -3619,6 +3768,59 @@ export default class NectendaPlugin extends Plugin {
     });
   }
 
+  /**
+   * Presence for a drawing just bound live (excalidraw-presence.ts, WIRE-099):
+   * collaborators' pointers and selections drawn by Excalidraw itself, and who
+   * is here in the header while it is the active view. Ends with the binding.
+   */
+  private startExcalidrawPresence(binding: ExcalidrawLiveBinding): void {
+    const awareness = binding.awareness;
+    const docName = binding.boundDocName();
+    const root = (binding.view as unknown as { contentEl?: HTMLElement }).contentEl;
+    if (!awareness || !docName || !root) return;
+    const presence = new ExcalidrawPresence(binding, root, {
+      username: () => this.presenceName(),
+      userColor,
+      sharePointer: () => this.settings.sharePointer,
+      showPointers: () => this.settings.showPointers,
+    });
+    presence.start();
+    const isActive = (): boolean => this.app.workspace.getActiveViewOfType(TextFileView) === (binding.view as unknown);
+    const report = (people: Person[]): void => {
+      if (isActive()) this.updatePresence(people);
+    };
+    const reporter = presenceReporter(awareness, docName, report);
+    awareness.on('change', reporter);
+    this.canvasReporters.set(binding.view, () => {
+      window.setTimeout(() => presenceReporter(awareness, docName, report)(), 0);
+    });
+    if (isActive()) reporter();
+    binding.onDetach(() => {
+      awareness.off('change', reporter);
+      this.canvasReporters.delete(binding.view);
+      presence.stop();
+      // The header said who is here live; this drawing no longer is, so it says
+      // nothing until it is bound again. Left, its circles would go on claiming
+      // a live session that has dropped to syncing on save.
+      if (isActive()) this.updatePresence([]);
+    });
+  }
+
+  /** "Live sync for Excalidraw drawings": bound drawings let go at once when it is turned off. */
+  async setLiveExcalidraw(on: boolean): Promise<void> {
+    this.settings.liveExcalidraw = on;
+    await this.saveSettings();
+    this.excalidrawLive?.refresh();
+  }
+
+  /** "Live sync for Kanban boards": open boards stop saving early and drawing focus at once. */
+  async setLiveKanban(on: boolean): Promise<void> {
+    this.settings.liveKanban = on;
+    await this.saveSettings();
+    this.quickSave?.refresh();
+    this.textViewPresence?.later();
+  }
+
   updatePresence(people: Person[]): void {
     this.renderPresenceStack(people);
     this.updatePresenceCount(people);
@@ -3690,6 +3892,11 @@ export default class NectendaPlugin extends Plugin {
         .catch((err: unknown) => log.warn('Could not switch a base to a collaborator\'s view', { error: String(err) }));
       return;
     }
+    if (isOtherNoteView(other)) {
+      // Another plugin's view of the note — a Kanban board: the card they are on.
+      if (!this.textViewPresence?.goTo(name)) new Notice(`${name} is not on a card here right now.`);
+      return;
+    }
     if (!view) {
       const canvas = other;
       const presence = canvas ? this.canvasPresences.get(canvas) : undefined;
@@ -3709,6 +3916,19 @@ export default class NectendaPlugin extends Plugin {
     } else {
       view.editor.scrollIntoView({ from: pos, to: pos }, true);
     }
+  }
+
+  /**
+   * Every open view of a note that is not Obsidian's own editor: any
+   * TextFileView whose file is a `.md`. Canvas and bases are other files, and
+   * have their own guard.
+   */
+  private otherNoteViews(): TextFileView[] {
+    const views: TextFileView[] = [];
+    this.app.workspace.iterateAllLeaves((leaf) => {
+      if (isOtherNoteView(leaf.view)) views.push(leaf.view);
+    });
+    return views;
   }
 
   /**
@@ -6919,6 +7139,32 @@ export class NectendaSettingTab extends PluginSettingTab {
       .addToggle((toggle) =>
         toggle.setValue(this.plugin.settings.showPointers).onChange(async (value) => {
           await this.plugin.setShowPointers(value);
+        }),
+      );
+
+    new Setting(containerEl)
+      .setName('Live sync for Excalidraw drawings')
+      .setDesc(
+        'Show changes to an open drawing in the other vaults as they are made, with collaborators’ pointers and selections drawn on it. ' +
+          'Turn this off if live drawing misbehaves: drawings are then merged when they are saved instead, a few seconds behind, ' +
+          'and edits made in two places at once are still kept.',
+      )
+      .addToggle((toggle) =>
+        toggle.setValue(this.plugin.settings.liveExcalidraw).onChange(async (value) => {
+          await this.plugin.setLiveExcalidraw(value);
+        }),
+      );
+
+    new Setting(containerEl)
+      .setName('Live sync for Kanban boards')
+      .setDesc(
+        'Save an open board moments after each change, so a moved card shows in the other vaults within a second, and show which card each collaborator is on. ' +
+          'Turn this off if a board misbehaves: it then saves on Obsidian’s usual two-second pace and is merged when it is saved. ' +
+          'Who is on the board still shows in its header.',
+      )
+      .addToggle((toggle) =>
+        toggle.setValue(this.plugin.settings.liveKanban).onChange(async (value) => {
+          await this.plugin.setLiveKanban(value);
         }),
       );
 

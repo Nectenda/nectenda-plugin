@@ -167,6 +167,26 @@ export interface NectendaSettings {
    */
   showPointers: boolean;
   /**
+   * Live sync for drawings of the Excalidraw plugin (NEC-41): an open drawing
+   * bound to its document, so changes show in the other vault as they are
+   * made, with collaborators' pointers and selections drawn on it.
+   *
+   * Off, a drawing is merged when it is saved, by the same element merge, with
+   * every safeguard (SAFE-A27, SAFE-A19, SAFE-A26): only the binding and the
+   * drawing of collaborators stop. It is the way back if the binding misbehaves
+   * with an Excalidraw release it was not read against.
+   */
+  liveExcalidraw: boolean;
+  /**
+   * Live sync for boards of the Kanban plugin (NEC-25, NEC-200): a board saved
+   * moments after each change rather than on Obsidian's two-second pace, and
+   * collaborators' card and list focus drawn on it.
+   *
+   * Off, a board merges as text when it is saved, keeps its guards (SAFE-A19,
+   * SAFE-A26) and still shows who is on it in the header.
+   */
+  liveKanban: boolean;
+  /**
    * Mark each note in a shared folder with its sync status in the file
    * explorer, and each shared entry of a shared base with the same mark
    * (bases-shared-marks.ts). On by default: "is this note syncing?" had no
@@ -279,6 +299,8 @@ export const DEFAULT_SETTINGS: NectendaSettings = {
   diagnosticLog: false,
   sharePointer: true,
   showPointers: true,
+  liveExcalidraw: true,
+  liveKanban: true,
   fileStatusIcons: true,
   errorReports: true,
   errorReportsAcknowledgedAt: null,

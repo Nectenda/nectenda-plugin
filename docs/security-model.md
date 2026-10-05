@@ -29,11 +29,11 @@ more than it should about where to push on a system nobody has audited yet.
 | Note and folder *paths* | **No** — document ids are HMACs of the path |
 | Attachment content | **No** — sealed in a chunked AEAD envelope |
 | Attachment filenames | **No** — they live inside the encrypted listing |
-| Structured file content and names | **No** — a file merged key by key (a canvas, a base) is a document like a note: the same ciphertext, an HMAC id, and its name inside the encrypted listing |
+| Structured file content and names | **No** — a file merged key by key (a canvas, a base, an Excalidraw drawing) is a document like a note: the same ciphertext, an HMAC id, and its name inside the encrypted listing |
 | Your passphrase | **No** — on the hosted service, never sent in any form; a self-hosted server receives an independent derivation that cannot yield the key |
 | Your private key | **No** — stored wrapped, unwrappable only by your password |
 | Folder display names | **No** — sealed under the folder's content key |
-| Who is where in a note (presence) | **No** — names, colours, caret positions, which view and entry of a base someone is on, and which property they are editing are sealed; that someone has a note open, and how often their presence changes, is visible |
+| Who is where in a note (presence) | **No** — names, colours, caret positions, which view and entry of a base someone is on, which property they are editing, and which card or list of a board they are on are sealed; that someone has a note open, and how often their presence changes, is visible |
 | Who shares a folder with whom | **Yes** |
 | Sizes, timing, device and account records | **Yes** |
 
@@ -206,7 +206,13 @@ marketing.
   table cell you have selected, or the card under your pointer — as that
   note's path within the shared folder and, in a table, the property's name.
   In an open note it carries the property you have focused in the
-  Properties panel, by name. All of it is sealed, and in the same 1024-byte
+  Properties panel, by name. In another plugin's view of a note — a board of
+  the Kanban plugin — it carries that view's type and the card or list you are
+  on, as its lane, its place in the lane and an eight-digit hash of its text
+  (a list's title, for a list). On an open Excalidraw drawing it carries
+  where your pointer is in the drawing, whether you hold the laser, what you
+  have in view, and the ids of the shapes you have selected — never the shapes
+  themselves. All of it is sealed, and in the same 1024-byte
   bucket, so the length shows neither which entry nor whether you are in the
   panel, unless a path runs to some 600 characters. What the server does see is that a device has the
   note open (it knows that from the subscription anyway), and when and how

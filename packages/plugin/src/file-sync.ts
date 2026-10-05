@@ -125,6 +125,10 @@ export class FileSync {
    */
   classify(sharedFolderId: string, relativePath: string): FileKind {
     const conn = this.connections.get(sharedFolderId);
+    // Except for a Markdown-named format taken over from text (SAFE-A28): its
+    // text entry is kept for clients that still read it, and the structured
+    // one is how this build syncs it.
+    if (conn && this.takenFromText(conn, relativePath)) return 'structured';
     // Listed as text wins over listed as structured, as `placeStructured`
     // decides: two roots claiming a path must not put two writers on it, and
     // the watcher must reach the same verdict or it reconnects what was refused.
@@ -148,13 +152,36 @@ export class FileSync {
     this.folderReadyListeners.push(listener);
   }
 
+  /**
+   * Connects in flight, by folder: the generation each was started with.
+   *
+   * A connect awaits the listing's id and then IndexedDB before it records
+   * itself in `connections`. Without this, a second connect in that window — a
+   * reconnect after the sign-in refresh, a tenth of a second after
+   * `onLayoutReady` — built a second listing; the provider kept the first
+   * subscription and the second replaced it here, so every file added in that
+   * vault afterwards was listed in a document the server never saw (NEC-203).
+   * A disconnect in the window found nothing to disconnect, and the connect
+   * landed after it. Now a second connect returns, and a disconnect cancels:
+   * the connect sees its generation gone when it resumes, and tears down.
+   */
+  private connecting = new Map<string, number>();
+  private connectGeneration = 0;
+
   connectFolder(sharedFolderId: string, localPath: string): void {
-    if (this.connections.has(sharedFolderId)) return;
-    void this.doConnectFolder(sharedFolderId, localPath);
+    if (this.connections.has(sharedFolderId) || this.connecting.has(sharedFolderId)) return;
+    const generation = ++this.connectGeneration;
+    this.connecting.set(sharedFolderId, generation);
+    void this.doConnectFolder(sharedFolderId, localPath, generation);
   }
 
-  private async doConnectFolder(sharedFolderId: string, localPath: string): Promise<void> {
-    if (this.connections.has(sharedFolderId)) return;
+  /** Whether the connect started as `generation` is still wanted. */
+  private stillConnecting(sharedFolderId: string, generation: number): boolean {
+    return this.connecting.get(sharedFolderId) === generation;
+  }
+
+  private async doConnectFolder(sharedFolderId: string, localPath: string, generation: number): Promise<void> {
+    if (this.connections.has(sharedFolderId) || !this.stillConnecting(sharedFolderId, generation)) return;
 
     // Refuse the whole folder when its keys are missing, rather than connecting
     // part of it.
@@ -164,6 +191,7 @@ export class FileSync {
     // that will happily trash local files on a listing it misread. Nothing local
     // may be touched for a folder this client cannot read.
     if (!this.deps.hasKeys(sharedFolderId)) {
+      this.connecting.delete(sharedFolderId);
       log.warn('Folder has no encryption keys — not connecting it', { sharedFolderId });
       new Notice('Nectenda: no encryption key for a shared folder. Ask an owner to re-share it.');
       return;
@@ -173,6 +201,7 @@ export class FileSync {
     // leaving `__meta__` in clear as a marker telling the server which blob is
     // the folder index.
     const docName = await this.deps.docIndex.ref(sharedFolderId, META_DOC_SUFFIX);
+    if (!this.stillConnecting(sharedFolderId, generation)) return;
     const ydoc = new Y.Doc();
     const ymap = ydoc.getMap<FileEntry>('files');
     const bmap = ydoc.getMap<BlobEntry>(BLOBS_MAP_KEY);
@@ -181,6 +210,16 @@ export class FileSync {
     const idbProvider = new IndexeddbPersistence(idbStoreName(this.deps.vaultKey(), docName), ydoc);
 
     const startProvider = () => {
+      // Let go of, or connected again, while IndexedDB loaded: this one is not
+      // wanted, and must not subscribe or record itself.
+      if (!this.stillConnecting(sharedFolderId, generation)) {
+        void idbProvider.destroy().catch((e: unknown) => {
+          log.warn('IndexedDB teardown failed', { error: String(e) });
+        });
+        ydoc.destroy();
+        return;
+      }
+      this.connecting.delete(sharedFolderId);
       // Subscribe meta doc via multiplexed provider. `startProvider` runs after
       // IndexedDB has loaded, which is what makes the checkpoint's state-vector
       // check meaningful.
@@ -297,6 +336,8 @@ export class FileSync {
     // coming back when some unrelated connection opened would be a folder
     // syncing that nobody asked for.
     this.unplaced.delete(sharedFolderId);
+    // A connect still in flight is cancelled: it tears down when it resumes.
+    this.connecting.delete(sharedFolderId);
     const conn = this.connections.get(sharedFolderId);
     if (!conn) return;
 
@@ -312,7 +353,7 @@ export class FileSync {
   }
 
   disconnectAll(): void {
-    for (const folderId of Array.from(this.connections.keys())) {
+    for (const folderId of new Set([...this.connections.keys(), ...this.connecting.keys()])) {
       this.disconnectFolder(folderId);
     }
   }
@@ -356,11 +397,28 @@ export class FileSync {
         return;
       }
 
+      // A newer client moved both entries of a drawing in one transaction: the
+      // structured listing's own handler renames it. Doing it here as well
+      // would rename one file twice.
+      if (this.namedFromText(newRelPath) && conn.smap.has(newRelPath) && !conn.smap.has(oldRelPath)) return;
+
       const oldExists = this.vault.isFile(oldLocalPath);
       if (oldExists) {
         this.vault.rename(oldLocalPath, newLocalPath).catch((err: unknown) => {
           log.error(`Failed to rename ${oldLocalPath} → ${newLocalPath}:`, err);
         });
+
+        // A drawing an older client renamed through its text entry: the
+        // structured entry follows, and structured sync with it (SAFE-A28).
+        const entry = this.takenFromText(conn, oldRelPath) ? conn.smap.get(oldRelPath) : undefined;
+        if (entry) {
+          conn.ydoc.transact(() => {
+            conn.smap.delete(oldRelPath);
+            conn.smap.set(newRelPath, entry);
+          }, LOCAL_ORIGIN);
+          this.structuredSync?.moveFile(conn.sharedFolderId, conn.localPath, oldRelPath, newRelPath, entry.format, { fill: false });
+          return;
+        }
 
         // Reconnect background sync under new name
         this.contentSync?.moveFile(conn.sharedFolderId, conn.localPath, oldRelPath, newRelPath);
@@ -387,6 +445,11 @@ export class FileSync {
     // Handle remaining deletions
     for (const key of deleted) {
       log.debug('Meta dropped a file', { key });
+      // A drawing an older client deleted through its text entry: unlisted as
+      // structured too, or the next connect would place it again (SAFE-A28).
+      if (this.takenFromText(conn, key)) {
+        conn.ydoc.transact(() => conn.smap.delete(key), LOCAL_ORIGIN);
+      }
       this.sequence(conn.sharedFolderId, key, () =>
         this.completeRemoteDeletion(conn.sharedFolderId, conn.localPath, key),
       );
@@ -514,6 +577,58 @@ export class FileSync {
     return [...conn.bmap.entries()];
   }
 
+  /** Whether the codec named by this path's extension takes its files over from text. */
+  private namedFromText(relativePath: string): boolean {
+    return codecForPath(relativePath, this.formats)?.fromText === true;
+  }
+
+  /**
+   * Whether a path is listed as structured in a format that took it over from
+   * text — so a text entry beside it is the older clients', not a second
+   * writer (SAFE-A28).
+   */
+  private takenFromText(conn: MetaConnection, relativePath: string): boolean {
+    const entry = conn.smap.get(relativePath);
+    if (!entry) return false;
+    return codecForFormat(entry.format, this.formats)?.fromText === true;
+  }
+
+  /**
+   * Move a file listed as text onto the structured format that now owns its
+   * name (SAFE-A28, step one): list it as structured as well.
+   *
+   * The text entry stays. A client that predates the format still reads the
+   * file as a note through it, and removing the entry would read to that client
+   * as a deletion and trash the file there. Both entries move together on a
+   * rename and go together on a delete (`renameStructuredEntry`,
+   * `removeStructuredEntry`).
+   *
+   * Nothing is copied: the structured document is the same document the text
+   * one was — its name is derived from the path — and is filled from the note's
+   * text the first time it is followed (StructuredSync.seedIfEmpty).
+   */
+  private takeOverFromText(conn: MetaConnection, keys: string[]): string[] {
+    const taken: Array<[string, StructuredEntry]> = [];
+    for (const key of keys) {
+      if (conn.smap.has(key) || !conn.ymap.has(key) || !this.namedFromText(key)) continue;
+      const localFilePath = joinWithin(conn.localPath, key);
+      if (!localFilePath) continue;
+      const codec = codecForPath(key, this.formats);
+      if (!codec) continue;
+      const listed = conn.ymap.get(key);
+      const stat = this.vault.stat(localFilePath) ?? { size: listed?.size ?? 0, mtime: listed?.mtime ?? Date.now() };
+      taken.push([key, { ...stat, format: codec.format }]);
+    }
+    if (taken.length === 0) return [];
+    conn.ydoc.transact(() => {
+      for (const [key, entry] of taken) conn.smap.set(key, entry);
+    }, LOCAL_ORIGIN);
+    log.info('Took Markdown-named structured files over from text', {
+      sharedFolderId: conn.sharedFolderId, count: taken.length,
+    });
+    return taken.map(([key]) => key);
+  }
+
   /** Whether the folder lists this path as structured. */
   isStructuredListed(sharedFolderId: string, relativePath: string): boolean {
     return this.connections.get(sharedFolderId)?.smap.has(relativePath) ?? false;
@@ -534,7 +649,12 @@ export class FileSync {
   removeStructuredEntry(sharedFolderId: string, relativePath: string): boolean {
     const conn = this.connections.get(sharedFolderId);
     if (!conn?.smap.has(relativePath)) return false;
-    conn.ydoc.transact(() => conn.smap.delete(relativePath), LOCAL_ORIGIN);
+    const textToo = this.takenFromText(conn, relativePath) && conn.ymap.has(relativePath);
+    conn.ydoc.transact(() => {
+      conn.smap.delete(relativePath);
+      // The older clients' entry goes with it, or they keep the file (SAFE-A28).
+      if (textToo) conn.ymap.delete(relativePath);
+    }, LOCAL_ORIGIN);
     return true;
   }
 
@@ -543,9 +663,15 @@ export class FileSync {
     const conn = this.connections.get(sharedFolderId);
     const entry = conn?.smap.get(from);
     if (!conn || !entry) return false;
+    const textEntry = this.takenFromText(conn, from) ? conn.ymap.get(from) : undefined;
     conn.ydoc.transact(() => {
       conn.smap.delete(from);
       conn.smap.set(to, entry);
+      // The older clients' entry moves with it, so they see the same rename.
+      if (textEntry) {
+        conn.ymap.delete(from);
+        conn.ymap.set(to, textEntry);
+      }
     }, LOCAL_ORIGIN);
     return true;
   }
@@ -621,8 +747,10 @@ export class FileSync {
     const structuredSync = this.structuredSync;
     if (!structuredSync) return;
     // Two roots claiming one path would put two writers on one file. The text
-    // listing is the older and wins; this one is refused, out loud.
-    if (conn.ymap.has(key)) {
+    // listing is the older and wins; this one is refused, out loud — unless the
+    // format took the path over from text (SAFE-A28), when the text entry is
+    // the older clients' and text sync no longer follows the file here.
+    if (conn.ymap.has(key) && !this.takenFromText(conn, key)) {
       log.error('Path listed as both text and structured; ignoring the structured entry', {
         relativePath: key,
       });
@@ -733,7 +861,16 @@ export class FileSync {
   }
 
   private applyAdditions(conn: MetaConnection, added: string[]): void {
+    // Listed as text by a client that predates the format that owns the name
+    // now — a drawing an older member made: taken over and placed as
+    // structured, never followed as text (SAFE-A28).
+    const fromText = added.filter((key) => this.namedFromText(key));
+    if (fromText.length > 0) {
+      this.takeOverFromText(conn, fromText);
+      for (const key of fromText) if (this.takenFromText(conn, key)) this.placeStructured(conn, key);
+    }
     for (const key of added) {
+      if (this.namedFromText(key)) continue;
       const localFilePath = joinWithin(conn.localPath, key);
       // A name from the listing belongs to whoever created the file, not to
       // this vault. Refused rather than clamped, and said out loud: a file
@@ -943,15 +1080,19 @@ export class FileSync {
       if (stat) localFiles.set(path.slice(conn.localPath.length + 1), stat);
     }
 
-    // Push local files to Y.Map
+    // Push local files to Y.Map. Not a Markdown-named structured file — an
+    // Excalidraw drawing — which the structured sweep below lists instead.
     conn.ydoc.transact(() => {
       for (const [relPath, stat] of localFiles) {
+        if (this.namedFromText(relPath)) continue;
         if (!conn.ymap.has(relPath)) conn.ymap.set(relPath, stat);
       }
     }, LOCAL_ORIGIN);
 
     // Create local files that exist in Y.Map but not locally
     for (const [relPath] of conn.ymap.entries()) {
+      // Placed by the structured sweep, as structured (SAFE-A28).
+      if (this.namedFromText(relPath)) continue;
       const localFilePath = joinWithin(conn.localPath, relPath);
       if (!localFilePath) {
         log.warn('Refused a shared file whose name leaves the folder', { folder: conn.sharedFolderId });
@@ -988,6 +1129,11 @@ export class FileSync {
     // not recorded here: the file on disk may differ from it, and recording it
     // would mark that version kept without anyone having compared the bytes.
     // The sweep at the end compares, and records it once it has.
+    // Files listed as text whose name a format now owns that takes them over
+    // (SAFE-A28): listed as structured beside the text entry, whether this vault
+    // has the file yet or not. Placed with everything else below.
+    this.takeOverFromText(conn, [...conn.ymap.keys()]);
+
     const enrolled: Array<[string, StructuredEntry]> = [];
     for (const path of this.vault.listFiles(conn.localPath)) {
       const relPath = path.slice(conn.localPath.length + 1);

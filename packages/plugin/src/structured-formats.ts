@@ -1,6 +1,7 @@
 import type * as Y from 'yjs';
 import { basesCodec } from './bases-codec';
 import { canvasCodec } from './canvas-codec';
+import { excalidrawCodec } from './excalidraw-codec';
 
 /**
  * How one file format maps between its text on disk and a Y.Doc.
@@ -107,6 +108,48 @@ export interface StructuredCodec {
    * YAML comments, say — so that the file must be backed up first (SAFE-A13).
    */
   dropsOnRewrite?(text: string): boolean;
+  /**
+   * The part of a file's `value` that is safe to merge even when the file and
+   * the document both changed it while this vault was not syncing (SAFE-A30):
+   * a part whose merge refuses what is older and keeps what loses, so a
+   * record that lags cannot make the file's catch-up revert anything. The
+   * rest is taken from `base`, so it does not change, and stays in the backup
+   * the clash took. Absent: nothing is, and the whole file stays in the
+   * backup.
+   */
+  mergeOnClash?(value: unknown, base: unknown): unknown;
+  /**
+   * Whether a file's `value` is plainly another file's content, saved under
+   * this path — a view reused for another file saving before it loaded the
+   * new one. Such a save is kept in .nectenda-backups and never read in.
+   * Absent: nothing is.
+   */
+  foreign?(value: unknown, ydoc: Y.Doc): boolean;
+  /**
+   * A format whose files are Markdown notes (`.excalidraw.md`), and so were
+   * synced as text by earlier versions. Such a file listed as text is moved
+   * onto this codec rather than left as text, and the text entry is kept for
+   * the clients that still read it (SAFE-A28).
+   */
+  readonly fromText?: boolean;
+  /**
+   * Settle what concurrent edits left behind, after the document changed.
+   * Called by StructuredSync, inside a transaction of its own, after a remote
+   * update, after the first sync and after a disk read-in. `isOurs(root, key)` says
+   * whether the entry under `key` in the codec's revision root was written by
+   * this vault (`root` names the map). For a codec that resolves a race itself rather than leaving
+   * it to Yjs (excalidraw-model.ts): its chance to keep what lost, exactly once
+   * (SAFE-A27). Returns a report for the log.
+   */
+  settle?(ydoc: Y.Doc, isOurs: (root: string, key: string) => boolean): SettleOutcome;
+}
+
+/** What a codec's `settle` did, for StructuredSync to log and tell the user. */
+export interface SettleOutcome {
+  /** This vault's versions that lost writing, kept in the file. */
+  kept: Array<{ id: string; why: string }>;
+  /** This vault's versions that lost nothing anyone wrote, converged. */
+  converged: Array<{ id: string; why: string; lost?: unknown }>;
 }
 
 /**
@@ -121,17 +164,27 @@ export interface StructuredCodec {
 export const STRUCTURED_FORMATS: Readonly<Record<string, StructuredCodec>> = {
   '.canvas': canvasCodec,
   '.base': basesCodec,
+  '.excalidraw.md': excalidrawCodec,
 };
 
-/** The codec for a file extension, or null. */
+/**
+ * The codec for a file's extension, or null.
+ *
+ * The longest registered extension wins, so `Drawing.excalidraw.md` is an
+ * Excalidraw drawing and not a note: a format that is a kind of Markdown is
+ * named by a compound extension, and the plain last one would read it as text.
+ */
 export function codecForPath(
   path: string,
   formats: Readonly<Record<string, StructuredCodec>> = STRUCTURED_FORMATS,
 ): StructuredCodec | null {
-  const slash = path.lastIndexOf('/');
-  const dot = path.lastIndexOf('.');
-  if (dot <= slash + 1) return null;
-  return formats[path.slice(dot).toLowerCase()] ?? null;
+  const name = path.slice(path.lastIndexOf('/') + 1).toLowerCase();
+  let best: string | null = null;
+  for (const ext of Object.keys(formats)) {
+    // A name that is only the extension (".canvas") is a dotfile, not a canvas.
+    if (name.length > ext.length && name.endsWith(ext) && (best === null || ext.length > best.length)) best = ext;
+  }
+  return best === null ? null : formats[best];
 }
 
 /** The codec for a format name, as a listing entry records it, or null. */

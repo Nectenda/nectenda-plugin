@@ -120,25 +120,32 @@ export class VaultWatcher {
 
     // Register inside onLayoutReady to avoid vault-load events
     this.deps.app.workspace.onLayoutReady(() => {
-      this.deps.registerEvent(
-        this.deps.app.vault.on('create', (file) => this.handleCreate(file.path))
-      );
-      this.deps.registerEvent(
-        this.deps.app.vault.on('delete', (file) => this.handleDelete(file.path))
-      );
-      this.deps.registerEvent(
-        this.deps.app.vault.on('rename', (file, oldPath) => this.handleRename(file.path, oldPath))
-      );
-      this.deps.registerEvent(
-        this.deps.app.vault.on('modify', (file) => this.handleModify(file.path))
-      );
+      // Stopped before the layout was ready, or registered already.
+      if (!this.started || this.refs.length > 0) return;
+      const vault = this.deps.app.vault;
+      this.refs = [
+        vault.on('create', (file) => this.handleCreate(file.path)),
+        vault.on('delete', (file) => this.handleDelete(file.path)),
+        vault.on('rename', (file, oldPath) => this.handleRename(file.path, oldPath)),
+        vault.on('modify', (file) => this.handleModify(file.path)),
+      ];
+      // Still tied to the plugin's lifetime, so unloading releases them too.
+      for (const ref of this.refs) this.deps.registerEvent(ref);
     });
   }
 
+  /**
+   * Release the listeners. Every start of sync makes a new watcher, and these
+   * used to be released only when the plugin unloaded, so after N restarts
+   * every vault event ran N dead handlers, each logging (NEC-208).
+   */
   stop(): void {
     this.started = false;
-    // Event refs are cleaned up by plugin.registerEvent on unload
+    for (const ref of this.refs) this.deps.app.vault.offref(ref);
+    this.refs = [];
   }
+
+  private refs: EventRef[] = [];
 
   /**
    * Handlers take paths rather than Obsidian files so they can be driven
