@@ -85,6 +85,7 @@ import { canvasCardBinding } from './canvas-card-binding';
 import { PendingEdits } from './pending-edits';
 import { EditorWiring } from './editor-wiring';
 import { CanvasPresence } from './canvas-presence';
+import { deleteRecordStore } from './excalidraw-delete-store';
 import { DeleteWitness, ExcalidrawLiveManager, sharedDrawingViews, type ExcalidrawLib, type ExcalidrawLiveBinding, type ExcalidrawViewLike } from './excalidraw-live';
 import { ExcalidrawPresence } from './excalidraw-presence';
 import { setKeptBy } from './excalidraw-codec';
@@ -372,9 +373,10 @@ export default class NectendaPlugin extends Plugin {
   /**
    * What open drawings deleted, for the saves that leave it out. For the
    * plugin's lifetime, not a sync session's: a delete made while sync was off
-   * is read in when it starts again.
+   * is read in when it starts again. And kept on this device, so one made
+   * before a quit is read in after it (NEC-211).
    */
-  private readonly deleteWitness = new DeleteWitness(() => this.openSharedDrawings());
+  private readonly deleteWitness = new DeleteWitness(() => this.openSharedDrawings(), deleteRecordStore(() => this.vaultKey));
 
   /** Open drawings in shared folders, skipping tabs not yet loaded (see sharedDrawingViews). */
   private openSharedDrawings(): ExcalidrawViewLike[] {
@@ -583,9 +585,27 @@ export default class NectendaPlugin extends Plugin {
       openSharedWithYou: () => this.openSettingsTab(),
       openSettings: () => this.openSettingsTab(),
       addRibbon: (onClick) => this.addRibbonIcon(HEADER_ICON, 'Nectenda', onClick),
+      // Obsidian keeps each ribbon button in a list and redraws the ribbon
+      // from it, so one only detached comes back on the next redraw (NEC-220).
+      // removeRibbonAction is what Obsidian itself calls when a plugin unloads,
+      // with the id addRibbonIcon gave the button; it is not in the public API,
+      // hence the guard.
+      removeRibbon: (el) => {
+        const ribbon = (this.app.workspace as unknown as {
+          leftRibbon?: { removeRibbonAction?(id: string): void };
+        }).leftRibbon;
+        ribbon?.removeRibbonAction?.(`${this.manifest.id}:Nectenda`);
+        el.detach();
+      },
       addStatusBar: () => this.addStatusBarItem(),
     });
     this.headerStatus.apply();
+    // Read back what drawings deleted before the last quit, now, so it is in
+    // hand before any drawing connects (StructuredSync awaits it, `ready`).
+    void this.deleteWitness.restore();
+    // And move it with a drawing renamed, sync on or off.
+    this.registerEvent(this.app.vault.on('rename', (file, oldPath) => this.deleteWitness.renamed(oldPath, file.path)));
+    this.registerEvent(this.app.vault.on('delete', (file) => this.deleteWitness.deleted(file.path)));
     this.registerEvent(this.app.workspace.on('layout-change', () => {
       this.refreshStatusUi();
       this.canvasLive?.refresh();
@@ -3010,8 +3030,22 @@ export default class NectendaPlugin extends Plugin {
         });
       },
       // Live or not, a drawing's deletes are in no file: see DeleteWitness.
-      withViewDeletes: (path, saved, current) => this.deleteWitness.withViewDeletes(path, saved, current),
+      withViewDeletes: (path, saved, current, settled) => this.deleteWitness.withViewDeletes(path, saved, current, settled),
+      ready: () => this.deleteWitness.restore(),
+      // And which versions it showed, so a save is read in only against those.
+      verifyBase: (path, saved, base, fromRecord) => this.deleteWitness.verifiedBase(path, saved, base, fromRecord),
+      // And what it showed as it closed, for the save it makes on closing (NEC-235).
+      restBase: (path, saved, base) => this.deleteWitness.restBase(path, saved, base),
+      // And whether it drew our last write, which its `data` does not say.
+      loadedBase: (path, written, prior) => this.deleteWitness.loadedBase(path, written, prior),
+      // And make one that is ahead of its document save, whatever it says.
+      saveViewsAhead: (path, current) => this.deleteWitness.saveViewsAhead(path, current),
+      // And read in what one held that no save carried, past the view (NEC-236).
+      withRecordedAhead: (path, current, ydoc) => this.deleteWitness.withRecordedAhead(path, current, ydoc),
+      holdsRecordedAhead: (path, current, ydoc) => this.deleteWitness.holdsRecordedAhead(path, current, ydoc),
     }, this.provider, vaultAdapter);
+    // A view that leaves a drawing holding such an edit has it written at once.
+    this.deleteWitness.onLeft = (path) => this.structuredSync?.writeIfViewsAhead(path);
 
     // An open canvas of a shared file is bound live (canvas-live.ts): the
     // view writes the file, and changes travel both ways as they happen. The
@@ -3311,7 +3345,7 @@ export default class NectendaPlugin extends Plugin {
     this.textViewPresence = null;
     this.quickSave?.dispose();
     this.quickSave = null;
-    this.structuredSync?.disconnectAll();
+    this.structuredSync?.stop();
     this.structuredSync = null;
     this.textViewGuard?.dispose();
     this.textViewGuard = null;

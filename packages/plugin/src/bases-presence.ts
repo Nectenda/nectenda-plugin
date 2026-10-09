@@ -21,13 +21,13 @@ import type { EntryStatus } from './file-status-indicator';
  * is there.
  *
  * Finer than the view, `focus` says which entry someone is on, and in a table
- * which property: the table's active cell, or the card or list item under the
- * pointer, since neither of those layouts has a selection and a click opens
- * the note. It is drawn on the same entry in everyone else's layout, if that
- * layout draws it. Finding either needs the Bases view's internals
- * (bases-internals.ts), checked before use; a base that fails the check keeps
- * everything above and says so once. Kanban, map and a plugin's layouts send
- * and draw no focus.
+ * which property: the table's active cell, or the card, list item or kanban
+ * card under the pointer, since none of those layouts has a selection and a
+ * click opens the note. It is drawn on the same entry in everyone else's
+ * layout, if that layout draws it. Finding either needs the Bases view's
+ * internals (bases-internals.ts), checked before use; a base that fails the
+ * check keeps everything above and says so once. Map and a plugin's layouts
+ * send and draw no focus.
  *
  * The view itself is public API: the leaf's own state names the selected view
  * (`viewName`), and the view's `data` is the file it shows, which names that
@@ -147,7 +147,7 @@ export class BasesPresence {
   private held = new Map<string, Held>();
   /** Set for the session once the internals are found not as read: view-level presence only. */
   private broken = false;
-  /** The card or list item under this device's pointer, in the layout it was found in. */
+  /** The card, list item or kanban card under this device's pointer, in the layout it was found in. */
   private hover: { layout: object; path: string } | null = null;
   /** The listeners on the active base's layout, which say when its focus may have moved. */
   private listening: { host: object; stop: () => void } | null = null;
@@ -355,8 +355,9 @@ export class BasesPresence {
 
   /**
    * Listen on the active base's leaf for what moves its focus: the table's
-   * active cell follows clicks, keys and focus; a card or list item follows
-   * the pointer. A scroll recycles rows, so it redraws.
+   * active cell follows clicks, keys and focus; a card, list item or kanban
+   * card follows the pointer. A scroll recycles rows, so it redraws — a
+   * kanban's lanes scroll on their own, which a capturing listener still hears.
    *
    * On the leaf, not the layout: picking another view builds a new layout,
    * and listeners on the old one missed the pointer until the next refresh

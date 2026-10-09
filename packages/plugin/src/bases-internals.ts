@@ -1,7 +1,7 @@
 /**
  * The parts of Obsidian's Bases view that are not public API, as focus
  * presence (WIRE-096) uses them: which entry someone is on, and which element
- * draws an entry, in the table, cards and list layouts.
+ * draws an entry, in the table, cards and list layouts, and Obsidian 1.14's kanban.
  *
  * The public API describes a `BasesView` only to the plugin that registers it.
  * Nothing public reaches the built-in layouts behind a `bases` leaf, so
@@ -23,13 +23,23 @@
  * `activeCell` and `rows`; `o8` a table row and `a8` a cell (3147666); `A5` a
  * card (3093198) in the cards view's `items`; `z5` a list group (3100584) with
  * `rows`, and `q5` a list row (3101700).
+ *
+ * The kanban was read against 1.14.4 (`KANBAN_READ_AGAINST`): `m7` the layout
+ * (3157482) with `columns`; `y7` a column with `items`, only the cards drawn in
+ * its viewport, since `recycleItems` moves the rest to a pool the whole board
+ * shares; `b7` a card with `entry` and `el`; `w7` a card's property line, which
+ * carries `data-property` as a card's does. A kanban has no selection — a click
+ * opens the note — so, as in cards, its focus is the card under the pointer.
  */
 
 /** The Obsidian the members below were read against. */
 export const OBSIDIAN_BASES_INTERNALS_READ_AGAINST = '1.13.7';
 
+/** The Obsidian the kanban's members were read against: 1.13.7 has no kanban. */
+export const KANBAN_READ_AGAINST = '1.14.4';
+
 /** The layouts whose entries can be found and drawn. Any other draws nothing finer than the view. */
-export type FocusLayout = 'table' | 'cards' | 'list';
+export type FocusLayout = 'table' | 'cards' | 'list' | 'kanban';
 
 /** An entry as a layout holds it: the public `BasesEntry`, of which only the file is read. */
 interface EntryLike { file: { path: string } }
@@ -52,6 +62,7 @@ export const BASES_CONTRACT = {
   table: ['activeCell', 'rows', 'row.entry', 'row.el', 'row.cells', 'cell.prop', 'cell.el'],
   cards: ['items', 'item.entry', 'item.el'],
   list: ['groups', 'group.rows', 'row.entry', 'row.el'],
+  kanban: ['columns', 'column.items', 'item.entry', 'item.el'],
 } as const;
 
 const isObj = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null;
@@ -60,7 +71,7 @@ const isEl = (v: unknown): v is HTMLElement =>
 const isEntry = (v: unknown): v is EntryLike =>
   isObj(v) && isObj(v.file) && typeof (v.file as { path?: unknown }).path === 'string';
 
-const KNOWN: readonly string[] = ['table', 'cards', 'list'];
+const KNOWN: readonly string[] = ['table', 'cards', 'list', 'kanban'];
 
 /** The layout a bases leaf is showing, or null when it has none this can read. */
 export function layoutView(leafView: unknown): Record<string, unknown> | null {
@@ -69,7 +80,7 @@ export function layoutView(leafView: unknown): Record<string, unknown> | null {
   return isObj(view) ? view : null;
 }
 
-/** Which drawable layout this is, or null for one this does not know (kanban, map, a plugin's). */
+/** Which drawable layout this is, or null for one this does not know (map, a plugin's). */
 export function layoutOf(view: Record<string, unknown>): FocusLayout | null {
   return typeof view.type === 'string' && KNOWN.includes(view.type) ? (view.type as FocusLayout) : null;
 }
@@ -103,6 +114,17 @@ export function checkBasesShape(leafView: unknown): string | null {
     if (!Array.isArray(view.items)) return 'cards.items';
     return checkRow(view.items[0], 'cards', false);
   }
+  if (layout === 'kanban') {
+    if (!Array.isArray(view.columns)) return 'kanban.columns';
+    // Every column, not the first: a lane with no cards is common, and would
+    // otherwise leave the sample empty on a board whose other lanes are full.
+    let sample: unknown;
+    for (const c of view.columns as unknown[]) {
+      if (!isObj(c) || !Array.isArray(c.items)) return 'kanban.column.items';
+      sample ??= (c.items as unknown[])[0];
+    }
+    return checkRow(sample, 'kanban', false);
+  }
   if (!Array.isArray(view.groups)) return 'list.groups';
   const g: unknown = (view.groups as unknown[])[0];
   if (g === undefined) return null;
@@ -131,6 +153,7 @@ export function placedEntries(view: Record<string, unknown>): PlacedEntry[] {
     layout === 'table' ? (view.rows as unknown[])
     : layout === 'cards' ? (view.items as unknown[])
     : layout === 'list' ? (view.groups as { rows: unknown[] }[]).flatMap((g) => g.rows)
+    : layout === 'kanban' ? (view.columns as { items: unknown[] }[]).flatMap((c) => c.items)
     : [];
   const out: PlacedEntry[] = [];
   for (const r of rows) {
@@ -161,11 +184,25 @@ export function tableActive(view: Record<string, unknown>): { path: string; prop
   return { path: entry.file.path, prop: isObj(cell) && typeof cell.prop === 'string' ? cell.prop : null };
 }
 
+/** The class of the element that draws one entry, in each layout whose focus follows the pointer. */
+const POINTER_ITEM: Partial<Record<FocusLayout, string>> = {
+  cards: '.bases-cards-item',
+  list: '.bases-list-item',
+  kanban: '.bases-kanban-card',
+};
+
+/** The class of a card's property line, which carries `data-property`. */
+const PROPERTY_LINE: Partial<Record<FocusLayout, string>> = {
+  cards: '.bases-cards-property',
+  kanban: '.bases-kanban-card-property',
+};
+
 /** The entry drawn by the card or list item an element is inside, for the pointer. */
 export function entryAtElement(view: Record<string, unknown>, target: Element | null): string | null {
   const layout = layoutOf(view);
-  if (layout !== 'cards' && layout !== 'list' || !target) return null;
-  const item = target.closest(layout === 'cards' ? '.bases-cards-item' : '.bases-list-item');
+  const selector = layout ? POINTER_ITEM[layout] : undefined;
+  if (!selector || !target) return null;
+  const item = target.closest(selector);
   if (!item) return null;
   return placedEntries(view).find((p) => p.el === item)?.path ?? null;
 }
@@ -197,8 +234,10 @@ export function focusElement(view: Record<string, unknown>, path: string, proper
   if (property === undefined) return placed.el;
   const cell = placed.cells?.find((c) => wireProperty(c.prop) === property);
   if (cell) return cell.el;
-  if (layoutOf(view) === 'cards') {
-    for (const line of Array.from(placed.el.querySelectorAll<HTMLElement>('.bases-cards-property'))) {
+  const layout = layoutOf(view);
+  const lines = layout ? PROPERTY_LINE[layout] : undefined;
+  if (lines) {
+    for (const line of Array.from(placed.el.querySelectorAll<HTMLElement>(lines))) {
       if (wireProperty(line.dataset.property ?? null) === property) return line;
     }
   }

@@ -236,12 +236,14 @@ export class CanvasLiveBinding implements BoundView {
       && !(isEmpty(shown) && diskValue !== null && !isEmpty(diskValue as CanvasValue))
       && ((diskValue !== null && canvasCodec.equal(shown, diskValue)) || canvasCodec.equal(shown, docValue));
     if (!owned) {
-      this.deps.structured.releaseDoc(docName);
+      this.deps.structured.releaseDoc(docName, undefined, held.ydoc);
       return 'not-owned';
     }
-    const result = this.deps.structured.bindView(docName, this, shown);
+    // With the document acquired above: if a reconnect replaced it while the
+    // file was read, this is refused, and the next attach binds to the new one.
+    const result = this.deps.structured.bindView(docName, this, shown, held.ydoc);
     if (result !== 'bound') {
-      this.deps.structured.releaseDoc(docName);
+      this.deps.structured.releaseDoc(docName, undefined, held.ydoc);
       return result;
     }
     this.docName = docName;
@@ -290,6 +292,13 @@ export class CanvasLiveBinding implements BoundView {
     }
     this.liveCards.clear();
     this.emit();
+  }
+
+  /** BoundView: the document is being torn down under this binding. */
+  letGo(): void {
+    if (!this.bound) return;
+    log.info('Letting a live canvas go: its document is being torn down', { path: this.path });
+    this.detach();
   }
 
   /** A card's text as the view has committed it — behind its open editor by up to 2 s. */

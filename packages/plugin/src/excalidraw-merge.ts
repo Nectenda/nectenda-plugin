@@ -135,6 +135,31 @@ export type LoserFate =
  * lost: their copy just carries the old text) from "retyped it while someone
  * else retyped it" (their words are lost unless kept).
  */
+/** What Excalidraw changes on its own, with nothing a person did: see `onlyBookkeeping`. */
+const BOOKKEEPING = new Set(['isDeleted', 'index', 'version', 'versionNonce', 'updated', 'seed']);
+
+/**
+ * Whether `a` and `b` differ in nothing a person changes — only in z-order,
+ * version, nonce, timestamp, seed, and whether it is deleted. Excalidraw
+ * raises an element's version itself as it draws it into a scene whose
+ * z-order it must make room in, and a live vault carries that in as a
+ * version of its own (NEC-229).
+ */
+export function onlyBookkeeping(a: SceneElement, b: SceneElement): boolean {
+  // A field empty on one side and absent on the other is the same: a newer
+  // release fills in empty defaults as it draws an element in (found in
+  // review). A value on one side and empty on the other is still different —
+  // a link removed is an edit.
+  const empty = (v: unknown): boolean => v === null || v === undefined || v === false || v === ''
+    || (Array.isArray(v) && v.length === 0) || (typeof v === 'object' && v !== null && Object.keys(v).length === 0);
+  const rest = (el: SceneElement): string => {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(el)) if (!BOOKKEEPING.has(k) && !k.startsWith(INTERNAL) && !empty(v)) out[k] = v;
+    return canonical(out);
+  };
+  return rest(a) === rest(b);
+}
+
 export function fateOf(loser: SceneElement, winner: SceneElement, baseContent: string | null): LoserFate {
   if (loser.isDeleted) return { kind: 'converge', why: 'a delete lost to an edit; the element survives' };
   const content = contentOf(loser);
@@ -216,6 +241,19 @@ function when(ms: unknown): string {
 }
 
 /**
+ * `YYYY-MM-DD HH:MM UTC`, or nothing for a version with no time of its own:
+ * for a label every vault must write alike. Local time differs between two
+ * vaults in different zones, and "now" between two settling minutes apart;
+ * either made each keep the other's label as a copy of a label.
+ */
+function whenAnywhere(ms: unknown): string {
+  if (typeof ms !== 'number') return '';
+  const d = new Date(ms);
+  const p = (n: number): string => String(n).padStart(2, '0');
+  return `, ${d.getUTCFullYear()}-${p(d.getUTCMonth() + 1)}-${p(d.getUTCDate())} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())} UTC`;
+}
+
+/**
  * The elements that keep a losing version in the drawing: a copy of it under a
  * new id, and a frame around the copy naming whose edit it was.
  *
@@ -223,15 +261,19 @@ function when(ms: unknown): string {
  * right until the frame overlaps nothing live — so nobody mistakes the copy for
  * the element itself. The copy is cut loose from anything that would tie it
  * back: groups, a container, arrow bindings. `top` is the highest z-order
- * index among live elements, so both land on top.
+ * index among live elements, so both land on top. `whose` is what the label
+ * says the version was: "Bob's edit", or, for a fill no vault wrote, the same
+ * words in every vault. `anywhere` asks for a label every vault writes alike
+ * (`whenAnywhere`), for a version more than one vault may keep.
  */
 export function keptCopy(
   loser: SceneElement,
   winner: SceneElement,
   live: readonly SceneElement[],
   seed: string,
-  who: string,
+  whose: string,
   top: string | null,
+  anywhere = false,
 ): SceneElement[] {
   const copyId = derivedId(`${seed}\u0000copy`);
   const outlineId = derivedId(`${seed}\u0000frame`);
@@ -242,7 +284,9 @@ export function keptCopy(
   // outline and a label takes nothing in, and deleting it removes only those
   // three. Decided with the user on 4 October 2026.
   const groupId = derivedId(`${seed}\u0000group`);
-  const label = `Kept by Nectenda: ${who}'s edit, ${when(typeof loser.updated === 'number' ? loser.updated : Date.now())}`;
+  const label = anywhere
+    ? `Kept by Nectenda: ${whose}${whenAnywhere(loser.updated)}`
+    : `Kept by Nectenda: ${whose}, ${when(typeof loser.updated === 'number' ? loser.updated : Date.now())}`;
   const from = boxOf(loser) ?? { x: 0, y: 0, w: 100, h: 60 };
   const anchor = boxOf(winner.isDeleted ? loser : winner) ?? from;
   const fontSize = 14;

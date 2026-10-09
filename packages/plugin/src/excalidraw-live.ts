@@ -4,7 +4,7 @@ import type { Awareness } from 'y-protocols/awareness';
 import type { BindResult, BoundView, StructuredSync } from './structured-sync';
 import { excalidrawCodec } from './excalidraw-codec';
 import {
-  ROOT_APP_STATE, applyExcalidraw, isAnotherDrawing, observeExcalidraw, readExcalidraw, revisionsById, type ExcalidrawValue,
+  ROOT_APP_STATE, SHARED_APP_STATE, SHARED_SCENE_KEYS, applyExcalidraw, isAnotherDrawing, observeExcalidraw, readExcalidraw, revisionsById, unverified, versionsKnown, type ExcalidrawValue,
 } from './excalidraw-model';
 import { stripInternal, winnerOf } from './excalidraw-merge';
 import { EXCALIDRAW_READ_AGAINST, type SceneElement } from './excalidraw-format';
@@ -37,7 +37,8 @@ import { log } from './logger';
  * the plugin saves it with everything else. A save comes back to StructuredSync,
  * which hands it to the binding (`readInSave`): its elements by version against
  * the document, so an echo writes nothing and anything a hook missed is carried
- * in; its other parts against the document's own.
+ * in; its other parts against the document's own, but for what a tab of the
+ * drawing showed as it closed (`DeleteWitness.restBase`).
  *
  * **What is never undone by undo.** A remote change is drawn with
  * `captureUpdate: NEVER`, so it never enters this user's undo history —
@@ -83,6 +84,12 @@ export interface ExcalidrawViewLike {
   excalidrawAPI: ExcalidrawApiLike | null;
   save(suppressReload?: boolean, force?: boolean): Promise<void>;
   isDirty?(): boolean;
+  /**
+   * The file text the view last loaded or saved (Obsidian's TextFileView).
+   * Not updated when the plugin reloads only its scene (NEC-226), so it says
+   * nothing of elements; read for the rest of a drawing (DeleteWitness).
+   */
+  data?: string;
   /** The plugin's own record of an edit in progress (`semaphores.isEditingText`). */
   semaphores?: { isEditingText?: boolean } | null;
   getViewType?(): string;
@@ -120,7 +127,18 @@ export function checkExcalidrawShape(view: ExcalidrawViewLike, lib: ExcalidrawLi
 
 const key = (e: SceneElement): string => `${e.version}\u0000${e.versionNonce}`;
 
+/** Numbers each binding, so the log can tell one tab's binding from the next. */
+let bindingCount = 0;
+
 export class ExcalidrawLiveBinding implements BoundView {
+  /**
+   * Which binding this is, and when it bound. A save names no view, so one
+   * that lands after its tab closed and another bound is read in by the new
+   * binding (NEC-225): logged with these, such a save shows as one read in
+   * moments after binding.
+   */
+  private readonly id = ++bindingCount;
+  private boundAt = 0;
   private docName: string | null = null;
   private ydoc: Y.Doc | null = null;
   awareness: Awareness | null = null;
@@ -133,7 +151,8 @@ export class ExcalidrawLiveBinding implements BoundView {
   private around: ExcalidrawValue | null = null;
   /**
    * Per element, the document's version the view was last known to hold —
-   * at attach, as drawn, as carried in — by version and nonce. The only base
+   * seen showing before binding, at attach, as drawn, as carried in — by
+   * version and nonce. The only base
    * a newer version in the view can truthfully claim: a version records what
    * it was made on, and the version it names is then removed as superseded,
    * outright. Guessed as the document's current winner, an edit the view
@@ -147,6 +166,7 @@ export class ExcalidrawLiveBinding implements BoundView {
   private unobserve: (() => void) | null = null;
   private unChange: (() => void) | null = null;
   private captureTimer: number | null = null;
+  private unGesture: (() => void) | null = null;
   /** Remote changes not yet drawn, because an element was being edited. */
   private deferred = false;
   private drawing = false;
@@ -203,9 +223,15 @@ export class ExcalidrawLiveBinding implements BoundView {
     // loads (see isAnotherDrawing). Neither bound nor saved then: saved, it
     // would write the old drawing into this one's file.
     if (isAnotherDrawing(this.view.excalidrawAPI?.getSceneElementsIncludingDeleted() ?? [], held.ydoc)) {
-      this.deps.structured.releaseDoc(docName);
+      this.deps.structured.releaseDoc(docName, undefined, held.ydoc);
       this.refused('not-ready', { scene: 'another drawing' });
       return 'not-ready';
+    }
+    // What the view holds before its save, for the bases below: the save may
+    // be read into the document while the view moves past it (NEC-239).
+    const before = new Map<string, string[]>();
+    for (const e of this.view.excalidrawAPI?.getSceneElementsIncludingDeleted() ?? []) {
+      before.set(e.id, [`${e.version}:${e.versionNonce}`]);
     }
     // An edit waiting for the view's save is written out first, so file and
     // view agree before either is compared.
@@ -214,13 +240,13 @@ export class ExcalidrawLiveBinding implements BoundView {
       await this.view.save(true, false);
     }
     if (this.view.file?.path !== this.path) {
-      this.deps.structured.releaseDoc(docName);
+      this.deps.structured.releaseDoc(docName, undefined, held.ydoc);
       return 'not-owned';
     }
     const diskText = await this.deps.readFile(this.path);
     const parsed = diskText ? excalidrawCodec.parse(diskText) : null;
     if (!parsed?.ok) {
-      this.deps.structured.releaseDoc(docName);
+      this.deps.structured.releaseDoc(docName, undefined, held.ydoc);
       this.refused('not-ready', { disk: parsed ? parsed.error : 'no file' });
       return 'not-ready';
     }
@@ -237,7 +263,7 @@ export class ExcalidrawLiveBinding implements BoundView {
     // in on load, tombstones dropped, an element type an older release does
     // not know — leaving drawings unbound.
     if (this.view.file?.path !== this.path) {
-      this.deps.structured.releaseDoc(docName);
+      this.deps.structured.releaseDoc(docName, undefined, held.ydoc);
       return 'not-owned';
     }
     // What equality also guarded against: a view showing another drawing.
@@ -252,7 +278,7 @@ export class ExcalidrawLiveBinding implements BoundView {
     const strangers = (this.view.excalidrawAPI?.getSceneElementsIncludingDeleted() ?? [])
       .filter((e) => e.isDeleted !== true && !known.has(e.id));
     if (strangers.length > 0) {
-      this.deps.structured.releaseDoc(docName);
+      this.deps.structured.releaseDoc(docName, undefined, held.ydoc);
       this.refused('not-ready', { strangers: strangers.length, first: strangers.slice(0, 3).map((e) => e.id) });
       return 'not-ready';
     }
@@ -264,15 +290,18 @@ export class ExcalidrawLiveBinding implements BoundView {
     // drawing unbound for good.
     const rest = (v: ExcalidrawValue): ExcalidrawValue => ({ ...v, elements: [] });
     if (!excalidrawCodec.equal(rest(disk), rest(docValue)) && this.deps.structured.writePending(docName)) {
-      this.deps.structured.releaseDoc(docName);
+      this.deps.structured.releaseDoc(docName, undefined, held.ydoc);
       this.refused('not-ready', { waiting: 'the file to be written with a change the view cannot draw' });
       return 'not-ready';
     }
     // Handed over as the document's own value, so binding writes nothing:
     // the first capture carries in what the view adds, against the document.
-    const result = this.deps.structured.bindView(docName, this, docValue);
+    // With the document acquired above: if a reconnect replaced it while the
+    // save and the read were awaited, this is refused, and the next attach
+    // binds to the new one.
+    const result = this.deps.structured.bindView(docName, this, docValue, held.ydoc);
     if (result !== 'bound') {
-      this.deps.structured.releaseDoc(docName);
+      this.deps.structured.releaseDoc(docName, undefined, held.ydoc);
       this.refused(result, {});
       return result;
     }
@@ -282,12 +311,39 @@ export class ExcalidrawLiveBinding implements BoundView {
     this.around = { ...disk, elements: [] };
     this.seen.clear();
     {
+      // What the view holds, where the document has it. Where it does not,
+      // the latest version the view held before it that the document still
+      // has, by the order the witness saw the view show them — or, with no
+      // such record, what the view held before its save above. An edit made
+      // during that save leaves the view a version past what the save wrote,
+      // and the save may be read in before this: recorded as made on
+      // nothing, the view's own saved version beneath it was kept as a copy
+      // (NEC-239). By order, never by highest number: the version named is
+      // removed outright as superseded, and a view can show two rivals of
+      // one number in turn, or reload an older file; named by number, the
+      // version it did not edit on was removed with no copy (found in review).
       const revs = revisionsById(held.ydoc);
+      const history = this.deps.witness?.historyOf(this.view, this.path);
       for (const e of this.view.excalidrawAPI?.getSceneElementsIncludingDeleted() ?? []) {
-        if (revs.get(e.id)?.some((r) => r.rev.version === e.version && r.rev.versionNonce === e.versionNonce)) this.see(e);
+        const list = revs.get(e.id);
+        if (!list) continue;
+        if (list.some((r) => r.rev.version === e.version && r.rev.versionNonce === e.versionNonce)) {
+          this.see(e);
+          continue;
+        }
+        const pairs = history?.get(e.id) ?? before.get(e.id) ?? [];
+        for (let i = pairs.length - 1; i >= 0; i--) {
+          const [version, nonce] = pairs[i].split(':').map(Number);
+          const r = list.find((x) => x.rev.version === version && x.rev.versionNonce === nonce);
+          if (r) {
+            this.see(r.rev);
+            break;
+          }
+        }
       }
     }
     this.bound = true;
+    this.boundAt = Date.now();
     if (this.deps.pluginVersion && this.deps.pluginVersion !== EXCALIDRAW_READ_AGAINST) {
       log.info('A live drawing is running on an Excalidraw plugin its internals were not read against', {
         running: this.deps.pluginVersion, readAgainst: EXCALIDRAW_READ_AGAINST,
@@ -296,6 +352,7 @@ export class ExcalidrawLiveBinding implements BoundView {
     try {
       const api = this.view.excalidrawAPI!;
       this.unChange = api.onChange(() => this.safely(() => this.scheduleCapture()));
+      this.watchGestureEnds();
       this.unobserve = observeExcalidraw(held.ydoc, (change, tr) => {
         if (tr.origin === ORIGIN) return;
         // Settings, the note above the drawing, embedded files: not drawable
@@ -320,7 +377,7 @@ export class ExcalidrawLiveBinding implements BoundView {
       this.fail(err);
       return 'broken';
     }
-    log.debug('Bound an open drawing live', { path: this.path });
+    log.debug('Bound an open drawing live', { path: this.path, binding: this.id });
     return 'bound';
   }
 
@@ -347,6 +404,8 @@ export class ExcalidrawLiveBinding implements BoundView {
       // The view is going; nothing to unhook from.
     }
     this.unChange = null;
+    this.unGesture?.();
+    this.unGesture = null;
     for (const cb of [...this.detachListeners]) {
       try {
         cb();
@@ -377,22 +436,50 @@ export class ExcalidrawLiveBinding implements BoundView {
    * embedded files, settings) against the document's own. While bound only
    * this view changes those — any remote change to them lets the binding go
    * — so the save's are this view's edits. One writer for the drawing.
+   *
+   * Except that a save names no view: a tab of this drawing that closed as
+   * this one opened can land its save here, and its other parts are what it
+   * showed, not edits. Where they are what a closed view held and the
+   * document holds otherwise, they are read in as unchanged, and the binding
+   * lets go (`DeleteWitness.restBase`, NEC-235).
    */
-  readInSave(value: unknown): void {
-    if (!this.ydoc || !this.bound) return;
+  readInSave(value: unknown): { passedOver: string[]; keep: boolean } {
+    if (!this.ydoc || !this.bound) return { passedOver: [], keep: false };
     const saved = value as ExcalidrawValue;
     const doc = readExcalidraw(this.ydoc);
-    const { changed, bases } = this.newerThanDocument(this.withRecordedDeletes(saved.elements));
+    const { changed, bases, older } = this.newerThanDocument(this.withRecordedDeletes(saved.elements));
+    // A save names no view: a tab of this drawing that closed as this one
+    // opened can land its save here, built on a note, settings or links it
+    // showed before a remote change to them. Those parts are not its edits,
+    // and are not read in as such (NEC-235).
+    const rest = this.deps.witness?.restBase(this.path, saved, { ...doc, elements: bases }) ?? { base: { ...doc, elements: bases }, passedOver: [], keep: false };
     this.ydoc.transact(() => {
-      applyExcalidraw(this.ydoc!, { ...saved, elements: changed }, { ...doc, elements: bases });
+      applyExcalidraw(this.ydoc!, { ...saved, elements: changed }, rest.base as ExcalidrawValue);
     }, ORIGIN);
     for (const e of changed) this.see(e);
     this.around = { ...saved, elements: [] };
+    // Every save read in says so, with what it passed over: an element older
+    // than the document's is taken for a view not caught up yet, and dropped.
+    // From another tab's save it could be an edit, and nothing else would
+    // show it went (NEC-225).
+    log.debug('Read a bound drawing\'s save in', {
+      path: this.path, binding: this.id, boundMs: Date.now() - this.boundAt,
+      carried: changed.length, olderThanDocument: older.length, older: older.slice(0, 5),
+    });
     if (changed.length > 0) {
       log.info('An open drawing saved elements its live binding had not carried in; read them in', {
         path: this.path, count: changed.length,
       });
     }
+    if (rest.passedOver.length > 0) {
+      // The view loaded that save's file too, as Excalidraw reloads a file
+      // that changes under it, so it now shows what was passed over, and its
+      // next save would write it again. Let go: the file is written with the
+      // document's values, the plugin loads them, and the view binds again —
+      // the way any change the view cannot draw reaches it.
+      this.letGoFor(`a save held what a closed view of it showed (${rest.passedOver.slice(0, 5).join(' ')})`);
+    }
+    return { passedOver: rest.passedOver, keep: rest.keep };
   }
 
   shownText(): string | null {
@@ -450,10 +537,12 @@ export class ExcalidrawLiveBinding implements BoundView {
     return r ? stripInternal(r.rev) : null;
   }
 
-  private newerThanDocument(elements: readonly SceneElement[]): { changed: SceneElement[]; bases: SceneElement[] } {
+  private newerThanDocument(elements: readonly SceneElement[]): { changed: SceneElement[]; bases: SceneElement[]; older: string[] } {
     const revs = this.ydoc ? revisionsById(this.ydoc) : new Map<string, Array<{ rev: SceneElement }>>();
     const changed: SceneElement[] = [];
     const bases: SceneElement[] = [];
+    /** Passed over as behind the document, as `id@theirs<@document's`, for the log. */
+    const older: string[] = [];
     for (const e of elements) {
       const list = revs.get(e.id);
       const w = list ? stripInternal(winnerOf(list.map((r) => r.rev))) : undefined;
@@ -471,9 +560,11 @@ export class ExcalidrawLiveBinding implements BoundView {
         // marked the other as superseded, and settle removed it with no copy
         // kept — a lost edit, found by the hardness run (seed 2, round 4).
         changed.push({ ...e });
+      } else if (e.version < w.version) {
+        older.push(`${e.id}@${e.version}<@${w.version}`);
       }
     }
-    return { changed, bases };
+    return { changed, bases, older };
   }
 
   /**
@@ -501,6 +592,37 @@ export class ExcalidrawLiveBinding implements BoundView {
       else witness?.forget(this.path, e.id);
     }
     return newer.length === 0 ? elements : [...elements, ...newer];
+  }
+
+  /**
+   * Capture at once when a gesture ends — the pointer released or cancelled,
+   * the window left — rather than at the end of the throttle: a quit in those
+   * 100 ms lost what the gesture made (NEC-211; Canvas does the same,
+   * canvas-live.ts). After Excalidraw's own handler of the event, which is
+   * what finishes the gesture — an element finalised, an eraser's deletes —
+   * so a task later, not in the capture phase (found in review). Only when a
+   * capture is waiting then, so a click that changed nothing reads nothing.
+   */
+  private watchGestureEnds(): void {
+    const win = (this.view as { containerEl?: { ownerDocument?: { defaultView?: unknown } } }).containerEl?.ownerDocument?.defaultView ?? window;
+    const target = win as Partial<Pick<Window, 'addEventListener' | 'removeEventListener'>>;
+    if (typeof target.addEventListener !== 'function' || typeof target.removeEventListener !== 'function') return;
+    const now = (): void => {
+      window.setTimeout(() => {
+        if (this.captureTimer === null || !this.bound) return;
+        window.clearTimeout(this.captureTimer);
+        this.captureTimer = null;
+        this.safely(() => this.capture());
+      }, 0);
+    };
+    target.addEventListener('pointerup', now, true);
+    target.addEventListener('pointercancel', now, true);
+    target.addEventListener('blur', now);
+    this.unGesture = () => {
+      target.removeEventListener!('pointerup', now, true);
+      target.removeEventListener!('pointercancel', now, true);
+      target.removeEventListener!('blur', now);
+    };
   }
 
   private scheduleCapture(): void {
@@ -532,10 +654,16 @@ export class ExcalidrawLiveBinding implements BoundView {
     const { changed, bases } = this.newerThanDocument(this.withRecordedDeletes(api.getSceneElementsIncludingDeleted()));
     if (changed.length === 0) return false;
     const around = this.around;
+    // An image new here: its file is named under "## Embedded Files" only by
+    // the view's save, which the plugin makes about once a minute. Until then
+    // every other vault has the element without its file, and lets go to
+    // reload for it; and the file on disk lags the drawing. Saved soon after.
+    const newImage = changed.some((e) => e.type === 'image' && e.isDeleted !== true && !this.seen.has(e.id));
     this.ydoc.transact(() => {
       applyExcalidraw(this.ydoc!, { ...around, elements: changed }, { ...around, elements: bases });
     }, ORIGIN);
     for (const e of changed) this.see(e);
+    if (newImage) this.scheduleSave();
     const deletes = changed.filter((e) => e.isDeleted === true);
     if (deletes.length > 0) log.debug('Carried deletes in from a live drawing', { path: this.path, ids: deletes.slice(0, 5).map((e) => `${e.id}@${e.version}`) });
     return true;
@@ -659,7 +787,8 @@ export class ExcalidrawLiveBinding implements BoundView {
   private saveTimer: number | null = null;
 
   /**
-   * Ask the view to save a little after a remote change is drawn. The plugin
+   * Ask the view to save a little after a remote change is drawn, or after an
+   * image added here is carried in (see carryIn). The plugin
    * autosaves an open drawing only once a minute on desktop, and while bound
    * nothing else writes the file (SAFE-A19): without this, the file — what
    * git, a backup or another app sees — would lag the drawing by up to that.
@@ -671,7 +800,7 @@ export class ExcalidrawLiveBinding implements BoundView {
       this.saveTimer = null;
       if (!this.bound || this.view.file?.path !== this.path) return;
       void this.view.save(true, false).catch((err: unknown) => {
-        log.warn('A live drawing could not be saved after a remote change', { path: this.path, error: String(err) });
+        log.warn('A live drawing could not be saved after a change', { path: this.path, error: String(err) });
       });
     }, SAVE_AFTER_DRAW_MS);
   }
@@ -696,6 +825,11 @@ export class ExcalidrawLiveBinding implements BoundView {
     if (this.view.file?.path === this.path) return false;
     if (this.bound) this.letGoFor('the view now shows another file');
     return true;
+  }
+
+  /** BoundView: the document is being torn down under this binding. */
+  letGo(): void {
+    if (this.bound) this.letGoFor('its document is being torn down');
   }
 
   private letGoFor(why: string): void {
@@ -750,6 +884,73 @@ function editingIds(appState: Record<string, unknown>): Set<string> {
 }
 
 /**
+ * How long what a closed view of a drawing held is kept, for its save on
+ * closing (`DeleteWitness.restBase`). Excalidraw writes that save about 200 ms
+ * after it starts; this is room for a slow disk and a busy machine, and short
+ * enough that a later edit is unlikely to set a part back to exactly that.
+ */
+const CLOSED_HELD_MS = 30_000;
+
+/** How many shown versions of one element `DeleteWitness` keeps, per view. */
+const SHOWN_PER_ELEMENT = 16;
+
+/**
+ * Append `pair` to `id`'s history unless it is already the latest: the order
+ * a view showed versions in, bounded by dropping the oldest, which is the
+ * least likely to be what an edit was made on. Losing one costs a kept copy.
+ */
+function addInOrder(history: Map<string, string[]>, id: string, pair: string): void {
+  const pairs = history.get(id);
+  if (!pairs) history.set(id, [pair]);
+  else if (pairs[pairs.length - 1] !== pair) {
+    pairs.push(pair);
+    if (pairs.length > SHOWN_PER_ELEMENT) pairs.shift();
+  }
+}
+
+function addShown(shown: Map<string, string[]>, id: string, pair: string): void {
+  const pairs = shown.get(id);
+  if (!pairs) shown.set(id, [pair]);
+  else if (!pairs.includes(pair)) {
+    pairs.push(pair);
+    // Bounded: versions only rise, so the lowest is the least likely to be a
+    // save's base. Losing one costs a kept copy, not an edit.
+    if (pairs.length > SHOWN_PER_ELEMENT) {
+      pairs.sort((a, b) => parseInt(a, 10) - parseInt(b, 10));
+      pairs.shift();
+    }
+  }
+}
+
+/**
+ * The highest version of an element a view's scene was seen to hold
+ * (`DeleteWitness.recordedAhead`): the element; the version it was made on,
+ * the one recorded before it, if any (`on`); some other elements of that scene
+ * (`peers`), deleted ones included, by which an element the document lacks is
+ * told from another drawing's; and whether the document has had it (`done`).
+ * Kept once done, so that the next edit knows what it was made on.
+ */
+interface Drawn {
+  element: SceneElement;
+  on: string | null;
+  peers: string[];
+  done: boolean;
+  /** Read back from the stored record (`take`): a delete made before the restart, on `on`. */
+  restored?: boolean;
+}
+
+/** Where `DeleteWitness` keeps its record of deletes across a restart: one text, read once and written whole. */
+export interface DeleteRecordStore {
+  load(): Promise<string | null>;
+  save(text: string): Promise<void>;
+}
+
+/** A scene, by each element's id and version: what tells a scene that has changed from one that has not. */
+function sceneMark(scene: readonly SceneElement[]): string {
+  return scene.map((e) => `${e.id}@${e.version}`).join(',');
+}
+
+/**
  * What open drawings deleted, recorded as Excalidraw deletes it, for the saves
  * that leave it out.
  *
@@ -775,27 +976,292 @@ function editingIds(appState: Record<string, unknown>): Set<string> {
  * another drawing could, for a moment, show the old scene under the new path;
  * its deleted elements then count only if the new drawing has the same ids
  * live, which only a copied drawing would.
+ *
+ * It also records which version of each element a view has shown, for the
+ * base a save is read in against (`verifiedBase`). The disk path's base is a
+ * guess — our last write, or the last session's record — and a version in it
+ * is removed as superseded by the save's newer one. A view whose scene never
+ * redrew our write builds on what it held before, so the remote version in
+ * that base was superseded by nobody, and removing it lost it with no copy
+ * (NEC-212).
+ *
+ * And it records the highest version of each element any view's scene was
+ * seen to hold, past the view (`recordedAhead`). Excalidraw clears a view's
+ * unsaved flag when a save ends, not at the scene it saved, so an edit made
+ * during a save is marked clean, and a tab switched or closed then saves
+ * nothing (NEC-236, hardness seed 225003, traced in 2.27.3 and 2.28.1); a
+ * scene rebuilt from the file throws its edits away the same way (seed
+ * 235001). What the scene held is read into the document before the
+ * drawing's next write, and a view leaving the drawing asks for that write
+ * (`onLeft`), so none of it waits on Excalidraw saving.
+ *
+ * The record of deletes is kept on this device too (`DeleteRecordStore`), and
+ * read back before any drawing connects (`restore`). In memory only, a delete
+ * made with sync stopped, or in the second before its save was read in, came
+ * back if Obsidian quit first (NEC-211). Still by path: with sync stopped
+ * there is no document to name it by, so a rename moves it (`renamed`).
  */
 export class DeleteWitness {
   private seen = new Map<string, Map<string, SceneElement>>();
+  /**
+   * Per path, the ids whose delete came from the stored record, not from a
+   * view this session. An element absent from a document that has not yet had
+   * its first sync is "not heard from yet", not gone, and such a record is not
+   * dropped for it (`withViewDeletes`).
+   */
+  private restoredIds = new Map<string, Set<string>>();
+  private restoring: Promise<void> | null = null;
+  /** Whether the stored record has been read: until it has, nothing is written over it. */
+  private loaded = false;
+  /** The record has changed since it was last written. */
+  private dirty = false;
+  private flushQueued = false;
+  private writing: Promise<void> = Promise.resolve();
+  private disposed = false;
+  /**
+   * Per view, per path, per element id: the `version:versionNonce` pairs that
+   * view has shown. Per view, not per path: with two views of one drawing
+   * open, one that drew a version says nothing of the other, which may not
+   * have, and either may be the one that saved. Weakly held, so a closed view
+   * is not kept alive by it, and kept while the view lives though it is let go
+   * and watched again: with sync stopped no drawing is listed, and a view that
+   * came back with an empty record would vouch for nothing it had shown
+   * before, leaving copies of what it had.
+   */
+  private shownByView = new WeakMap<ExcalidrawViewLike, Map<string, Map<string, string[]>>>();
+  /** Per path, the same for every view of it this session, closed ones included. */
+  private shownByPath = new Map<string, Map<string, string[]>>();
+  /**
+   * Per view, per path, per element id: the `version:versionNonce` pairs the
+   * view showed, in the order it showed them, each once in a row. What a
+   * binding names as the base of a version the view holds past the document
+   * is the latest of these the document has (NEC-239): by order, not by
+   * number. A view can show two rivals of one number in turn, or reload a
+   * file older than a version it showed, and its edit is made on the one it
+   * held last; named by highest number, the other was removed as superseded
+   * with no copy (found in review, and reproduced). Not `shownByView`, which
+   * is a set, and reordered when it is trimmed.
+   */
+  private historyByView = new WeakMap<ExcalidrawViewLike, Map<string, Map<string, string[]>>>();
+  /** Per path, the element versions `saveViewsAhead` has already forced a save for. */
+  private forced = new Map<string, Set<string>>();
+  /** Per view watched, the path it shows and the file text it last held, for `closedHeld`. */
+  private heldByView = new Map<ExcalidrawViewLike, { path: string; text: string }>();
+  /**
+   * Per path, the file text each view of it held as it closed or turned to
+   * another file, and when: what its save on closing was built on (`restBase`).
+   */
+  private closedHeld = new Map<string, Array<{ text: string; at: number; value?: ExcalidrawValue | null; dropped?: Set<string>; kept?: boolean }>>();
+  /** Per path, per element id: the highest version any view's scene of it was seen to hold. See `Drawn`. */
+  private drawn = new Map<string, Map<string, Drawn>>();
+  /** The path each watched view showed when last seen. */
+  private showing = new Map<ExcalidrawViewLike, string>();
+  /**
+   * A view that has just turned to another file, with the scene it showed as
+   * it turned: until that scene changes it is the old file's, under the new
+   * path, and nothing in it is recorded for the new one. Recorded, a copy of a
+   * drawing — which shares its ids — had the other's versions read into it
+   * (found in review).
+   */
+  private turned = new WeakMap<ExcalidrawViewLike, string>();
+  /** Told the path a view stopped showing — switched to another file, closed, or rebuilt. */
+  onLeft: ((path: string) => void) | null = null;
   private watching = new Map<ExcalidrawViewLike, { api: ExcalidrawApiLike; off: () => void }>();
   private retry: number | null = null;
   /** Looks taken in a row for a drawing still loading; see `watch`. */
   private retries = 0;
 
-  constructor(private views: () => readonly ExcalidrawViewLike[]) {}
+  constructor(private views: () => readonly ExcalidrawViewLike[], private store: DeleteRecordStore | null = null) {}
+
+  /**
+   * Read the stored record of deletes back, once; resolves when it has been.
+   * Awaited before any drawing connects: a connect's first write reads the
+   * file in, and a delete it did not know of was put back (NEC-211). A record
+   * that cannot be read is no record — today's behaviour, the shape back and
+   * visible — and says so in the log.
+   */
+  restore(): Promise<void> {
+    this.restoring ??= (async () => {
+      let text: string | null = null;
+      try {
+        text = this.store ? await this.store.load() : null;
+      } catch (err) {
+        log.warn('Could not read the stored record of what drawings deleted; deletes made before the restart that never synced may come back', { error: String(err) });
+      }
+      if (text !== null && !this.disposed) this.take(text);
+      this.loaded = true;
+      if (this.dirty) this.changed();
+    })();
+    return this.restoring;
+  }
+
+  /** Take in a stored record: a delete only where this session has not seen the element at a version as high. */
+  private take(text: string): void {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      log.warn('The stored record of what drawings deleted does not parse; ignoring it');
+      return;
+    }
+    const paths = (parsed as { v?: unknown; paths?: unknown } | null)?.v === 1 ? (parsed as { paths?: unknown }).paths : null;
+    if (paths === null || typeof paths !== 'object') {
+      log.warn('The stored record of what drawings deleted is not one this version reads; ignoring it');
+      return;
+    }
+    let count = 0;
+    for (const [path, list] of Object.entries(paths as Record<string, unknown>)) {
+      if (!Array.isArray(list)) continue;
+      for (const rec of list as Array<{ element?: unknown; on?: unknown }>) {
+        const e = rec?.element as SceneElement | undefined;
+        if (!e || typeof e.id !== 'string' || typeof e.version !== 'number' || e.isDeleted !== true) continue;
+        let seen = this.seen.get(path);
+        if (seen?.get(e.id) && seen.get(e.id)!.version >= e.version) continue;
+        let drawn = this.drawn.get(path);
+        if (drawn?.get(e.id) && drawn.get(e.id)!.element.version >= e.version) continue;
+        if (!seen) this.seen.set(path, (seen = new Map<string, SceneElement>()));
+        seen.set(e.id, e);
+        let restored = this.restoredIds.get(path);
+        if (!restored) this.restoredIds.set(path, (restored = new Set<string>()));
+        restored.add(e.id);
+        // And as a version the document may lack, so the next write reads it
+        // in whether or not a save leaves it out — one made before the delete
+        // still holds the shape (`recordedAhead`).
+        if (!drawn) this.drawn.set(path, (drawn = new Map<string, Drawn>()));
+        drawn.set(e.id, { element: e, on: typeof rec.on === 'string' ? rec.on : null, peers: [], done: false, restored: true });
+        count++;
+      }
+    }
+    if (count > 0) log.info('Read back what drawings deleted before the restart that has not synced yet', { count, paths: Object.keys(paths).length });
+  }
+
+  /** The record of deletes changed: write it, soon, once the stored one has been read. */
+  private changed(): void {
+    if (!this.store || this.disposed) return;
+    this.dirty = true;
+    if (!this.loaded || this.flushQueued) return;
+    this.flushQueued = true;
+    // A microtask, not a timer: a crash between a delete and its write is the
+    // one way left to lose it, so the window is kept as small as can be.
+    queueMicrotask(() => {
+      this.flushQueued = false;
+      this.flush();
+    });
+  }
+
+  private flush(): void {
+    if (!this.store || !this.dirty) return;
+    this.dirty = false;
+    const paths: Record<string, Array<{ element: SceneElement; on: string | null }>> = {};
+    for (const [path, seen] of this.seen) {
+      if (seen.size === 0) continue;
+      paths[path] = [...seen.values()].map((element) => {
+        const d = this.drawn.get(path)?.get(element.id);
+        return { element, on: d && d.element.version === element.version ? d.on : null };
+      });
+    }
+    const text = JSON.stringify({ v: 1, paths });
+    const store = this.store;
+    this.writing = this.writing.then(() => store.save(text)).catch((err: unknown) => {
+      log.warn('Could not store the record of what drawings deleted; a delete not yet synced may come back after a restart', { error: String(err) });
+    });
+  }
+
+  /** Writes of the record still in flight; for a test, and for unload. */
+  settled(): Promise<void> {
+    return this.writing;
+  }
+
+  /**
+   * A file or folder moved from `oldPath` to `newPath`: its record moves with
+   * it. Sync on or off, since a delete waits for sync in exactly the case
+   * that matters. Left behind, the shape came back under its new name.
+   */
+  renamed(oldPath: string, newPath: string): void {
+    const moved = (p: string): string | null => (p === oldPath ? newPath : p.startsWith(`${oldPath}/`) ? newPath + p.slice(oldPath.length) : null);
+    // Merged into what is already there, by version, not over it: a view
+    // that showed the new path first may have recorded a delete under it
+    // before this ran (found in review).
+    const higher = <T>(version: (x: T) => number) => (into: Map<string, T>, from: Map<string, T>): void => {
+      for (const [id, x] of from) {
+        const there = into.get(id);
+        if (!there || version(x) > version(there)) into.set(id, x);
+      }
+    };
+    const mergeSeen = higher<SceneElement>((e) => e.version);
+    const mergeDrawn = higher<Drawn>((d) => d.element.version);
+    let any = false;
+    for (const [p, v] of [...this.seen]) {
+      const to = moved(p);
+      if (to === null) continue;
+      this.seen.delete(p);
+      const there = this.seen.get(to);
+      if (there) mergeSeen(there, v);
+      else this.seen.set(to, v);
+      any = true;
+    }
+    for (const [p, v] of [...this.restoredIds]) {
+      const to = moved(p);
+      if (to === null) continue;
+      this.restoredIds.delete(p);
+      this.restoredIds.set(to, new Set([...(this.restoredIds.get(to) ?? []), ...v]));
+    }
+    for (const [p, v] of [...this.drawn]) {
+      const to = moved(p);
+      if (to === null) continue;
+      this.drawn.delete(p);
+      const there = this.drawn.get(to);
+      if (there) mergeDrawn(there, v);
+      else this.drawn.set(to, v);
+    }
+    if (any) {
+      log.debug('Moved what a drawing deleted with it', { from: oldPath, to: newPath });
+      this.changed();
+    }
+  }
+
+  /**
+   * A file or folder at `path` was deleted: what was recorded for it goes,
+   * here and in storage, rather than being kept for a drawing that is gone.
+   * A drawing made again at the path is a new one, whose shapes these deletes
+   * never applied to.
+   */
+  deleted(path: string): void {
+    const under = (p: string): boolean => p === path || p.startsWith(`${path}/`);
+    let any = false;
+    for (const p of [...this.seen.keys()]) {
+      if (!under(p)) continue;
+      this.seen.delete(p);
+      any = true;
+    }
+    for (const p of [...this.restoredIds.keys()]) if (under(p)) this.restoredIds.delete(p);
+    for (const p of [...this.drawn.keys()]) if (under(p)) this.drawn.delete(p);
+    if (any) this.changed();
+  }
 
   /** Watch every open drawing, and stop watching the closed. */
   watch(): void {
     const open = new Set(this.views());
+    for (const [view, held] of this.heldByView) {
+      if (open.has(view)) continue;
+      this.heldByView.delete(view);
+      this.closed(held);
+    }
     for (const [view, w] of this.watching) {
-      if (open.has(view) && view.excalidrawAPI === w.api) continue;
+      if (open.has(view) && view.excalidrawAPI === w.api) {
+        this.showingNow(view);
+        continue;
+      }
       try {
         w.off();
       } catch {
         // The view is going; nothing to unhook from.
       }
       this.watching.delete(view);
+      // Closed, or its scene rebuilt: what it held is gone from it.
+      const was = this.showing.get(view);
+      this.showing.delete(view);
+      if (was !== undefined) this.left(was);
     }
     let loading = false;
     for (const view of open) {
@@ -806,6 +1272,7 @@ export class DeleteWitness {
       try {
         const off = api.onChange(() => this.note(view));
         this.watching.set(view, { api, off });
+        if (view.file?.path) this.showing.set(view, view.file.path);
       } catch (err) {
         log.warn('Could not watch an open drawing for deletes', { path: view.file?.path, error: String(err) });
       }
@@ -826,6 +1293,26 @@ export class DeleteWitness {
     }
   }
 
+  /** Note the path a watched view shows, and say so if it has moved on from another. */
+  private showingNow(view: ExcalidrawViewLike): void {
+    const path = view.file?.path;
+    const was = this.showing.get(view);
+    if (path) this.showing.set(view, path);
+    else this.showing.delete(view);
+    if (was !== undefined && was !== path) {
+      this.turned.set(view, sceneMark(view.excalidrawAPI?.getSceneElementsIncludingDeleted() ?? []));
+      this.left(was);
+    }
+  }
+
+  private left(path: string): void {
+    try {
+      this.onLeft?.(path);
+    } catch (err) {
+      log.warn('Could not ask for a write of a drawing a view left', { path, error: String(err) });
+    }
+  }
+
   private note(view: ExcalidrawViewLike): void {
     // Called from Excalidraw's own change emitter: a throw would break it.
     try {
@@ -833,27 +1320,202 @@ export class DeleteWitness {
     } catch {
       return;
     }
+    if (this.watching.has(view)) this.showingNow(view);
     const path = view.file?.path;
+    if (path) this.hold(view, path);
     const scene = view.excalidrawAPI?.getSceneElementsIncludingDeleted();
     if (!path || !scene) return;
+    let drawn = this.drawn.get(path);
+    if (!drawn) this.drawn.set(path, (drawn = new Map<string, Drawn>()));
+    // The old file's scene, still shown under the new path: not this drawing's.
+    const turned = this.turned.get(view);
+    const mark = turned === undefined ? null : sceneMark(scene);
+    const record = turned === undefined || mark !== turned;
+    if (turned !== undefined && record) this.turned.delete(view);
+    const sample = scene.slice(0, 9).map((e) => e.id);
     let seen = this.seen.get(path);
+    let paths = this.shownByView.get(view);
+    if (!paths) this.shownByView.set(view, (paths = new Map<string, Map<string, string[]>>()));
+    let shown = paths.get(path);
+    if (!shown) paths.set(path, (shown = new Map<string, string[]>()));
+    let anyView = this.shownByPath.get(path);
+    if (!anyView) this.shownByPath.set(path, (anyView = new Map<string, string[]>()));
+    let histories = this.historyByView.get(view);
+    if (!histories) this.historyByView.set(view, (histories = new Map<string, Map<string, string[]>>()));
+    let history = histories.get(path);
+    if (!history) histories.set(path, (history = new Map<string, string[]>()));
     for (const e of scene) {
+      addShown(shown, e.id, `${e.version}:${e.versionNonce}`);
+      addShown(anyView, e.id, `${e.version}:${e.versionNonce}`);
+      // A delete read back from before a restart, while the view shows the
+      // shape live at a version as high: the file still held it — Obsidian
+      // quit before Excalidraw saved — and the user has edited it since, on
+      // the version before the delete, so at the same number. That edit is
+      // newer than the delete and stands; as a rival of the same version the
+      // delete won about half the time, by nonce (found in review).
+      if (record && e.isDeleted !== true && this.restoredIds.get(path)?.has(e.id) === true) {
+        const restored = seen?.get(e.id);
+        if (restored && e.version >= restored.version && `${e.version}:${e.versionNonce}` !== `${restored.version}:${restored.versionNonce}`) {
+          log.info('A delete read back from before a restart gave way to an edit of the shape since', { path, id: `${e.id}@${e.version}` });
+          this.drop(path, e.id);
+          // Made on what the delete was made on: the version the file held.
+          const gone = drawn.get(e.id);
+          if (gone?.element.isDeleted === true) {
+            drawn.set(e.id, { element: stripInternal({ ...e }), on: gone.on, peers: sample.filter((id) => id !== e.id).slice(0, 8), done: false });
+          }
+        }
+      }
+      // Not while a turned tab still shows the old file's scene: those are
+      // the other drawing's versions, which a copy of it shares by id.
+      if (record) addInOrder(history, e.id, `${e.version}:${e.versionNonce}`);
+      // Cloned only when the version rises: this runs on every scene change.
+      const was = drawn.get(e.id);
+      if (record && (!was || e.version > was.element.version)) {
+        drawn.set(e.id, {
+          element: stripInternal({ ...e }),
+          on: was ? `${was.element.version}:${was.element.versionNonce}` : null,
+          peers: sample.filter((id) => id !== e.id).slice(0, 8),
+          done: false,
+        });
+      }
       const had = seen?.get(e.id);
       if (e.isDeleted === true) {
         if (had && had.version >= e.version) continue;
         if (!seen) this.seen.set(path, (seen = new Map<string, SceneElement>()));
         seen.set(e.id, stripInternal({ ...e }));
+        this.restoredIds.get(path)?.delete(e.id);
+        this.changed();
         log.debug('Saw a drawing delete an element', { path, id: `${e.id}@${e.version}` });
       } else if (had && e.version > had.version) {
         // Undone, or edited again elsewhere and drawn here: no longer deleted.
-        seen?.delete(e.id);
+        this.drop(path, e.id);
       }
     }
   }
 
+  /** Record the file text `view` holds for `path`; a view that turned to another file closed the old one. */
+  private hold(view: ExcalidrawViewLike, path: string): void {
+    const held = this.heldByView.get(view);
+    if (held && held.path !== path) {
+      this.heldByView.delete(view);
+      this.closed(held);
+    }
+    const text = view.data;
+    if (typeof text === 'string' && text !== '') this.heldByView.set(view, { path, text });
+  }
+
+  private closed(held: { path: string; text: string }): void {
+    const now = Date.now();
+    const list = (this.closedHeld.get(held.path) ?? []).filter((c) => now - c.at <= CLOSED_HELD_MS && c.text !== held.text);
+    list.push({ text: held.text, at: now });
+    this.closedHeld.set(held.path, list);
+  }
+
+  /**
+   * The base a save of `path` is read in against, with each part but the
+   * elements — the note above the drawing, each shared setting, each embedded
+   * link, the scene's shared keys — taken from the save itself where the save holds
+   * what a view of the drawing closed in the last `CLOSED_HELD_MS` held and
+   * the base holds something else. Such a part is not an edit: it is what
+   * that view was showing when it closed, saved on its way out, after a
+   * remote change to that part had been written to the file it no longer
+   * showed. Diffed against the base, it reverted the remote change in every
+   * vault, with no copy, bound or not, and the reopened view loaded the
+   * revert from the file too (NEC-235). Elements need none of this: they are
+   * judged by version (`verifiedBase`).
+   *
+   * Only closed views count. An open view that missed a write is the guard's
+   * to repair, and one that loaded it holds the write's values. And a part
+   * this vault has since changed by a save read in is that view's no longer:
+   * set back to what the view held — an undo — it is an edit (found in
+   * review). Returns the
+   * parts it passed over, for the log and the backup the caller keeps.
+   */
+  restBase(path: string, saved: unknown, base: unknown): { base: unknown; passedOver: string[]; keep: boolean } {
+    const save = saved as ExcalidrawValue;
+    const was = base as ExcalidrawValue | null;
+    if (!was || !Array.isArray(save?.elements) || !Array.isArray(was.elements)) return { base, passedOver: [], keep: false };
+    this.watch();
+    const now = Date.now();
+    const list = (this.closedHeld.get(path) ?? []).filter((c) => now - c.at <= CLOSED_HELD_MS);
+    if (list.length === 0) {
+      this.closedHeld.delete(path);
+      return { base, passedOver: [], keep: false };
+    }
+    this.closedHeld.set(path, list);
+    for (const c of list) {
+      if (c.value !== undefined) continue;
+      const parsed = excalidrawCodec.parse(c.text);
+      c.value = parsed.ok ? (parsed.value as ExcalidrawValue) : null;
+    }
+    const same = (a: unknown, b: unknown): boolean => canonical(a ?? null) === canonical(b ?? null);
+    // Only what the document shares: a file holds every app-state key — the
+    // theme, the scroll, the zoom — and the document only the shared ones, so
+    // the rest differ from any base, always, and are never read in anyway.
+    const slots: Array<{ name: string; part: 'head' | 'appState' | 'embedded' | 'scene'; key?: string }> = [{ name: 'head', part: 'head' }];
+    for (const key of SHARED_APP_STATE) slots.push({ name: `appState.${key}`, part: 'appState', key });
+    for (const key of new Set([...Object.keys(save.embedded ?? {}), ...Object.keys(was.embedded ?? {})])) slots.push({ name: `embedded.${key}`, part: 'embedded', key });
+    for (const key of SHARED_SCENE_KEYS) slots.push({ name: `scene.${key}`, part: 'scene', key });
+    const get = (v: ExcalidrawValue, slot: (typeof slots)[number]): unknown =>
+      slot.key === undefined ? v.head : (v[slot.part as 'appState'] as Record<string, unknown> | undefined)?.[slot.key];
+    const out = { head: was.head, appState: { ...was.appState }, embedded: { ...was.embedded }, scene: { ...was.scene } };
+    const passedOver: string[] = [];
+    /** The closed views whose record a part was passed over for, and whether any part was more than a link the save lacks. */
+    const matched = new Set<(typeof list)[number]>();
+    let more = false;
+    for (const slot of slots) {
+      const theirs = get(save, slot);
+      if (same(theirs, get(was, slot))) continue;
+      const matches = list.filter((c) => c.value && !c.dropped?.has(slot.name) && same(get(c.value, slot), theirs));
+      if (matches.length === 0) {
+        // A change of this vault's own, read in: whatever a closed view held
+        // there is behind it now. Set back later — an undo — it is an edit
+        // too, not that view's, so its record of this part goes.
+        for (const c of list) (c.dropped ??= new Set()).add(slot.name);
+        continue;
+      }
+      if (slot.key === undefined) out.head = theirs as string;
+      else {
+        const into = out[slot.part as 'appState'];
+        if (theirs === undefined) delete into[slot.key];
+        else into[slot.key] = theirs;
+      }
+      passedOver.push(slot.name);
+      for (const c of matches) matched.add(c);
+      if (slot.part !== 'embedded' || theirs !== undefined) more = true;
+    }
+    if (passedOver.length === 0) return { base, passedOver, keep: false };
+    // A backup once per closed view, and none for a save that only lacks
+    // links: a tab switched away and back closes the drawing every time, and
+    // kept a copy of every save it made after (the hardness run: some 80 in
+    // 25 minutes). A link a save lacks was never removed by anyone; the image
+    // it names is an element, judged by version. The user chose this (NEC-235).
+    const keep = more && [...matched].some((c) => !c.kept);
+    if (keep) for (const c of matched) c.kept = true;
+    log.warn('A drawing\'s save held what a view of it showed as it closed, where the document has since changed; read those parts in as unchanged', {
+      path, parts: passedOver.slice(0, 10), count: passedOver.length,
+    });
+    return { base: { ...was, ...out }, passedOver, keep };
+  }
+
+  /**
+   * Per element id, the `version:versionNonce` pairs `view` showed for
+   * `path`, oldest first, in the order it showed them (see `historyByView`).
+   * Read-only; undefined when it showed none.
+   */
+  historyOf(view: ExcalidrawViewLike, path: string): ReadonlyMap<string, readonly string[]> | undefined {
+    return this.historyByView.get(view)?.get(path);
+  }
+
   /** Drop the record of a delete the document has reached. */
   forget(path: string, id: string): void {
-    this.seen.get(path)?.delete(id);
+    this.drop(path, id);
+  }
+
+  /** Drop a delete from the record, here and in storage. */
+  private drop(path: string, id: string): void {
+    this.restoredIds.get(path)?.delete(id);
+    if (this.seen.get(path)?.delete(id) === true) this.changed();
   }
 
   /** What was seen deleted in `path` that `present` (by id) does not hold. */
@@ -862,8 +1524,13 @@ export class DeleteWitness {
     return seen ? [...seen.values()].filter((e) => !present.has(e.id)) : [];
   }
 
-  /** A save of `path`, with the deletes its open drawing made that it left out. */
-  withViewDeletes(path: string, saved: unknown, current: unknown): unknown {
+  /**
+   * A save of `path`, with the deletes its open drawing made that it left out.
+   * `settled`: whether the document has had its first sync. Until it has, an
+   * element it lacks may be one it has not heard of yet, and a delete read
+   * back from storage is kept rather than dropped for it.
+   */
+  withViewDeletes(path: string, saved: unknown, current: unknown, settled = true): unknown {
     const save = saved as ExcalidrawValue;
     const now = current as ExcalidrawValue;
     if (!Array.isArray(save?.elements) || !Array.isArray(now?.elements)) return saved;
@@ -885,7 +1552,8 @@ export class DeleteWitness {
       // edit it lost to (see the binding's withRecordedDeletes): nothing more
       // to say.
       const standing = liveNow.get(id);
-      if (standing === undefined || standing >= e.version) seen.delete(id);
+      if (standing === undefined && !settled && this.restoredIds.get(path)?.has(id) === true) continue;
+      if (standing === undefined || standing >= e.version) this.drop(path, id);
       else if (!inSave.has(id)) added.push(e);
     }
     log.debug('Asked what open drawings deleted', { path, recorded: seen.size, added: added.length });
@@ -894,7 +1562,285 @@ export class DeleteWitness {
     return { ...save, elements: [...save.elements, ...added] };
   }
 
+  /**
+   * What views of `path` were seen to hold that `current`, the document, has
+   * never had — open views or gone ones, by the document's own revisions
+   * (`versionsKnown` of `ydoc`, its document) — split by how it goes in:
+   *
+   * - `ahead`: a version above the document's standing one. Made on the
+   *   standing one (`on`), it supersedes it; made on anything else, the
+   *   standing one was never seen by whoever made it, and stands beside it.
+   * - `rivals`: a version at or below the standing one, which reached no
+   *   document: an edit made while another vault's edit of the same shape
+   *   arrived first. Read in with no base, as a rival, so settle decides, and
+   *   keeps the loser as SAFE-A27 does for any concurrent edit. Dropped
+   *   instead, it was lost with no copy (found in review).
+   *
+   * A version the document has had is done with: delivered, or decided. An
+   * element the document lacks goes in only if it is not deleted and its scene
+   * shared an element with the document (a scene of one shape cannot say, and
+   * goes in). An image whose file the document lacks waits for a save that
+   * carries the file.
+   */
+  recordedAhead(path: string, current: unknown, ydoc?: Y.Doc): { ahead: Drawn[]; rivals: Drawn[] } {
+    const known = ydoc ? versionsKnown(ydoc) : new Map<string, Set<string>>();
+    const out = { ahead: [] as Drawn[], rivals: [] as Drawn[] };
+    const now = current as ExcalidrawValue;
+    if (!Array.isArray(now?.elements)) return out;
+    // What the views show now too, in case a change has not been reported yet.
+    this.watch();
+    for (const view of this.views()) if (view.file?.path === path) this.note(view);
+    const drawn = this.drawn.get(path);
+    if (!drawn) return out;
+    const standing = new Map(now.elements.map((e) => [e.id, e]));
+    for (const [id, d] of drawn) {
+      if (d.done) continue;
+      const { element } = d;
+      const pair = `${element.version}:${element.versionNonce}`;
+      const doc = standing.get(id);
+      if ((doc && `${doc.version}:${doc.versionNonce}` === pair) || known.get(id)?.has(pair) === true) {
+        d.done = true;
+        // A delete the document has had: delivered, so its record goes too.
+        // Kept, one that synced before a quit came back on every launch after.
+        if (element.isDeleted === true && this.seen.get(path)?.get(id)?.version === element.version) this.drop(path, id);
+        continue;
+      }
+      if (doc === undefined) {
+        if (element.isDeleted === true || (standing.size > 0 && d.peers.length > 0 && !d.peers.some((p) => standing.has(p)))) {
+          d.done = true;
+          continue;
+        }
+        const fileId = (element as { fileId?: unknown }).fileId;
+        if (element.type === 'image' && typeof fileId === 'string' && !(fileId in (now.files ?? {})) && !(fileId in (now.embedded ?? {}))) continue;
+        out.ahead.push(d);
+      } else if (element.version > doc.version) {
+        out.ahead.push(d);
+      } else {
+        out.rivals.push(d);
+      }
+    }
+    return out;
+  }
+
+  /** Whether views of `path` held anything its document never had (`recordedAhead`); only looks. */
+  holdsRecordedAhead(path: string, current: unknown, ydoc?: Y.Doc): boolean {
+    const { ahead, rivals } = this.recordedAhead(path, current, ydoc);
+    return ahead.length > 0 || rivals.length > 0;
+  }
+
+  /**
+   * What to read into the document for what views of `path` held that it
+   * never had (`recordedAhead`): `current` with it put in, and the base to
+   * read it against — the document itself, not a save, whose base can already
+   * hold the edit and hide it (NEC-238). Null when there is nothing. Each
+   * version is handed out once: read in, the document has it.
+   */
+  withRecordedAhead(path: string, current: unknown, ydoc?: Y.Doc): { value: unknown; base: unknown } | null {
+    const { ahead, rivals } = this.recordedAhead(path, current, ydoc);
+    if (ahead.length === 0 && rivals.length === 0) return null;
+    const now = current as ExcalidrawValue;
+    const put = new Map([...ahead, ...rivals].map((d) => [d.element.id, d.element]));
+    const madeOn = new Map(ahead.map((d) => [d.element.id, d.on]));
+    const rivalIds = new Set(rivals.map((d) => d.element.id));
+    const elements = now.elements.map((e) => put.get(e.id) ?? e);
+    const have = new Set(now.elements.map((e) => e.id));
+    for (const [id, e] of put) if (!have.has(id)) elements.push(e);
+    const base = now.elements
+      .filter((e) => !rivalIds.has(e.id))
+      .map((e) => (madeOn.has(e.id) && madeOn.get(e.id) !== `${e.version}:${e.versionNonce}` ? unverified(e) : e));
+    for (const d of [...ahead, ...rivals]) d.done = true;
+    // A delete read in is in the document now: its record is done with.
+    for (const d of [...ahead, ...rivals]) {
+      if (d.element.isDeleted === true && this.seen.get(path)?.get(d.element.id)?.version === d.element.version) this.drop(path, d.element.id);
+    }
+    log.debug('Open drawings held versions their document never had, which no save carried', {
+      path, ahead: ahead.slice(0, 5).map((d) => `${d.element.id}@${d.element.version} on ${d.on ?? 'none'}`), rivals: rivals.slice(0, 5).map((d) => `${d.element.id}@${d.element.version}`),
+    });
+    return { value: { ...now, elements }, base: { ...now, elements: base } };
+  }
+
+  /**
+   * The base a save of `path` may be read in against: `base` without the
+   * elements no view was seen to show, where the save supersedes them.
+   *
+   * `applyExcalidraw` removes a base version the save is newer than, as
+   * superseded by someone who saw it. That holds only if the save was built on
+   * it. A version an open view was seen to show, it may have been; one it
+   * never showed, it was not — the view built on what it held before, and the
+   * version is a remote edit it never saw. Marked `unverified` in the base,
+   * it is neither removed nor named as what the save's version was made on,
+   * both stand, and settle keeps the loser by its author: at worst a copy,
+   * never a loss. Its content stays, for judging what the save changed.
+   *
+   * Which view saved is not known, so a version counts as shown only when
+   * every view of the file open now showed it — two views of one drawing, one
+   * of which missed the write, are each a possible author — or, with none
+   * open, when any view of it did.
+   *
+   * Trusted as it is when no view of the file has been seen this session and
+   * the base is this session's own agreed text: the file is what we wrote, and
+   * whatever edited it read that. Not when it is the last session's record
+   * (`fromRecord`), which a view's save on close can have overtaken.
+   *
+   * A base element the save is older than, or has not moved past, is kept:
+   * stale-save refusal and the unchanged check need it.
+   */
+  verifiedBase(path: string, saved: unknown, base: unknown, fromRecord: boolean): unknown {
+    const save = saved as ExcalidrawValue;
+    const was = base as ExcalidrawValue;
+    if (!Array.isArray(save?.elements) || !Array.isArray(was?.elements)) return base;
+    this.watch();
+    for (const view of this.views()) if (view.file?.path === path) this.note(view);
+    const anyView = this.shownByPath.get(path);
+    if (!anyView && !fromRecord) return base;
+    // Shown by every view of the file open now, since any of them may have
+    // made the save; with none open, by any view that was.
+    const open = this.views().filter((v) => v.file?.path === path).map((v) => this.shownByView.get(v)?.get(path));
+    const wasShown = (id: string, pair: string): boolean => {
+      if (open.length > 0) return open.every((r) => r?.get(id)?.includes(pair) === true);
+      return anyView?.get(id)?.includes(pair) === true;
+    };
+    // A delete read back from before a restart says which version it was
+    // made on, and so which version a save holding that delete was built on:
+    // no view this session showed it, since the view that made it is gone.
+    // Taken as unverified, the shape the user deleted came back beside the
+    // delete as a kept copy (NEC-211, found by its e2e case: Excalidraw
+    // 2.28.1 wrote the delete into the file rather than leaving it out).
+    const restored = this.drawn.get(path);
+    const madeOn = (id: string, pair: string, saved: SceneElement): boolean => {
+      const d = restored?.get(id);
+      return d?.restored === true && d.on === pair && d.element.version === saved.version && d.element.versionNonce === saved.versionNonce;
+    };
+    const inSave = new Map(save.elements.map((e) => [e.id, e]));
+    const dropped: string[] = [];
+    const elements = was.elements.map((e) => {
+      const saved = inSave.get(e.id);
+      const version = saved?.version;
+      if (saved === undefined || version === undefined || version <= e.version) return e;
+      if (wasShown(e.id, `${e.version}:${e.versionNonce}`)) return e;
+      if (madeOn(e.id, `${e.version}:${e.versionNonce}`, saved)) return e;
+      dropped.push(`${e.id}@${e.version}:${e.versionNonce} shown ${open.length > 0 ? open.map((r) => (r?.get(e.id) ?? []).join(',')).join(' | ') : 'by no open view'}`);
+      return unverified(e);
+    });
+    if (dropped.length === 0) return base;
+    log.info('Read a save in against base versions no open view was seen to show, as built on none of them; settle keeps them if they lose', {
+      path, fromRecord, count: dropped.length, first: dropped.slice(0, 5),
+    });
+    return { ...was, elements };
+  }
+
+  /**
+   * Save every open view of `path` whose scene is ahead of `current`, the
+   * document: an element at a higher version than the document's standing
+   * one, or one the document lacks, deleted or not. Forced, since the view's
+   * own flag is what failed: a drawing edited while a save was in flight
+   * cleared it, said it had nothing to save, and the write that followed took
+   * the edit from under it (NEC-228, hardness seed 212003). Its save is then
+   * read in like any other.
+   */
+  async saveViewsAhead(path: string, current: unknown): Promise<void> {
+    const now = current as ExcalidrawValue;
+    if (!Array.isArray(now?.elements)) return;
+    const standing = new Map(now.elements.map((e) => [e.id, e]));
+    for (const view of this.views()) {
+      if (view.file?.path !== path) continue;
+      const scene = view.excalidrawAPI?.getSceneElementsIncludingDeleted() ?? [];
+      // Another drawing's scene under this path — a tab reused for this file,
+      // before its scene loads — shares no element with the document. Forced,
+      // its save would carry the old drawing in; and `isAnotherDrawing` says
+      // no when every shape here is deleted, so ask the ids directly (found in
+      // review). A document with no element yet cannot tell, and is saved.
+      if (standing.size > 0 && scene.length > 0 && !scene.some((e) => standing.has(e.id))) continue;
+      // Higher than the document's, and not forced before. Not a rival of the
+      // same number: that is usually a loser the view has not reloaded, and
+      // forced, it was put back as a new write on every write after — a copy,
+      // a copy of the copy, and a view that never showed the winner (the e2e
+      // soak, 11 runs in 20, PR #266). And once per version, so that a view
+      // that never reloads cannot be saved for ever.
+      const forced = this.forced.get(path) ?? new Set<string>();
+      const ahead = scene.filter((e) => {
+        if (forced.has(`${e.id}@${e.version}:${e.versionNonce}`)) return false;
+        const doc = standing.get(e.id);
+        if (doc === undefined) return e.isDeleted !== true;
+        return e.version > doc.version;
+      });
+      if (ahead.length === 0) continue;
+      for (const e of ahead) forced.add(`${e.id}@${e.version}:${e.versionNonce}`);
+      this.forced.set(path, forced);
+      log.info('An open drawing holds versions its document lacks; saving it before the write, whatever it says of unsaved work', {
+        path, count: ahead.length, first: ahead.slice(0, 5).map((e) => `${e.id}@${e.version}`), dirty: view.isDirty?.(),
+      });
+      await view.save(true, true);
+    }
+  }
+
+  /**
+   * The base a view's save of `path` is read in against, when every open view
+   * of it showed what our write `written` brought that `prior` — what the
+   * views held before it — lacked: the write's elements, and `prior` for the
+   * rest. Null when it cannot tell, and the guard's base, `prior`, stands.
+   *
+   * `TextViewGuard` asks a view's `data` instead, which a drawing's view does
+   * not update when it reloads its scene, so for a few seconds after every
+   * write it took a view that had reloaded for one that had not, and its save
+   * was read in against the text before the write: the remote version the
+   * write brought was then superseded by nobody, and its author kept a copy of
+   * an edit the user had seen and drawn over (NEC-226, found by NEC-212's e2e
+   * case).
+   *
+   * Only elements can be seen in a scene, so only they are taken from the
+   * write. If the writes since `prior` also changed the note above the
+   * drawing, its settings, its files or the scene, nothing here says the view
+   * loaded those, and reading its save against the write's would revert
+   * them, for every vault, with no copy kept: two writes inside the guard's
+   * window, the first drawn and the second missed, did exactly that (found in
+   * review). Against `prior`'s, the save changed nothing there, and the write
+   * stands. This used to refuse outright instead, and so refused nearly every
+   * write between two Excalidraw releases: the newer one fills in grid
+   * settings the older one's file lacks, and the copy that cost was kept of
+   * an edit drawn over in plain sight (NEC-231).
+   */
+  loadedBase(path: string, written: unknown, prior: unknown): unknown {
+    const now = written as ExcalidrawValue;
+    const before = prior as ExcalidrawValue;
+    if (!Array.isArray(now?.elements) || !Array.isArray(before?.elements)) return null;
+    // Each "no" says why in the log: which of these decided it is what tells
+    // a view that missed the write from one this check misjudged (NEC-231).
+    const no = (why: string, more: Record<string, unknown> = {}): null => {
+      log.debug('Could not tell that the open drawing showed the last write', { path, why, ...more });
+      return null;
+    };
+    const had = new Set(before.elements.map((e) => `${e.id}@${e.version}:${e.versionNonce}`));
+    // Live ones only: a view drops a deleted element from its scene as it loads.
+    const brought = now.elements.filter((e) => e.isDeleted !== true && !had.has(`${e.id}@${e.version}:${e.versionNonce}`));
+    if (brought.length === 0) return no('the writes brought no element version');
+    this.watch();
+    const views = this.views().filter((v) => v.file?.path === path);
+    if (views.length === 0) return no('no view of it is open');
+    for (const view of views) this.note(view);
+    const unseen: string[] = [];
+    for (const v of views) {
+      const shown = this.shownByView.get(v)?.get(path);
+      for (const e of brought) {
+        if (shown?.get(e.id)?.includes(`${e.version}:${e.versionNonce}`) !== true) {
+          unseen.push(`${e.id}@${e.version}:${e.versionNonce} shown ${(shown?.get(e.id) ?? []).join(',') || 'none'}`);
+        }
+      }
+    }
+    if (unseen.length > 0) return no('a view was not seen to show a version the writes brought', { views: views.length, first: unseen.slice(0, 5) });
+    if (!excalidrawCodec.equal({ ...now, elements: [] }, { ...before, elements: [] })) {
+      log.debug('The writes the open drawing showed changed more than elements; those are read against what it held', {
+        path, differ: differing(now, before),
+      });
+    }
+    return { ...before, elements: now.elements };
+  }
+
   dispose(): void {
+    // What changed since the last write is written before the record is let
+    // go, not cleared with it: an unload is how a quit reaches here.
+    if (this.loaded && this.dirty) this.flush();
+    this.disposed = true;
     if (this.retry !== null) window.clearTimeout(this.retry);
     this.retry = null;
     for (const w of this.watching.values()) {
@@ -906,7 +1852,35 @@ export class DeleteWitness {
     }
     this.watching.clear();
     this.seen.clear();
+    this.restoredIds.clear();
+    this.shownByView = new WeakMap();
+    this.historyByView = new WeakMap();
+    this.shownByPath.clear();
+    this.forced.clear();
+    this.heldByView.clear();
+    this.closedHeld.clear();
+    this.drawn.clear();
+    this.showing.clear();
   }
+}
+
+/**
+ * Where two drawings differ outside their elements, down to a key inside each
+ * part, `appState` above all, whose keys are as much a release's defaults as
+ * anyone's edit: for the log.
+ */
+function differing(now: ExcalidrawValue, before: ExcalidrawValue): string[] {
+  const keys = (a: unknown, b: unknown, at: string): string[] => {
+    if (canonical(a) === canonical(b)) return [];
+    const objs = a !== null && b !== null && typeof a === 'object' && typeof b === 'object' && !Array.isArray(a) && !Array.isArray(b);
+    if (!objs || at.includes('.')) return [`${at}: ${b === undefined ? 'absent' : canonical(b)} before, ${a === undefined ? 'absent' : canonical(a)} written`];
+    const x = a as Record<string, unknown>;
+    const y = b as Record<string, unknown>;
+    return Object.keys({ ...x, ...y }).flatMap((k) => keys(x[k], y[k], `${at}.${k}`));
+  };
+  const x = now as unknown as Record<string, unknown>;
+  const y = before as unknown as Record<string, unknown>;
+  return Object.keys({ ...x, ...y }).filter((k) => k !== 'elements').flatMap((k) => keys(x[k], y[k], k));
 }
 
 /**
@@ -937,13 +1911,16 @@ export interface ExcalidrawLiveManagerDeps extends ExcalidrawLiveDeps {
   witness?: DeleteWitness;
 }
 
+/** How long an open drawing waits to be bound before the log says it still is. */
+const STILL_WAITING_MS = 5000;
+
 /** Binds every open drawing it can, and lets go of the rest. */
 export class ExcalidrawLiveManager {
   private bindings = new Map<ExcalidrawViewLike, ExcalidrawLiveBinding>();
   private brokenViews = new WeakMap<ExcalidrawViewLike, string>();
   private pending = new Set<ExcalidrawViewLike>();
   /** Views tried and not bound yet: since when, how often, and the last reason logged. */
-  private waiting = new WeakMap<ExcalidrawViewLike, { since: number; attempts: number; last: string }>();
+  private waiting = new WeakMap<ExcalidrawViewLike, { path: string; since: number; attempts: number; last: string; told?: boolean }>();
   private retry: number | null = null;
   private notified = false;
   private disposed = false;
@@ -964,8 +1941,8 @@ export class ExcalidrawLiveManager {
   private ownWitness: DeleteWitness | null = null;
 
   /** For StructuredSync's read-in of a save: see DeleteWitness. */
-  withViewDeletes(path: string, saved: unknown, current: unknown): unknown {
-    return this.witness.withViewDeletes(path, saved, current);
+  withViewDeletes(path: string, saved: unknown, current: unknown, settled = true): unknown {
+    return this.witness.withViewDeletes(path, saved, current, settled);
   }
 
   bindingFor(view: unknown): ExcalidrawLiveBinding | null {
@@ -1013,7 +1990,11 @@ export class ExcalidrawLiveManager {
         this.fellBack(p, reason);
       },
     });
-    const wait = this.waiting.get(view) ?? { since: Date.now(), attempts: 0, last: '' };
+    // Keyed by view, and a view is reused when its tab opens another drawing:
+    // a wait for another path is a new wait, or the new drawing would inherit
+    // the old one's time and its "still not bound" line.
+    const prior = this.waiting.get(view);
+    const wait = prior?.path === path ? prior : { path, since: Date.now(), attempts: 0, last: '' };
     this.waiting.set(view, wait);
     wait.attempts++;
     try {
@@ -1028,13 +2009,27 @@ export class ExcalidrawLiveManager {
           wait.last = line;
           log.debug('An open drawing is not bound live yet', { path, why: why.why, ...why.detail });
         }
+        // The line above is once per reason, so a view refused for the same
+        // reason for good — one whose Excalidraw never finished loading, say —
+        // went silent after its first attempt, and its log read as though the
+        // manager had stopped trying (NEC-244). Once per wait, say it is still
+        // waiting.
+        const waited = Date.now() - wait.since;
+        if (!wait.told && waited >= STILL_WAITING_MS) {
+          wait.told = true;
+          log.info('An open drawing is still not bound live', {
+            path, ms: waited, attempts: wait.attempts, lastRefusal: wait.last,
+          });
+        }
       }
       if (result === 'bound') {
+        // The wait ends here either way: bound, or let go because sync was
+        // turned off or the manager went meanwhile.
+        this.waiting.delete(view);
         if (this.disposed || this.bindings.has(view) || !this.deps.enabled()) {
           binding.detach();
           return;
         }
-        this.waiting.delete(view);
         if (wait.attempts > 1) {
           log.info('Bound an open drawing live after waiting', {
             path, ms: Date.now() - wait.since, attempts: wait.attempts, lastRefusal: wait.last,

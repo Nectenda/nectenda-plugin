@@ -165,7 +165,10 @@ function isEditable(el: unknown): boolean {
  * data is a load in progress, never a file someone emptied.
  */
 export class TextViewGuard implements StructuredSurface {
-  /** What each path's views held just before our last write. */
+  /**
+   * What each path's views held just before our last write: text read in,
+   * never a save not read in yet, which is the base that save is read against.
+   */
   private held = new Map<string, string>();
   /** Paths being repaired: the text their views held, for the repair's save. */
   private repairing = new Map<string, string>();
@@ -233,8 +236,31 @@ export class TextViewGuard implements StructuredSurface {
 
   async beforeWrite(localPath: string): Promise<void> {
     const views = this.viewsOf(localPath);
-    if (views.length > 0) log.debug('Asking open views to save before a write', { path: localPath, views: views.length });
+    // Said even when there are none: a write that found no open view with the
+    // file loaded used to leave no line at all, so the log could not show it
+    // (NEC-216).
+    log.debug('Asking open views to save before a write', { path: localPath, views: views.length });
+    // Every view holds the last write: it loaded it after the quick check and
+    // before this one. What they held is that write, as the quick check would
+    // have said; kept as the base it was before, a save of theirs built on it
+    // read its changes as edits, and reverted whatever this write brings
+    // (found in review).
+    const pending = this.written.get(localPath);
+    if (pending !== undefined && views.length > 0 && views.every((v) => v.data === pending)) {
+      this.written.delete(localPath);
+      this.held.set(localPath, pending);
+      const timer = this.timers.get(localPath);
+      if (timer) window.clearTimeout(timer);
+      this.timers.delete(localPath);
+    }
     for (const v of views) await v.save();
+    // While an earlier write's check is pending, what the views held is the
+    // base a save of theirs is read in against — and what they hold now may be
+    // a save not read in yet, this one or one forced before it. Taken as the
+    // base, that save diffed to nothing against itself, and a shape it added
+    // never reached the document (NEC-238, hardness seed 235003; canvas lost a
+    // node move the same way). It is moved on by `ingested`, once read in.
+    if (this.written.has(localPath)) return;
     const after = this.viewsOf(localPath)[0]?.data;
     if (typeof after === 'string') this.held.set(localPath, after);
     else this.held.delete(localPath);

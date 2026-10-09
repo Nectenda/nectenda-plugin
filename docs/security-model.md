@@ -253,17 +253,17 @@ marketing.
   `packages/shared/src/scrub.ts`, and it is tested by planting a forbidden
   string and confirming it does not arrive. If readable content ever appeared
   in a report, that would be an incident, not a policy question.
-- **Usage metrics, which we keep internally.** To see how the service is
-  used, we copy some of the metadata listed above to a machine of our own and
-  keep its history there: sign-up and sign-in method, how far each sign-in
-  got (including ones abandoned before an address was typed), organisation and folder
-  membership, device platforms and last-seen days, per-folder update counts,
-  attachment counts and usage totals. People appear there under a random
-  identifier, not their email or name. None of it touches content, paths,
-  folder names or keys, because the server has none of those to give. It is
-  read through a read-only credential that cannot change anything. The
-  server keeps nothing extra for it: every figure is one this list already
-  says the server has.
+- **Usage metrics.** To see how the service is
+  used, we analyse some of the metadata listed above: sign-up and sign-in
+  method, how far each sign-in got (including ones abandoned before an address
+  was typed), organisation and folder membership, device platforms and
+  last-seen days, when devices were added and how many vaults sync, passphrase
+  changes and recovery attempts, when sessions began and ended, per-folder
+  update counts, attachment counts, billing event types and usage totals. None
+  of it touches content, paths, folder names or keys, because the server has
+  none of those to give. It is read through a read-only credential that cannot
+  change anything. We don't store any data that is purely for tracking - all
+  data that is in the system exists as part of a feature of our product.
 - **Error reports from the plugin**, when you are signed in to the hosted
   service and have not turned them off. This is the one thing on this list the
   client sends about itself, so it is worth being exact.

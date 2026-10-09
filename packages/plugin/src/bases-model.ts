@@ -1,6 +1,6 @@
 import type * as Y from 'yjs';
 import {
-  applyOrder, applyWholeValues, bury, buried, byOrderKey, clearTombstones, normaliseJson, recordKey, same, SEP,
+  applyOrder, applyWholeValues, bury, buried, byOrderKey, canonical, clearTombstones, normaliseJson, recordKey, same, SEP,
   tombstonesByRecord,
 } from './structured-records';
 
@@ -23,12 +23,19 @@ import {
  * - `propFields`: `property id \0 field` → value (`displayName`, and anything
  *   else a property carries).
  * - `viewFields`: `view name \0 field` → value, for every view key except its
- *   `name` (the key), `order`, `sort` and `columnSize`. `order` and `sort` are
- *   held here as `true` while the list exists, so an empty list is kept apart
- *   from no list — Obsidian writes them differently.
- * - `lists`, `listOrder`: a view's `order` (columns) and `sort` as ordered
- *   sets, `view \0 order|sort \0 item` → the item, and → a fractional key. Two
- *   people adding, removing or moving different columns all keep their change.
+ *   `name` (the key), `order`, `sort`, `groupOrder` and `columnSize`. The three
+ *   lists are held here as `true` while the list exists, so an empty list is
+ *   kept apart from no list — Obsidian writes them differently, and to 1.14 an
+ *   empty `groupOrder` is a board sorted by hand with no lanes yet. A
+ *   document a build before 1.14's lanes wrote holds `groupOrder` here whole,
+ *   as the unknown key it was then. It is read as the list, but an edit here
+ *   does not convert it, so such a document can lose a lane edit: a known gap,
+ *   left while no one depends on those builds.
+ * - `lists`, `listOrder`: a view's `order` (columns), `sort` and `groupOrder`
+ *   (lanes, or groups sorted by hand) as ordered sets,
+ *   `view \0 order|sort|groupOrder \0 item` → the item, and → a fractional key.
+ *   Two people adding, removing or moving different columns or lanes all keep
+ *   their change.
  * - `viewOrder`: view name → fractional key. The first view opens by default.
  * - `widths`: view name → `columnSize`, as the document was first filled.
  *   Only a vault with no widths of its own for a view ever writes these
@@ -74,11 +81,13 @@ export interface BasesView {
   /**
    * Every other key of the view Obsidian keeps, in its normal form — `filters`,
    * `groupBy`, `limit`, `summaries`, layout options, unknown keys — except
-   * `order`, `sort` and `columnSize`.
+   * `order`, `sort`, `groupOrder` and `columnSize`.
    */
   fields: Record<string, unknown>;
   order?: string[];
   sort?: SortEntry[];
+  /** Lanes, each as Obsidian stored its group's value: text, a link, a number, null, a list. */
+  groupOrder?: unknown[];
   /** This vault's column widths, or the document's first ones (SAFE-A21). */
   columnSize?: unknown;
 }
@@ -94,12 +103,18 @@ export interface BasesValue {
 }
 
 type Rec = Record<string, unknown>;
-type ListField = 'order' | 'sort';
-const LIST_FIELDS: ListField[] = ['order', 'sort'];
+type ListField = 'order' | 'sort' | 'groupOrder';
+const LIST_FIELDS: ListField[] = ['order', 'sort', 'groupOrder'];
 
-/** The id of a list item: a column's property id, or the property a sort entry sorts by. */
+/**
+ * The id of a list item: a column's property id, the property a sort entry
+ * sorts by, or a lane's value as canonical JSON — a lane may be null, a
+ * number or a list, and `"1"` and `1` are two lanes to Obsidian.
+ */
 function itemId(field: ListField, item: unknown): string {
-  return field === 'order' ? (item as string) : (item as SortEntry).property;
+  if (field === 'order') return item as string;
+  if (field === 'sort') return (item as SortEntry).property;
+  return canonical(item);
 }
 
 const listKey = (view: string, field: ListField, id: string): string => `${view}${SEP}${field}${SEP}${id}`;
@@ -144,7 +159,8 @@ function viewContent(fields: Rec, lists: Partial<Record<ListField, unknown[]>>):
   for (const f of LIST_FIELDS) {
     const items = lists[f] ?? [];
     if (out[f] === true || items.length > 0) out[f] = items;
-    else delete out[f];
+    // Anything else is a whole groupOrder an earlier build stored as an unknown key.
+    else if (out[f] === undefined) delete out[f];
   }
   return out;
 }
@@ -189,6 +205,7 @@ export function readBases(ydoc: Y.Doc): BasesValue {
   const views = liveRecords(ydoc, ROOT_VIEWS, 'v', (name, fields) => viewContent(fields, {
     order: readList(ydoc, name, 'order'),
     sort: readList(ydoc, name, 'sort'),
+    groupOrder: readList(ydoc, name, 'groupOrder'),
   }));
   const widths = ydoc.getMap<unknown>(ROOT_WIDTHS);
   const names = [...views.keys()].sort(byOrderKey(ydoc.getMap<unknown>(ROOT_VIEW_ORDER)));
@@ -202,10 +219,12 @@ export function readBases(ydoc: Y.Doc): BasesValue {
 }
 
 function toView(name: string, content: Rec, columnSize: unknown): BasesView {
-  const { type, order, sort, ...fields } = content;
+  const { type, order, sort, groupOrder, ...fields } = content;
   const view: BasesView = { type: typeof type === 'string' ? type : '', name, fields };
   if (Array.isArray(order)) view.order = order as string[];
   if (Array.isArray(sort)) view.sort = sort as SortEntry[];
+  if (Array.isArray(groupOrder)) view.groupOrder = groupOrder;
+  else if (groupOrder !== undefined) fields.groupOrder = groupOrder;
   if (columnSize !== undefined) view.columnSize = columnSize;
   return view;
 }
@@ -217,6 +236,7 @@ function viewRecord(v: BasesView): Rec {
   const rec: Rec = { type: v.type, ...v.fields };
   if (v.order) rec.order = true;
   if (v.sort) rec.sort = true;
+  if (v.groupOrder) rec.groupOrder = true;
   return rec;
 }
 
@@ -303,7 +323,7 @@ function topWithMarker(v: BasesValue): Rec {
 
 /** A view's lists, keyed for diffing. */
 function listItems(v: BasesView | undefined, field: ListField): Map<string, unknown> {
-  const list = (v?.[field] ?? []) as unknown[];
+  const list: unknown[] = v?.[field] ?? [];
   return new Map(list.map((item) => [itemId(field, item), item]));
 }
 
@@ -376,7 +396,7 @@ export function applyBases(ydoc: Y.Doc, input: BasesValue, baseInput: BasesValue
     new Map(showing.views.map((v) => [v.name, viewRecord(v)])),
     (name) => {
       const b = baseViews?.get(name) as BasesView;
-      return viewContent(viewRecord(b), { order: b.order, sort: b.sort });
+      return viewContent(viewRecord(b), { order: b.order, sort: b.sort, groupOrder: b.groupOrder });
     },
   );
   for (const [name, v] of nextViews) applyLists(ydoc, v, baseViews?.get(name), exact.has(name));

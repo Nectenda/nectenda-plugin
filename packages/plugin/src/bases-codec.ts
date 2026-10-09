@@ -12,7 +12,9 @@ import { canonical, normaliseJson, SEP } from './structured-records';
  * Everything here mirrors Obsidian's own reading and writing of the file, read
  * from 1.13.7's `app.js`: `cQ.parse` and `getSerializable` for the file,
  * `dQ` and `lQ.serialize` for a view, `iQ` for a property, `uQ` for a filter,
- * `pQ`/`hQ` for property ids, and `yL`/`bL` for the YAML. Obsidian rewrites a
+ * `pQ`/`hQ` for property ids, and `yL`/`bL` for the YAML. Re-read against
+ * 1.14.4, where the one change is a view's `groupOrder` (`g$`, `h$.serialize`):
+ * the lanes of a kanban, or the groups of any view sorted by hand. Obsidian rewrites a
  * base into its own normal form whenever its view saves; reading every file
  * into that same form means its normalising save is never mistaken for an
  * edit (SAFE-A15), and writing that form means an open base that reloads our
@@ -23,8 +25,11 @@ import { canonical, normaliseJson, SEP } from './structured-records';
  * - Keys Obsidian keeps in insertion order (formulas, properties, unknown
  *   keys, a view's options) are written sorted: the document does not keep
  *   their order, and none of them carries meaning by position.
- * - A view's `order` and `sort` keep the first of any repeated entry: the
- *   document holds them as sets keyed by property.
+ * - A view's `order`, `sort` and `groupOrder` keep the first of any repeated
+ *   entry: the document holds them as sets keyed by item.
+ * - A `groupOrder` with no `groupBy` is kept. 1.14 drops it on load and 1.13.7
+ *   keeps it as an unknown key; a key one of them still writes is not ours to
+ *   discard. One that is not a list is refused (SAFE-A13).
  * - A file with no views is left with none. Obsidian adds a default view on
  *   load, named in the user's language, and writes it on its next save; that
  *   save arrives here as an ordinary edit.
@@ -34,26 +39,36 @@ import { canonical, normaliseJson, SEP } from './structured-records';
  */
 
 /** The Obsidian version this codec was read against. See canvas-codec.ts. */
-export const OBSIDIAN_BASES_READ_AGAINST = '1.13.7';
+export const OBSIDIAN_BASES_READ_AGAINST = '1.14.4';
 
 /** Keys of the file Obsidian reads itself; everything else it keeps verbatim. */
 const KNOWN_TOP = new Set(['views', 'filters', 'display', 'properties', 'formulas', 'newItemFolder', 'newItemTemplate']);
-/** Keys of a view Obsidian reads itself, in the order it writes them. */
-const VIEW_LEAD = ['type', 'name', 'filters', 'groupBy', 'order', 'sort', 'limit', 'summaries'];
+/**
+ * Keys of a view Obsidian reads itself, in the order it writes them. 1.13.7
+ * does not read `groupOrder` and writes it among the options; 1.14 writes it
+ * here, and the newer one is the order an open view settles on.
+ */
+const VIEW_LEAD = ['type', 'name', 'filters', 'groupBy', 'groupOrder', 'order', 'sort', 'limit', 'summaries'];
 /** View keys `lQ.serialize` never writes: its own fields shadow them. */
 const VIEW_DROPPED = new Set(['query', 'data']);
 
 /**
  * View keys that are presentation only (SAFE-A22): two people setting one at
  * once converge on one value without a conflict copy. Layout options of the
- * table (`rowHeight`), cards (`cardSize`, `image*`) and list (`markers`,
- * `indentProperties`, `separator`) views, the sort, the row limit, and which
- * columns show in what order. Filters, grouping, summaries, the layout itself
- * and every key this build does not know are not.
+ * table (`rowHeight`), cards and kanban (`cardSize`, `columnWidth`, `image*`)
+ * and list (`markers`, `indentProperties`, `separator`) views, the sort, the
+ * row limit, and which columns show in what order. Filters, grouping,
+ * summaries, the layout itself and every key this build does not know are not.
+ *
+ * Nor is `groupOrder`. It reads like an order, but it is also which lanes
+ * exist: a lane listed with no cards still shows, and a card whose value is
+ * not listed does not. Its lanes merge one by one in `lists`, as columns do,
+ * so a lane one person adds survives another moving the rest; only the flag
+ * that it exists lives here, and that flag is not quiet.
  */
 const PRESENTATION_FIELDS = new Set([
   'order', 'sort', 'limit',
-  'rowHeight', 'cardSize', 'image', 'imageFit', 'imageAspectRatio',
+  'rowHeight', 'cardSize', 'columnWidth', 'image', 'imageFit', 'imageAspectRatio',
   'markers', 'indentProperties', 'separator',
 ]);
 /** Whole roots that are presentation only: column and sort lists, view order, first widths. */
@@ -179,6 +194,25 @@ function toView(raw: unknown, index: number): BasesView {
         }
         break;
       }
+      case 'groupOrder': {
+        // Neither Obsidian writes one that is not a list: 1.14 ignores it, and
+        // 1.13.7 keeps it as an unknown key. Held whole it would share its key
+        // with the model's lanes, and a lane added elsewhere would replace it
+        // with no copy, so it is refused rather than guessed at (SAFE-A13).
+        if (!Array.isArray(v)) throw new Refused(`the groupOrder of view "${name}" is not a list`);
+        // A lane is whatever Obsidian stored for its group (`R$`): text, a
+        // link, a number, a boolean, null for "no value", or a list. Two
+        // spellings are two lanes, as they are to Obsidian.
+        const seen = new Set<string>();
+        view.groupOrder = [];
+        for (const lane of v) {
+          const id = canonical(lane);
+          if (seen.has(id)) continue;
+          seen.add(id);
+          view.groupOrder.push(lane);
+        }
+        break;
+      }
       case 'limit':
         if (typeof v === 'number' && v > 0) view.fields.limit = v;
         break;
@@ -267,6 +301,7 @@ const sortedKeys = (o: Record<string, unknown>): string[] => Object.keys(o).sort
 /** `lQ.serialize`: a view in Obsidian's key order, options after. */
 function writeView(v: BasesView): Record<string, unknown> {
   const all: Record<string, unknown> = { ...v.fields, type: v.type, name: v.name };
+  if (v.groupOrder) all.groupOrder = v.groupOrder;
   if (v.order) all.order = v.order;
   if (v.sort) all.sort = v.sort;
   if (v.columnSize !== undefined) all.columnSize = v.columnSize;

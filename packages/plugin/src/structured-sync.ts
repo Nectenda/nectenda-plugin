@@ -17,6 +17,8 @@ import { log } from './logger';
 const WRITE_DEBOUNCE = 500;
 const WRITE_RETRY_DELAY = 400;
 const MAX_WRITE_RETRIES = 5;
+/** How long a connect waits for `ready` (what is remembered across a restart) before going on without it. */
+const READY_WAIT_MS = 10_000;
 /** Origin of every transaction this class makes from disk. */
 const LOCAL_ORIGIN = 'structured-local';
 /** The origin MultiplexedProvider applies server updates under. */
@@ -182,6 +184,12 @@ export interface StructuredDocState {
    */
   agreedAtConnect?: string | null;
   /**
+   * `lastSyncedText` is an earlier session's record, not a text this session
+   * wrote or read: a view's save on close can have overtaken it, so nothing
+   * in it is known to be what a save was built on (see `verifyBase`).
+   */
+  baseFromRecord?: boolean;
+  /**
    * Per client id of ours, the clock up to which our entries are known to be on
    * the server. See `noteAcknowledged` and `lostUnseen`.
    */
@@ -192,6 +200,8 @@ export interface StructuredDocState {
   keeping: Promise<void>;
   /** The last save kept aside as another file's content (see `keepForeign`). */
   foreignKept?: string;
+  /** The last save kept for what it held of a closed view's (`keepPassedOver`). */
+  passedOverKept?: string;
   /** Why this client refuses to touch the file, or null. See `handOffReason`. */
   handedOff: string | null;
   /** So an unreadable file is announced once, not on every save. */
@@ -268,7 +278,13 @@ export interface BoundView {
    * than keeping a history of what its view held (excalidraw-live.ts): it is
    * then the one writer of the file's content while bound.
    */
-  readInSave?: (value: unknown) => void;
+  readInSave?: (value: unknown) => { passedOver: string[]; keep?: boolean } | void;
+  /**
+   * The document is being torn down — the file deleted remotely, its folder
+   * gone, sync stopped. Let go: a binding left holding a destroyed document
+   * stays "bound", so nothing ever binds the view again.
+   */
+  letGo?: () => void;
 }
 
 /** How `bindView` went. Anything but `bound` leaves the file on the disk path. */
@@ -306,7 +322,57 @@ export interface StructuredSyncDeps {
    * holds them — never inferred from what a save lacks, since a view that
    * never loaded an element lacks it too. `current` is the document now.
    */
-  withViewDeletes?(localPath: string, saved: unknown, current: unknown): unknown;
+  withViewDeletes?(localPath: string, saved: unknown, current: unknown, settled?: boolean): unknown;
+  /**
+   * Resolves once what the deps above remember across a restart has been
+   * read back. Awaited before any file connects: the first write of a connect
+   * reads the file in, and a drawing's delete it did not know of yet was put
+   * back (NEC-211).
+   */
+  ready?(): Promise<void>;
+  /**
+   * The base a save may be read in against, without what no open view of the
+   * file was seen to show. A version in the base is removed as superseded by
+   * the save's newer one, which is true only if the save was built on it; a
+   * view whose scene missed our write built on what it held before (NEC-212).
+   * `fromRecord`: the base is an earlier session's record, not this session's.
+   */
+  verifyBase?(localPath: string, saved: unknown, base: unknown, fromRecord: boolean): unknown;
+  /**
+   * The base for a view's save when the open views of the file are known to
+   * have loaded what `written`, our last write, brought that `prior` — what
+   * they held before it — lacked: the parts of `written` they were seen to
+   * show, and `prior` for the rest. Null when that cannot be seen. The
+   * surface's base for a view's save assumes they did not load it; a
+   * drawing's view, which says nothing of its scene in its `data`, can be
+   * seen this way instead (NEC-226, NEC-231).
+   */
+  loadedBase?(localPath: string, written: unknown, prior: unknown): unknown;
+  /**
+   * The base for a save, with the parts a view of the file held as it closed
+   * taken as unchanged where the save holds them and the base does not: what
+   * a closing view saved on its way out, built on what it showed before a
+   * remote change (NEC-235). Names the parts it passed over, and `keep` when
+   * the save is to be kept in .nectenda-backups: once per closed view, and
+   * not for a save that only lacks links.
+   */
+  restBase?(localPath: string, saved: unknown, base: unknown): { base: unknown; passedOver: string[]; keep?: boolean };
+  /**
+   * Make every open view of the file whose scene holds something `current` —
+   * the document — does not save, whatever the view says of its unsaved work.
+   * Before every write, ahead of the surface's own ask (NEC-228).
+   */
+  saveViewsAhead?(localPath: string, current: unknown): Promise<void>;
+  /**
+   * What open views of the file were seen to hold that the document, `ydoc`,
+   * never had and no save carried — kept past the view, which may have
+   * switched file, closed or been rebuilt since: `current` with it put in, and
+   * the base to read that against. Null when there is none. Read in before
+   * every write (NEC-236).
+   */
+  withRecordedAhead?(localPath: string, current: unknown, ydoc: Y.Doc): { value: unknown; base: unknown } | null;
+  /** Whether there is anything for `withRecordedAhead`; only looks. */
+  holdsRecordedAhead?(localPath: string, current: unknown, ydoc: Y.Doc): boolean;
 }
 
 /**
@@ -332,6 +398,8 @@ export class StructuredSync {
   private vault: VaultAdapter;
   private docs: Map<string, StructuredDocState> = new Map();
   private connecting: Set<string> = new Set();
+  /** Set by `stop`. */
+  private stopped = false;
   private unplaced: Map<string, {
     sharedFolderId: string; folderLocalPath: string; relativePath: string; format?: string; fill: boolean;
   }> = new Map();
@@ -406,6 +474,29 @@ export class StructuredSync {
     gate: string,
     options: ConnectOptions,
   ): Promise<void> {
+    if (this.deps.ready) {
+      // Not for ever: IndexedDB that never answers would hold every
+      // structured file unconnected, which is worse than what the record
+      // prevents (a delete come back, visibly).
+      let timer: number | null = null;
+      try {
+        const late = await Promise.race([
+          this.deps.ready().then(() => false),
+          new Promise<boolean>((resolve) => {
+            timer = window.setTimeout(() => resolve(true), READY_WAIT_MS);
+          }),
+        ]);
+        if (late) log.warn('What structured files remember across a restart was not read in time; connecting without it', { relativePath, waitedMs: READY_WAIT_MS });
+      } catch (err) {
+        log.warn('What structured files remember across a restart could not be read; connecting without it', { relativePath, error: String(err) });
+      } finally {
+        if (timer !== null) window.clearTimeout(timer);
+      }
+    }
+    if (this.stopped) {
+      this.connecting.delete(gate);
+      return;
+    }
     let docName: string;
     try {
       docName = await this.deps.docIndex.ref(sharedFolderId, relativePath);
@@ -694,6 +785,7 @@ export class StructuredSync {
    */
   private agree(state: StructuredDocState, text: string): void {
     state.lastSyncedText = text;
+    state.baseFromRecord = false;
     void Promise.resolve(state.idbProvider.set(AGREED_KEY, text)).catch((err: unknown) => {
       log.warn('Could not record what a structured file agreed on with its document', {
         path: state.localPath, error: String(err),
@@ -719,7 +811,9 @@ export class StructuredSync {
    * Let the codec settle what concurrent edits left behind (SAFE-A27): for
    * Excalidraw, two versions of one element, one of them this vault's that
    * lost. Only this vault's own entries are its to decide — `isOurs` — so each
-   * losing version is kept, or converged, by its author alone.
+   * losing version is kept, or converged, by its author alone. A take-over
+   * fill's version has no author among the vaults, and the codec decides it in
+   * whichever vault meets it (SAFE-A27, SAFE-A28).
    */
   private settle(state: StructuredDocState): void {
     // Inside Yjs's own transaction cleanup: a throw there would break it, so
@@ -752,15 +846,31 @@ export class StructuredSync {
         path: state.localPath, id: c.id, why: c.why, lost: c.lost,
       });
     }
-    const kept = done.kept ?? [];
-    if (kept.length === 0) return;
-    log.warn('A concurrent change won over edits made here; kept them in the drawing', {
-      path: state.localPath, kept,
-    });
-    this.deps.notify(
-      `Nectenda: "${state.relativePath}" was changed in two places at once. ` +
-      `Your version of ${kept.length === 1 ? 'one shape was' : `${kept.length} shapes were`} kept beside the original, labelled "Kept by Nectenda".`,
-    );
+    const all = done.kept ?? [];
+    if (all.length === 0) return;
+    // A fill's version was nobody's here: the drawing as text sync had it,
+    // before it was taken over. Not "your version", which it may never have been.
+    const kept = all.filter((k) => k.fill !== true);
+    const filled = all.filter((k) => k.fill === true);
+    const shapes = (n: number): string => (n === 1 ? 'one shape was' : `${n} shapes were`);
+    if (kept.length > 0) {
+      log.warn('A concurrent change won over edits made here; kept them in the drawing', {
+        path: state.localPath, kept,
+      });
+      this.deps.notify(
+        `Nectenda: "${state.relativePath}" was changed in two places at once. ` +
+        `Your version of ${shapes(kept.length)} kept beside the original, labelled "Kept by Nectenda".`,
+      );
+    }
+    if (filled.length > 0) {
+      log.warn('A change won over the version a drawing had before it was taken over from text; kept it in the drawing', {
+        path: state.localPath, kept: filled,
+      });
+      this.deps.notify(
+        `Nectenda: "${state.relativePath}" was changed in two places at once. ` +
+        `The version from before live sync of ${shapes(filled.length)} kept beside the original, labelled "Kept by Nectenda".`,
+      );
+    }
   }
 
   /**
@@ -999,7 +1109,13 @@ export class StructuredSync {
     // the file when it is what filled the document, and otherwise nothing
     // until the record below says what it is. With nothing, the first write
     // keeps the file aside (SAFE-A2) and a view waits to bind.
-    state.lastSyncedText = source === disk ? disk : null;
+    // Recorded, not only held: the first write after a fill normally records
+    // it, but a view that binds the file at once and never saves means no
+    // write ever does, and after a restart the file was kept aside as if it
+    // might be newer (NEC-241, found in the NEC-211 e2e run).
+    if (source === disk) this.agree(state, disk);
+    else state.lastSyncedText = null;
+    state.baseFromRecord = false;
     log.debug('Filled a structured document from text', {
       path: state.localPath, from: source === merged ? 'merged text' : 'file',
     });
@@ -1012,13 +1128,15 @@ export class StructuredSync {
           log.info('A file taken over from text was edited since it last agreed with its text; reading the edit in', {
             path: state.localPath,
           });
-          state.ydoc.transact(() => state.codec.apply(state.ydoc, edit.value, base), LOCAL_ORIGIN);
+          const verified = this.verifyBase(state, edit.value, base, true);
+          state.ydoc.transact(() => state.codec.apply(state.ydoc, edit.value, verified), LOCAL_ORIGIN);
           this.agree(state, disk);
         }
       } else if (typeof agreed === 'string') {
         // Only behind: the file is what was agreed, and the document is newer.
         // That agreement is the file's base, and the next write replaces it.
         state.lastSyncedText = agreed;
+        state.baseFromRecord = true;
         state.firstWriteChecked = true;
       }
     }
@@ -1046,6 +1164,12 @@ export class StructuredSync {
 
     try {
       const disk = await this.vault.read(state.localPath);
+      // Every change said, whatever is made of it: a save taken silently left
+      // nothing in the log, so a lost edit could not tell "the save never
+      // came" from "it came and was taken for nothing new" (NEC-225).
+      log.debug('A structured file changed on disk', {
+        path: state.localPath, bytes: disk.length, boundViews: state.boundViews.size,
+      });
       // Our own write coming back, or nothing new. Compared by content rather
       // than by a one-shot flag: a flag armed for a write that produced no
       // event swallows the next real edit.
@@ -1169,16 +1293,26 @@ export class StructuredSync {
       this.deps.surface?.ingested(state.localPath, disk);
       return true;
     }
-    const viewBase = this.deps.surface?.baseFor(state.localPath) ?? null;
+    let viewBase = this.deps.surface?.baseFor(state.localPath) ?? null;
+    const loaded = viewBase !== null && state.lastSyncedText !== null ? this.loadedBase(state, state.lastSyncedText, viewBase) : null;
+    if (loaded !== null) {
+      log.info('An open view did load the last write, by what it showed; reading its save in against what of that write it showed', {
+        path: state.localPath,
+      });
+      viewBase = null;
+    }
     const baseText = viewBase ?? state.lastSyncedText;
-    const base = baseText === null ? null : this.parseOrNull(state, baseText);
-    if (base === null) return false;
+    const parsedBase = loaded ?? (baseText === null ? null : this.parseOrNull(state, baseText));
+    if (parsedBase === null) return false;
+    const verified = this.verifyBase(state, value, parsedBase, viewBase === null && state.baseFromRecord === true);
     if (viewBase !== null) {
       log.info('Reading in a save from a view that missed the last write, against what it held', {
         path: state.localPath,
       });
     }
+    const { base, passedOver, keep } = this.restBase(state, value, verified);
     state.ydoc.transact(() => state.codec.apply(state.ydoc, value, base), LOCAL_ORIGIN);
+    if (passedOver.length > 0) this.keepPassedOver(state, disk, passedOver, keep === true);
     this.agree(state, disk);
     this.deps.surface?.ingested(state.localPath, disk);
     return true;
@@ -1210,16 +1344,19 @@ export class StructuredSync {
     }
     const views = [...state.boundViews];
     if (state.codec.equal(parsed.value, state.codec.read(state.ydoc))) {
+      log.debug('A bound view saved what its document holds; taken as agreed', { path: state.localPath });
       this.agree(state, disk);
       return;
     }
     const reader = views.find((v) => v.readInSave);
     if (reader?.readInSave) {
-      reader.readInSave(parsed.value);
+      const read = reader.readInSave(parsed.value);
+      if (read && read.passedOver.length > 0) this.keepPassedOver(state, disk, read.passedOver, read.keep === true);
       this.agree(state, disk);
       return;
     }
     if (views.some((v) => v.holds(parsed.value))) {
+      log.debug('A bound view saved what one of its views held; taken as agreed', { path: state.localPath });
       this.agree(state, disk);
       return;
     }
@@ -1266,13 +1403,118 @@ export class StructuredSync {
     });
   }
 
+  /** The base for a save, without what a closed view of it showed (see the dep). */
+  private restBase(state: StructuredDocState, saved: unknown, base: unknown): { base: unknown; passedOver: string[]; keep?: boolean } {
+    try {
+      return this.deps.restBase?.(state.localPath, saved, base) ?? { base, passedOver: [] };
+    } catch (err) {
+      log.warn('Could not read what a closed view of a file showed; reading its save in as it is', { path: state.localPath, error: String(err) });
+      return { base, passedOver: [] };
+    }
+  }
+
+  /**
+   * A save read in with parts passed over as what a closed view showed
+   * (`restBase`). Those parts are taken as no edit, which is right for a
+   * closing tab's save and wrong only if someone set a part back to exactly
+   * that value. So the save is kept in .nectenda-backups when `keep` says so —
+   * once per closed view, never for a save that only lacks links — and once
+   * per content: whatever it held is still there to see. No notice: in the
+   * ordinary case nothing anyone wrote was lost.
+   */
+  private keepPassedOver(state: StructuredDocState, disk: string, parts: string[], keep: boolean): void {
+    log.info('Passed over parts of a save as what a closed view showed', {
+      path: state.localPath, parts: parts.slice(0, 10), count: parts.length, kept: keep,
+    });
+    if (!keep || state.passedOverKept === disk) return;
+    state.passedOverKept = disk;
+    state.keeping = state.keeping.then(async () => {
+      await backupLocalFile(this.vault, state.localPath, disk, 'A save held what a closed view showed before a remote change — those parts were not read in');
+    }).catch((err: unknown) => {
+      log.error('Could not keep a save whose parts were passed over', { path: state.localPath, error: String(err) });
+    });
+  }
+
   /** A save, with what its open view deleted and the save left out (see the dep). */
   private withViewDeletes(state: StructuredDocState, saved: unknown, current: unknown): unknown {
     try {
-      return this.deps.withViewDeletes?.(state.localPath, saved, current) ?? saved;
+      return this.deps.withViewDeletes?.(state.localPath, saved, current, state.hasSyncedOnce) ?? saved;
     } catch (err) {
       log.warn('Could not read what an open view deleted; reading its save in as it is', { path: state.localPath, error: String(err) });
       return saved;
+    }
+  }
+
+  /** Whether the open views loaded our last write (see the dep). */
+  private loadedBase(state: StructuredDocState, writtenText: string, priorText: string): unknown {
+    if (!this.deps.loadedBase) return null;
+    const written = this.parseOrNull(state, writtenText);
+    const prior = this.parseOrNull(state, priorText);
+    if (written === null || prior === null) return null;
+    try {
+      return this.deps.loadedBase(state.localPath, written, prior) ?? null;
+    } catch (err) {
+      log.warn('Could not tell whether open views loaded the last write; reading the save in against what they held', {
+        path: state.localPath, error: String(err),
+      });
+      return null;
+    }
+  }
+
+  /**
+   * Read in what open views of the file were seen to hold that the document
+   * never had (see the dep), against the base the dep gives: the document,
+   * with each version a recorded one was not made on marked as not seen, so it
+   * stands beside it and settle keeps the loser rather than this removing it.
+   */
+  private readInRecorded(state: StructuredDocState): boolean {
+    if (!this.deps.withRecordedAhead) return false;
+    const current = state.codec.read(state.ydoc);
+    let got: { value: unknown; base: unknown } | null;
+    try {
+      got = this.deps.withRecordedAhead(state.localPath, current, state.ydoc) ?? null;
+    } catch (err) {
+      log.warn('Could not read what open views held that their document never had; writing without it', {
+        path: state.localPath, error: String(err),
+      });
+      return false;
+    }
+    if (got === null) return false;
+    log.info('Reading in what an open view held that the document never had, which no save carried, before writing', { path: state.localPath });
+    state.ydoc.transact(() => state.codec.apply(state.ydoc, got.value, got.base), LOCAL_ORIGIN);
+    return true;
+  }
+
+  /**
+   * A view of `localPath` stopped showing it — switched to another file,
+   * closed, or rebuilt. If it held something above the document that no save
+   * carried, write the file now rather than at the next change: the record
+   * is in memory only.
+   */
+  writeIfViewsAhead(localPath: string): void {
+    if (!this.deps.holdsRecordedAhead) return;
+    for (const state of this.docs.values()) {
+      if (state.localPath !== localPath) continue;
+      let ahead = false;
+      try {
+        ahead = this.deps.holdsRecordedAhead(localPath, state.codec.read(state.ydoc), state.ydoc);
+      } catch (err) {
+        log.warn('Could not tell whether a view that left a drawing held unsaved work; writing it to be safe', { path: localPath, error: String(err) });
+        ahead = true;
+      }
+      if (ahead) this.scheduleDiskWrite(state);
+    }
+  }
+
+  /** A read-in's base, without what no open view was seen to show (see the dep). */
+  private verifyBase(state: StructuredDocState, saved: unknown, base: unknown, fromRecord: boolean): unknown {
+    try {
+      return this.deps.verifyBase?.(state.localPath, saved, base, fromRecord) ?? base;
+    } catch (err) {
+      log.warn('Could not check a read-in\'s base against what open views showed; reading it in against the base as it is', {
+        path: state.localPath, error: String(err),
+      });
+      return base;
     }
   }
 
@@ -1379,6 +1621,23 @@ export class StructuredSync {
       // under it would discard that edit when it reloads, so it saves first,
       // and the read below takes its save in (SAFE-A19). A view that cannot
       // save is not written under.
+      // A view's own record of unsaved work is not to be trusted with that: a
+      // drawing whose edit landed while a save was in flight says it has
+      // nothing to save, and the write took the edit from under it (NEC-228,
+      // hardness seed 212003). So one whose scene is ahead of the document is
+      // made to save, whatever it says.
+      if (this.deps.saveViewsAhead) {
+        try {
+          await this.deps.saveViewsAhead(state.localPath, state.codec.read(state.ydoc));
+        } catch (err) {
+          log.warn('An open view ahead of its document could not save before a structured write; retrying', {
+            path: state.localPath, error: String(err),
+          });
+          this.retryWrite(state);
+          return;
+        }
+        if (this.docs.get(state.docName) !== state || state.boundViews.size > 0) return;
+      }
       if (this.deps.surface) {
         try {
           await this.deps.surface.beforeWrite(state.localPath);
@@ -1404,6 +1663,7 @@ export class StructuredSync {
       const agreed = state.agreedAtConnect ?? null;
       if (!state.firstWriteChecked && state.lastSyncedText === null && agreed !== null && parsed?.ok) {
         state.lastSyncedText = agreed;
+        state.baseFromRecord = true;
         const base = disk === agreed ? null : this.parseOrNull(state, agreed);
         let clash = false;
         if (base !== null && !state.codec.equal(state.codec.read(state.ydoc), base)) {
@@ -1421,6 +1681,7 @@ export class StructuredSync {
           );
           if ((await this.vault.read(state.localPath)) !== disk) {
             state.lastSyncedText = null;
+            state.baseFromRecord = false;
             this.scheduleDiskWrite(state);
             return;
           }
@@ -1456,6 +1717,7 @@ export class StructuredSync {
           // the file's version is in the backup just taken, so the file is
           // accounted for and the write below may replace it.
           state.lastSyncedText = disk;
+          state.baseFromRecord = false;
           state.firstWriteChecked = true;
           log.warn('A structured file and its document both changed the same thing while it was not synced; kept the file in .nectenda-backups and left the document as it is', {
             path: state.localPath,
@@ -1471,6 +1733,7 @@ export class StructuredSync {
           });
         } else {
           state.lastSyncedText = null;
+          state.baseFromRecord = false;
         }
       }
 
@@ -1484,6 +1747,11 @@ export class StructuredSync {
         // aside as another file's: either way the write below goes ahead.
         this.readIn(state, disk, parsed.value);
       }
+      // What a view held that no save carried — its flag cleared by a save in
+      // flight, then switched away, closed or rebuilt (NEC-236) — goes in
+      // before the file is replaced. Not once the first write of a connect
+      // has kept the file aside: then it waits for the next write.
+      if (state.firstWriteChecked) this.readInRecorded(state);
       const value = state.codec.read(state.ydoc);
 
       // Already says the same thing, whatever its bytes (SAFE-A15). Rewriting
@@ -1603,10 +1871,16 @@ export class StructuredSync {
     return { ydoc: state.ydoc, awareness: this.provider.getAwareness(docName) };
   }
 
-  /** Give the document back. A view still bound through it is unbound first. */
-  releaseDoc(docName: string, view?: BoundView): void {
+  /**
+   * Give the document back. A view still bound through it is unbound first.
+   * With `ydoc`, only if it is still the document held under that name: one
+   * torn down and reconnected since was never acquired from the new state.
+   * (Nothing decides on the count today; it is kept honest for whatever will.)
+   */
+  releaseDoc(docName: string, view?: BoundView, ydoc?: Y.Doc): void {
     if (view) this.unbindView(docName, view);
     const state = this.docs.get(docName);
+    if (ydoc && state?.ydoc !== ydoc) return;
     if (state && state.acquired > 0) state.acquired--;
   }
 
@@ -1639,16 +1913,23 @@ export class StructuredSync {
     return !!state && (state.writeTimer !== null || state.writeInFlight === true);
   }
 
-  bindView(docName: string, view: BoundView, shown: unknown): BindResult {
+  bindView(docName: string, view: BoundView, shown: unknown, ydoc?: Y.Doc): BindResult {
     const state = this.docs.get(docName);
     if (!state) return 'unknown';
+    // The caller acquired `ydoc` and has awaited since. Torn down and
+    // reconnected meanwhile, the name now holds another document: bound to it,
+    // the view became its file's only writer (SAFE-A19) while carrying its
+    // edits into the destroyed one, where no other vault would ever see them.
+    if (ydoc && state.ydoc !== ydoc) return 'not-ready';
     if (this.checkHandOff(state)) return 'refused';
     if (!this.isStamped(state) || !state.hasSyncedOnce) return 'not-ready';
     if (!state.codec.equal(shown, state.codec.read(state.ydoc))) {
       const base = state.lastSyncedText === null ? null : this.parseOrNull(state, state.lastSyncedText);
       if (base === null) return 'not-ready';
       if (!state.codec.equal(shown, base)) {
-        state.ydoc.transact(() => state.codec.apply(state.ydoc, shown, base), LOCAL_ORIGIN);
+        // The view may have missed our last write, as a save can (readIn).
+        const verified = this.verifyBase(state, shown, base, state.baseFromRecord === true);
+        state.ydoc.transact(() => state.codec.apply(state.ydoc, shown, verified), LOCAL_ORIGIN);
       }
     }
     state.boundViews.add(view);
@@ -1731,6 +2012,19 @@ export class StructuredSync {
   }
 
   private teardown(state: StructuredDocState): void {
+    // Views bound to it let go first: a binding left holding the destroyed
+    // document stays "bound", and nothing binds the view again. Done before
+    // the write timer is cleared below, so the write the last unbind
+    // schedules is cleared with it. Whatever a view carries in on letting go
+    // goes into this document, which is going; the view keeps it and saves it
+    // to disk as before.
+    for (const view of [...state.boundViews]) {
+      try {
+        view.letGo?.();
+      } catch (err) {
+        log.warn('A bound view failed to let go of a document being torn down', { docName: state.docName, error: String(err) });
+      }
+    }
     if (state.writeTimer) window.clearTimeout(state.writeTimer);
     state.writeTimer = null;
     if (state.onTransaction) state.ydoc.off('afterTransaction', state.onTransaction);
@@ -1761,5 +2055,15 @@ export class StructuredSync {
   disconnectAll(): void {
     for (const folderId of Array.from(this.folderDocs.keys())) this.disconnectFolder(folderId);
     this.unplaced.clear();
+  }
+
+  /**
+   * Disconnect everything for good: sync is stopping and this instance goes
+   * with it. A connect still waiting (`ready`) then stops there, rather than
+   * opening a document under an instance nothing will disconnect again.
+   */
+  stop(): void {
+    this.stopped = true;
+    this.disconnectAll();
   }
 }

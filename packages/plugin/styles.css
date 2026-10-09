@@ -432,7 +432,8 @@
  * so it is visible which entries a collaborator has, and so whose presence can
  * show. A pseudo-element on Obsidian's own row, card or list item, never a
  * child: the table rebuilds a row's children as it scrolls. Each of the three
- * is `position: absolute` in Obsidian 1.13.7, so the dot places against it.
+ * is `position: absolute` in Obsidian 1.13.7, as is 1.14's kanban card, so the
+ * dot places against it.
  *
  * Where: in a table, the row's leading gutter, so it is there whichever
  * columns are shown; on a card, the top-right corner, ringed in the card's
@@ -461,6 +462,12 @@
   top: var(--size-4-2);
   inset-inline-end: var(--size-4-2);
   box-shadow: 0 0 0 2px var(--bases-cards-background, var(--background-primary));
+}
+/* Inside the corner: a 1.14 kanban card clips its own overflow. */
+.bases-kanban-card.nectenda-shared-entry::after {
+  top: var(--size-4-2);
+  inset-inline-end: var(--size-4-2);
+  box-shadow: 0 0 0 2px var(--bases-kanban-card-background, var(--background-primary));
 }
 .bases-list-item.nectenda-shared-entry::after {
   inset-inline-start: calc(-1ch - 4px);
@@ -509,36 +516,44 @@
 .nectenda-status-icon.nectenda-header-problem { color: var(--text-error); }
 .nectenda-status-icon.nectenda-header-idle { color: var(--text-muted); }
 /*
- * The two marks, sized and placed against the mark itself rather than in
- * pixels. Each place draws the logo at its own native size (ribbon
- * --icon-l, note header and status bar --icon-s), and fixed-pixel marks were
- * proportionally larger the smaller the logo: 39% of it in the ribbon, 50% in
- * the status bar. The ribbon's proportions are the reference, agreed 27 Sep
- * 2026: dot 0.39 of the logo, number 0.6 tall with text 0.42 (0.78 covered
- * too much of the logo). Each is centred just inside its corner of the
- * logo, the dot top right and the number bottom right, as mirror images.
+ * The two marks, sized and placed against the logo rather than in pixels.
+ * The ribbon's proportions are the reference, agreed 27 Sep 2026: dot 0.39
+ * of the logo, number 0.6 tall with text 0.42 (0.78 covered too much of the
+ * logo). Each is centred just inside its corner of the logo, the dot top
+ * right and the number bottom right, as mirror images.
  *
- * `--nectenda-icon` is the logo's size in each place. Obsidian sets
- * --icon-size on the svg in the ribbon and the status bar, not on the button
- * around it, so the button cannot read it; each place names its own below.
- * Both marks are placed from the button's centre, which is the logo's centre,
- * so they sit the same distance from the logo whatever padding the button has.
+ * Both sit in `.nectenda-marks`, a box laid over the logo that carries
+ * Obsidian's `svg-icon` class. Obsidian sets --icon-size on `.svg-icon` in
+ * each place (ribbon, view header, status bar), so the box is handed the
+ * logo's own size wherever it is, and follows it when a theme, a snippet or
+ * Obsidian itself changes it. The logo is never sized here: it is whatever
+ * Obsidian draws the icons around it at. Naming the size per place was
+ * wrong once already: 1.14 moved ribbon icons from --icon-l to --icon-m, and
+ * marks sized for --icon-l came out at 0.44 of the logo.
+ *
+ * The box is centred on the button, which is the logo's centre, so it sits
+ * on the logo whatever padding the button has.
  */
-.nectenda-status-icon {
+.nectenda-marks {
+  --nectenda-icon: var(--icon-size);
   --nectenda-dot: calc(var(--nectenda-icon) * 0.39);
   --nectenda-count: calc(var(--nectenda-icon) * 0.6);
   /* How far inside the logo's corner each mark is centred: the same for
      both, so the dot (top right) and the number (bottom right) mirror. */
   --nectenda-corner: calc(var(--nectenda-icon) * 0.05);
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: var(--nectenda-icon);
+  height: var(--nectenda-icon);
+  transform: translate(-50%, -50%);
+  pointer-events: none;
 }
-.nectenda-header-status { --nectenda-icon: var(--icon-size, var(--icon-s)); }
-.side-dock-ribbon-action.nectenda-status-icon { --nectenda-icon: var(--icon-l); }
-.nectenda-status-bar { --nectenda-icon: var(--icon-s); }
 /* Something is waiting for you: an invitation, a folder shared with you. Top right of the logo. */
 .nectenda-status-waiting {
   position: absolute;
-  top: calc(50% - var(--nectenda-icon) / 2 + var(--nectenda-corner) - var(--nectenda-dot) / 2);
-  left: calc(50% + var(--nectenda-icon) / 2 - var(--nectenda-corner) - var(--nectenda-dot) / 2);
+  top: calc(var(--nectenda-corner) - var(--nectenda-dot) / 2);
+  left: calc(100% - var(--nectenda-corner) - var(--nectenda-dot) / 2);
   width: var(--nectenda-dot);
   height: var(--nectenda-dot);
   border-radius: 50%;
@@ -549,8 +564,8 @@
 /* Other people in the note. Bottom right of the logo. */
 .nectenda-header-badge {
   position: absolute;
-  top: calc(50% + var(--nectenda-icon) / 2 - var(--nectenda-corner) - var(--nectenda-count) / 2);
-  left: calc(50% + var(--nectenda-icon) / 2 - var(--nectenda-corner) - var(--nectenda-count) / 2);
+  top: calc(100% - var(--nectenda-corner) - var(--nectenda-count) / 2);
+  left: calc(100% - var(--nectenda-corner) - var(--nectenda-count) / 2);
   min-width: var(--nectenda-count);
   height: var(--nectenda-count);
   padding: 0 calc(var(--nectenda-count) * 0.2);
@@ -1191,6 +1206,7 @@
 .bases-td.nectenda-peer-focus,
 .bases-tr.nectenda-peer-focus,
 .bases-cards-property.nectenda-peer-focus,
+.bases-kanban-card-property.nectenda-peer-focus,
 .metadata-property.nectenda-peer-focus {
   outline: 2px solid var(--nectenda-peer-color, var(--text-accent));
   outline-offset: -2px;
@@ -1201,6 +1217,14 @@
 .bases-list-item.nectenda-peer-focus {
   outline: 2px solid var(--nectenda-peer-color, var(--text-accent));
   outline-offset: 2px;
+}
+
+/* Inset, and over Obsidian's `outline: none`: a 1.14 kanban card sits in a
+   lane that scrolls and clips, and the lane's own padding is too thin to
+   show an outline drawn outside the card. */
+.bases-kanban-card.nectenda-peer-focus {
+  outline: 2px solid var(--nectenda-peer-color, var(--text-accent));
+  outline-offset: -2px;
 }
 
 /*

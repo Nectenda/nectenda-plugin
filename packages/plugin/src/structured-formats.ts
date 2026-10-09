@@ -146,10 +146,14 @@ export interface StructuredCodec {
 
 /** What a codec's `settle` did, for StructuredSync to log and tell the user. */
 export interface SettleOutcome {
-  /** This vault's versions that lost writing, kept in the file. */
-  kept: Array<{ id: string; why: string }>;
+  /**
+   * This vault's versions that lost writing, kept in the file. `fill` marks a
+   * version no vault wrote — a take-over fill's (SAFE-A28) — kept by whichever
+   * vault met it, so not this vault's to call its own.
+   */
+  kept: Array<{ id: string; why: string; fill?: boolean }>;
   /** This vault's versions that lost nothing anyone wrote, converged. */
-  converged: Array<{ id: string; why: string; lost?: unknown }>;
+  converged: Array<{ id: string; why: string; lost?: unknown; fill?: boolean }>;
 }
 
 /**

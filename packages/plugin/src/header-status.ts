@@ -211,6 +211,11 @@ export interface HeaderStatusDeps {
   openSharedWithYou(): void;
   openSettings(): void;
   addRibbon(onClick: (evt: MouseEvent) => void): HTMLElement;
+  /**
+   * Take the ribbon icon away for good. Taking it off the page is not enough:
+   * Obsidian redraws the ribbon from its own list of buttons, and put it back.
+   */
+  removeRibbon(el: HTMLElement): void;
   addStatusBar(): HTMLElement;
 }
 
@@ -238,14 +243,27 @@ export function renderIcon(el: HTMLElement, state: HeaderState): void {
   if (el.getAttribute('aria-label') !== state.label) el.setAttribute('aria-label', state.label);
   let badge = el.querySelector<HTMLElement>('.nectenda-header-badge');
   if (state.badge) {
-    if (!badge) badge = el.createSpan({ cls: 'nectenda-header-badge' });
+    if (!badge) badge = marksOf(el).createSpan({ cls: 'nectenda-header-badge' });
     if (badge.textContent !== state.badge) badge.setText(state.badge);
   } else {
     badge?.remove();
   }
   const dot = el.querySelector('.nectenda-status-waiting');
-  if (state.waiting && !dot) el.createSpan({ cls: 'nectenda-status-waiting' });
+  if (state.waiting && !dot) marksOf(el).createSpan({ cls: 'nectenda-status-waiting' });
   else if (!state.waiting) dot?.remove();
+}
+
+/**
+ * The box the two marks are drawn in: a span laid over the logo, carrying
+ * Obsidian's `svg-icon` class so that whatever `--icon-size` Obsidian (or a
+ * theme) gives the logo in this place, it gives this box too. The marks are
+ * sized from that, so they follow the logo wherever it is and at whatever size.
+ * Naming the size per place broke once already: Obsidian 1.14 drew ribbon
+ * icons at `--icon-m` where 1.13 had `--icon-l`, and the dot came out too big.
+ */
+function marksOf(el: HTMLElement): HTMLElement {
+  return el.querySelector<HTMLElement>(':scope > .nectenda-marks')
+    ?? el.createSpan({ cls: ['svg-icon', 'nectenda-marks'] });
 }
 
 /**
@@ -303,7 +321,7 @@ export class HeaderStatus {
       this.ribbon = this.deps.addRibbon((evt) => this.openMenu(evt, this.activePath()));
       this.ribbon.addClass('nectenda-status-icon');
     } else if (!places.ribbon && this.ribbon) {
-      this.ribbon.remove();
+      this.deps.removeRibbon(this.ribbon);
       this.ribbon = null;
     }
     if (places.statusBar && !this.statusBar) {
@@ -372,7 +390,7 @@ export class HeaderStatus {
 
   stop(): void {
     this.stopHeaders();
-    this.ribbon?.remove();
+    if (this.ribbon) this.deps.removeRibbon(this.ribbon);
     this.ribbon = null;
     this.statusBar?.remove();
     this.statusBar = null;
