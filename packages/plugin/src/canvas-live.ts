@@ -2,7 +2,7 @@ import type * as Y from 'yjs';
 import type { Awareness } from 'y-protocols/awareness';
 import { canvasCodec } from './canvas-codec';
 import {
-  applyCanvas, canonical, normaliseCanvas, normaliseJson, observeCanvas, readCanvas, ROOT_TEXTS,
+  canonical, normaliseCanvas, normaliseJson, observeCanvas, ROOT_TEXTS,
   type CanvasRecord, type CanvasValue,
 } from './canvas-model';
 import {
@@ -10,6 +10,7 @@ import {
   type CanvasData, type CanvasLike, type CanvasNodeLike, type CanvasViewInternal,
 } from './canvas-internals';
 import type { BindResult, BoundView, StructuredSync } from './structured-sync';
+import type { StructuredCodec } from './structured-formats';
 import { log } from './logger';
 
 /**
@@ -126,6 +127,12 @@ const isEmpty = (v: CanvasValue): boolean => v.nodes.length === 0 && v.edges.len
 export class CanvasLiveBinding implements BoundView {
   private docName: string | null = null;
   private ydoc: Y.Doc | null = null;
+  /**
+   * The file's codec, from StructuredSync: reads and writes the folder's paths
+   * as this vault names them (SAFE-A33). Parsing and comparing are the same
+   * for every file, and stay on `canvasCodec`.
+   */
+  private codec: StructuredCodec = canvasCodec;
   awareness: Awareness | null = null;
   private held: CanvasValue = { nodes: [], edges: [], extra: {} };
   private recent: CanvasValue[] = [];
@@ -228,7 +235,8 @@ export class CanvasLiveBinding implements BoundView {
     const shown = valueOfCanvas(this.canvas);
     const disk = diskText === null || diskText.trim() === '' ? null : canvasCodec.parse(diskText);
     const diskValue = disk?.ok ? disk.value : null;
-    const docValue = readCanvas(held.ydoc);
+    const codec = held.codec ?? canvasCodec;
+    const docValue = codec.read(held.ydoc);
     // The view shows this file when it equals the file or the document. An
     // empty view over a file with content is a load still in progress, never
     // a canvas someone emptied; a view of another file fails both.
@@ -248,6 +256,7 @@ export class CanvasLiveBinding implements BoundView {
     }
     this.docName = docName;
     this.ydoc = held.ydoc;
+    this.codec = codec;
     this.awareness = held.awareness;
     this.setHeld(shown);
     this.bound = true;
@@ -324,6 +333,15 @@ export class CanvasLiveBinding implements BoundView {
   /** A record as the view last committed it — for presence to tell a node mid-drag from one at rest. */
   heldNode(id: string): CanvasRecord | null {
     return this.held.nodes.find((n) => n.id === id) ?? null;
+  }
+
+  /**
+   * Whether an edge is one the view committed. The edge Obsidian draws while a
+   * connection is being dragged is not, even once it snaps onto a card and
+   * both its ends are real (presence, NEC-255).
+   */
+  holdsEdge(id: string): boolean {
+    return this.held.edges.some((e) => e.id === id);
   }
 
   /** The document this binding is bound through. */
@@ -525,7 +543,7 @@ export class CanvasLiveBinding implements BoundView {
     this.outside.push(value);
     if (this.outside.length > 8) this.outside.shift();
     const ydoc = this.ydoc;
-    ydoc.transact(() => applyCanvas(ydoc, value, base as CanvasValue), EXTERNAL);
+    ydoc.transact(() => this.codec.apply(ydoc, value, base), EXTERNAL);
     this.applyRemoteNow();
   }
 
@@ -570,7 +588,7 @@ export class CanvasLiveBinding implements BoundView {
     if (canvasCodec.equal(value, this.held)) return;
     const ydoc = this.ydoc;
     const base = this.held;
-    ydoc.transact(() => applyCanvas(ydoc, value, base), this);
+    ydoc.transact(() => this.codec.apply(ydoc, value, base), this);
     this.setHeld(value);
     this.emit();
   }
@@ -590,7 +608,7 @@ export class CanvasLiveBinding implements BoundView {
     this.applyPending = false;
     if (!this.bound || !this.ydoc) return;
     const canvas = this.canvas;
-    const next = readCanvas(this.ydoc);
+    const next = this.codec.read(this.ydoc) as CanvasValue;
     const moving = movingGeometry(canvas, this.gesture);
     if (moving && !this.gesture) this.heldLate = true;
     const plan = planDraw(this.held, next, moving);

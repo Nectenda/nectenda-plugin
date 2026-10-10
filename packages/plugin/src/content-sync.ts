@@ -17,6 +17,10 @@ import { FrontmatterSync } from './frontmatter-sync';
 import { kindOf } from './blob-policy';
 
 const WRITE_DEBOUNCE = 500;
+
+/** The editor bound to a note's own pane, through EditorBridge: the default owner. */
+export const PANE_OWNER: unique symbol = Symbol('pane');
+
 /**
  * The write delay for a note open in another plugin's view. Its changes come
  * a whole save at a time, not a keystroke at a time, so there is little to
@@ -190,6 +194,12 @@ export class ContentSync {
   private provider: SyncProvider;
   private vault: VaultAdapter;
   private fileDocs: Map<string, FileDocState> = new Map();
+  /**
+   * Who holds each bound document: the note's pane (`PANE_OWNER`) and any
+   * canvas card bound to it. Forgotten with the document, so an owner from a
+   * document torn down can never keep a reconnected one from its disk writes.
+   */
+  private editorOwners: Map<string, Set<unknown>> = new Map();
   /** Paths with a connect in flight, keyed before the first await. */
   private connecting: Set<string> = new Set(); // key: docName
   /**
@@ -866,6 +876,7 @@ export class ContentSync {
    */
   private abandonUnsubscribed(state: FileDocState, sharedFolderId: string, folderLocalPath: string): void {
     this.fileDocs.delete(state.docName);
+    this.editorOwners.delete(state.docName);
     this.folderFiles.get(sharedFolderId)?.delete(state.docName);
     this.forgetWrites(state.docName);
     if (state.writeTimer) window.clearTimeout(state.writeTimer);
@@ -917,6 +928,7 @@ export class ContentSync {
     state.ydoc.destroy();
 
     this.fileDocs.delete(docName);
+    this.editorOwners.delete(docName);
     this.folderFiles.get(state.sharedFolderId)?.delete(docName);
     this.forgetWrites(docName);
     this.changed();
@@ -1015,8 +1027,8 @@ export class ContentSync {
   }
 
   /** EditorBridge calls this when closing a file — ContentSync resumes background sync */
-  releaseDoc(docName: string): void {
-    this.setEditorBound(docName, false);
+  releaseDoc(docName: string, owner: unknown = PANE_OWNER): void {
+    this.setEditorBound(docName, false, owner);
   }
 
   /**
@@ -1027,9 +1039,30 @@ export class ContentSync {
    * file open in a tab that has not synced yet — ContentSync stays responsible,
    * so offline edits still reach the CRDT.
    */
-  setEditorBound(docName: string, bound: boolean): void {
+  setEditorBound(docName: string, bound: boolean, owner: unknown = PANE_OWNER): void {
     const state = this.fileDocs.get(docName);
     if (!state) return;
+    // More than one editor may be bound to a note at once — its pane, and a
+    // canvas card showing it (canvas-note-binding.ts, SAFE-A32). The document
+    // is the editors' while any of them holds it, and ContentSync's again
+    // only once the last lets go.
+    let owners = this.editorOwners.get(docName);
+    if (bound) {
+      if (!owners) this.editorOwners.set(docName, (owners = new Set()));
+      const was = owners.size > 0;
+      owners.add(owner);
+      if (was && state.editorActive) return;
+    } else {
+      if (owners?.has(owner)) owners.delete(owner);
+      // An owner this document never had — a card bound to a document since
+      // torn down and reconnected — has nothing to hand back. Letting it reset
+      // the base would read a card save built on older text against the
+      // newer one, as a deletion (found in review). The pane's own calls keep
+      // their old meaning: EditorBridge lets go of notes it never bound.
+      else if (owner !== PANE_OWNER || (owners && owners.size > 0)) return;
+      if (owners && owners.size > 0) return;
+      this.editorOwners.delete(docName);
+    }
     state.editorActive = bound;
     // While bound the editor writes the file itself, unseen here, so what disk
     // and document agree on is unknown. On letting go it is the document's

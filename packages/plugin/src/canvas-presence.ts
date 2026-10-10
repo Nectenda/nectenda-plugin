@@ -4,7 +4,7 @@ import {
   type Gesture, type GestureRect, type Pointer, type PresenceV1, type Selection, type Viewport,
 } from '@nectenda/shared';
 import type * as Y from 'yjs';
-import type { CanvasLike } from './canvas-internals';
+import type { CanvasLike, CanvasNodeLike } from './canvas-internals';
 import type { CanvasLiveBinding } from './canvas-live';
 import {
   POINTER_WINDOW_MS, buildPointerMarker, caretIn, placePointer, setPointerEdge, type Edge,
@@ -75,8 +75,11 @@ const r1 = (n: number): number => Math.round(n);
  * view last committed. Only while the pointer is down, so a remote change
  * drawn into the view is never mistaken for one.
  */
-export function sampleGesture(canvas: CanvasLike, binding: Pick<CanvasLiveBinding, 'isGesture' | 'heldNode'>): Gesture | null {
-  const connecting = sampleConnection(canvas);
+export function sampleGesture(
+  canvas: CanvasLike,
+  binding: Pick<CanvasLiveBinding, 'isGesture' | 'heldNode'> & Partial<Pick<CanvasLiveBinding, 'holdsEdge'>>,
+): Gesture | null {
+  const connecting = sampleConnection(canvas, (id) => binding.holdsEdge?.(id) ?? false);
   if (connecting) return connecting;
   if (!binding.isGesture()) return null;
   const nodes: GestureRect[] = [];
@@ -94,24 +97,134 @@ export function sampleGesture(canvas: CanvasLike, binding: Pick<CanvasLiveBindin
 
 /**
  * An edge being drawn: Obsidian marks `canvasEl` with `is-connecting` and adds
- * a temporary edge whose loose end is a stand-in node that is not in the
- * canvas (1.13.7, `onConnectionPointerdown`). Best-effort: presence only.
+ * a temporary edge from the card it was pulled out of (1.13.7,
+ * `onConnectionPointerdown`). Its other end is a stand-in node that follows
+ * the pointer — until it snaps onto a card's side, when it is that card, real,
+ * and the temporary edge looks like any other. So the temporary edge is told
+ * apart by not being one the view committed (`committed`), not by its ends.
+ * Snapped, it carries the card and side it would connect to, and its end is
+ * that side's midpoint: drawn there, not under the pointer, as Obsidian draws
+ * it (NEC-255). Best-effort: presence only.
  */
-function sampleConnection(canvas: CanvasLike): Gesture | null {
+export function sampleConnection(canvas: CanvasLike, committed: (id: string) => boolean = () => false): Gesture | null {
   const el = canvas.canvasEl as unknown as { classList?: { contains(c: string): boolean } };
   if (!el.classList?.contains('is-connecting')) return null;
-  for (const edge of canvas.edges.values()) {
-    const e = edge as unknown as { from?: { node?: { id?: string; x?: number; y?: number }; side?: string }; to?: { node?: { id?: string; x?: number; y?: number } } };
+  for (const [id, edge] of canvas.edges) {
+    if (committed(id)) continue;
+    const e = edge as unknown as {
+      from?: { node?: { id?: string }; side?: string };
+      to?: { node?: { id?: string; x?: number; y?: number; width?: number; height?: number }; side?: string };
+    };
     const from = e.from?.node;
     const to = e.to?.node;
-    if (!from || !to || typeof from.id !== 'string') continue;
-    const fromReal = canvas.nodes.get(from.id) === from;
+    if (!from || !to || typeof from.id !== 'string' || canvas.nodes.get(from.id) !== from) continue;
+    const side = e.from?.side;
     const toReal = typeof to.id === 'string' && canvas.nodes.get(to.id) === to;
-    if (fromReal && !toReal && typeof to.x === 'number' && typeof to.y === 'number') {
-      return { surface: 'canvas', kind: 'connect', from: from.id, side: e.from?.side, x: r1(to.x), y: r1(to.y) };
+    if (toReal) {
+      const target = canvas.nodes.get(to.id as string)!;
+      const toSide = e.to?.side;
+      const at = sidePoint(target, toSide);
+      return {
+        surface: 'canvas', kind: 'connect', from: from.id, side, x: r1(at.x), y: r1(at.y),
+        to: to.id as string, ...(toSide ? { toSide } : {}),
+      };
+    }
+    if (typeof to.x === 'number' && typeof to.y === 'number') {
+      // A zero-size stand-in at the pointer, whose side Obsidian fixes as the
+      // one opposite the source's — wherever the pointer goes — and which sets
+      // its arrowhead and the curve's last control point (read in 1.13.7).
+      const toSide = e.to?.side;
+      return { surface: 'canvas', kind: 'connect', from: from.id, side, x: r1(to.x), y: r1(to.y), ...(toSide ? { toSide } : {}) };
     }
   }
   return null;
+}
+
+// ── An edge's curve, as Obsidian draws it ────────────────────────────────
+
+type Side = 'top' | 'right' | 'bottom' | 'left';
+type Rect = { x: number; y: number; width: number; height: number };
+type Point = { x: number; y: number };
+
+const NORMAL: Record<Side, Point> = { top: { x: 0, y: -1 }, right: { x: 1, y: 0 }, bottom: { x: 0, y: 1 }, left: { x: -1, y: 0 } };
+const isSide = (s: unknown): s is Side => s === 'top' || s === 'right' || s === 'bottom' || s === 'left';
+/** How far an edge's line starts off its card's side (1.13.7: `M200 30 L207 30`). */
+const EDGE_GAP = 7;
+/** The nearest and furthest a control point sits off its side (1.13.7, `_ee`). */
+const EDGE_REACH_MIN = 70;
+const EDGE_REACH = 150;
+
+/** The midpoint of a card's side; its centre when the side is unknown. */
+export function sidePoint(r: Rect, side: unknown): Point {
+  switch (side) {
+    case 'top': return { x: r.x + r.width / 2, y: r.y };
+    case 'right': return { x: r.x + r.width, y: r.y + r.height / 2 };
+    case 'bottom': return { x: r.x + r.width / 2, y: r.y + r.height };
+    case 'left': return { x: r.x, y: r.y + r.height / 2 };
+    default: return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+  }
+}
+
+const OPPOSITE: Record<Side, Side> = { top: 'bottom', right: 'left', bottom: 'top', left: 'right' };
+
+/**
+ * A loose end's side when none was sent (a client that predates sending it):
+ * the one opposite the source's, which is what Obsidian gives its stand-in,
+ * wherever the pointer is (1.13.7; never the side the line happens to face).
+ */
+function looseSide(fromSide: unknown): Side {
+  return isSide(fromSide) ? OPPOSITE[fromSide] : 'left';
+}
+
+/** An arrowhead's length and half its width, in world units (1.13.7: `0,0 6.5,10.4 -6.5,10.4`). */
+const ARROW_LENGTH = 10.4;
+const ARROW_HALF = 6.5;
+
+/**
+ * An arrowhead as Obsidian 1.13.7 draws one on an edge's end: its tip on the
+ * side's midpoint, pointing into the card, its base `ARROW_LENGTH` out along
+ * the side's outward normal (`translate(tip) rotate(…)` of the same triangle;
+ * a left side's is `rotate(90deg)`, read from the canvas). World coordinates.
+ */
+export function arrowHead(tip: Point, side: unknown): Point[] {
+  const n = NORMAL[isSide(side) ? side : 'top'];
+  const base = { x: tip.x + n.x * ARROW_LENGTH, y: tip.y + n.y * ARROW_LENGTH };
+  // The base runs across the normal.
+  return [tip, { x: base.x - n.y * ARROW_HALF, y: base.y + n.x * ARROW_HALF }, { x: base.x + n.y * ARROW_HALF, y: base.y - n.x * ARROW_HALF }];
+}
+
+/**
+ * A connection's curve in world coordinates, as Obsidian 1.13.7 draws an edge
+ * (`updatePath`, read from its code and checked against the paths it draws):
+ * from the source side's midpoint, a short straight run of `EDGE_GAP` out of
+ * it, then a cubic Bézier whose control points sit off each end along its
+ * side's outward normal, at half the distance between the ends, kept within
+ * `EDGE_REACH_MIN`–`EDGE_REACH`. With `snapped`, the end is a card's side
+ * midpoint and the line stops `EDGE_GAP` short of it, where the arrowhead
+ * goes. A loose end is drawn the same way, as Obsidian draws it: a zero-size
+ * stand-in at the pointer, on the side opposite the source's.
+ */
+export function connectionCurve(
+  from: Rect,
+  fromSide: unknown,
+  end: Point,
+  toSide?: unknown,
+  snapped = false,
+): { start: Point; gap: Point; c1: Point; c2: Point; at: Point; end: Point } {
+  const start = sidePoint(from, fromSide);
+  const fs: Side = isSide(fromSide) ? fromSide : 'right';
+  const gap = { x: start.x + NORMAL[fs].x * EDGE_GAP, y: start.y + NORMAL[fs].y * EDGE_GAP };
+  const ts: Side = isSide(toSide) ? toSide : looseSide(fs);
+  const at = snapped ? { x: end.x + NORMAL[ts].x * EDGE_GAP, y: end.y + NORMAL[ts].y * EDGE_GAP } : end;
+  const reach = Math.min(Math.max(Math.hypot(at.x - gap.x, at.y - gap.y) / 2, EDGE_REACH_MIN), EDGE_REACH);
+  return {
+    start,
+    gap,
+    c1: { x: gap.x + NORMAL[fs].x * reach, y: gap.y + NORMAL[fs].y * reach },
+    c2: { x: at.x + NORMAL[ts].x * reach, y: at.y + NORMAL[ts].y * reach },
+    at,
+    end,
+  };
 }
 
 export function sampleSelection(canvas: CanvasLike): Selection | null {
@@ -150,8 +263,10 @@ export interface PeerToDraw {
   /** World position of the pointer, or null when they have none on this canvas. */
   pointer: { x: number; y: number } | null;
   selection: string[];
+  /** Edges in their selection, by id (NEC-255): drawn as theirs, like nodes. */
+  edges: string[];
   ghosts: GestureRect[];
-  connect: { from: string; x: number; y: number } | null;
+  connect: { from: string; side?: string; x: number; y: number; to?: string; toSide?: string } | null;
   /** The world rectangle they are looking at, or null. */
   viewport: { x: number; y: number; w: number; h: number } | null;
 }
@@ -165,6 +280,7 @@ export function peersToDraw(
   states: Map<number, unknown>,
   self: number,
   nodeIds: ReadonlySet<string>,
+  edgeIds: ReadonlySet<string> = new Set(),
 ): PeerToDraw[] {
   const out: PeerToDraw[] = [];
   for (const [clientId, raw] of states) {
@@ -187,8 +303,15 @@ export function peersToDraw(
       color: p.user.color,
       pointer,
       selection: p.selection?.surface === 'canvas' ? p.selection.ids.filter((id) => nodeIds.has(id)) : [],
+      edges: p.selection?.surface === 'canvas' ? p.selection.ids.filter((id) => edgeIds.has(id)) : [],
       ghosts,
-      connect: gesture?.kind === 'connect' && nodeIds.has(gesture.from) ? { from: gesture.from, x: gesture.x, y: gesture.y } : null,
+      connect: gesture?.kind === 'connect' && nodeIds.has(gesture.from)
+        ? {
+          from: gesture.from, x: gesture.x, y: gesture.y,
+          ...(gesture.side ? { side: gesture.side } : {}),
+          ...(gesture.to && nodeIds.has(gesture.to) ? { to: gesture.to, ...(gesture.toSide ? { toSide: gesture.toSide } : {}) } : {}),
+        }
+        : null,
       viewport: p.viewport?.surface === 'canvas' ? { x: p.viewport.x, y: p.viewport.y, w: p.viewport.w, h: p.viewport.h } : null,
     });
   }
@@ -215,6 +338,32 @@ export function placeCanvasPointer(
 ): { x: number; y: number; edge: Edge | null } {
   const at = toScreen(canvas, width, height, x, y);
   return placePointer({ x: at.x, y: at.y, h: 0 }, { left: 0, top: 0, right: width, bottom: height });
+}
+
+/** Someone with a caret in a note, as a card showing that note draws them (NEC-255). */
+export interface NoteTyper {
+  clientId: number;
+  name: string;
+  color: string;
+}
+
+/**
+ * Who has a caret in a note, from that note's own awareness: never ourselves
+ * (WIRE-093), and only a state that says who it is. A note card's text is the
+ * note's document, not the canvas's, so a peer typing in it leaves no caret
+ * the canvas can see; the note's awareness is where it is.
+ */
+export function noteTypers(states: ReadonlyMap<number, unknown>, self: number): NoteTyper[] {
+  const out: NoteTyper[] = [];
+  for (const [clientId, raw] of states) {
+    if (clientId === self) continue;
+    const cursor = (raw as { cursor?: unknown } | null)?.cursor;
+    if (cursor === null || cursor === undefined) continue;
+    const p: PresenceV1 | null = readPresence(raw);
+    if (!p?.user) continue;
+    out.push({ clientId, name: p.user.name, color: p.user.color });
+  }
+  return out.sort((a, b) => a.clientId - b.clientId);
 }
 
 /** A collaborator's caret inside a card on this canvas (NEC-162's `cursor`). */
@@ -357,6 +506,32 @@ export interface CanvasPresenceDeps {
   userColor(name: string): { seat: number; color: string; light: string };
   sharePointer(): boolean;
   showPointers(): boolean;
+  /**
+   * The awareness of a note in a shared folder, by its vault path, for the
+   * cards that show it (NEC-255). Absent, or null for a note not synced: no
+   * typing is drawn on note cards.
+   */
+  noteAwareness?(localPath: string): Awareness | null;
+}
+
+/** How often note cards' typists are looked for: their awareness is not the canvas's. */
+const NOTE_TYPING_TICK_MS = 700;
+
+/**
+ * The elements Obsidian draws an edge in: its line (`lineGroupEl`, holding
+ * `.canvas-display-path`) and its arrowheads (`lineEndGroupEl`, holding
+ * `.canvas-path-end`). Read against 1.13.7. Presence only: none, no mark.
+ */
+function edgeElsOf(edge: unknown): Element[] {
+  const e = edge as { lineGroupEl?: unknown; lineEndGroupEl?: unknown } | null;
+  return [e?.lineGroupEl, e?.lineEndGroupEl]
+    .filter((el): el is Element => !!el && typeof (el as Element).classList?.add === 'function');
+}
+
+/** A note card's note: the path of a `.md` its child shows, or null. */
+function noteOf(node: unknown): string | null {
+  const path = (node as { child?: { file?: { path?: unknown } } } | null)?.child?.file?.path;
+  return typeof path === 'string' && path.toLowerCase().endsWith('.md') ? path : null;
 }
 
 /** Presence for one live canvas: sends ours, draws theirs. */
@@ -377,6 +552,10 @@ export class CanvasPresence {
   private drawn = new Map<number, { el: HTMLElement; at: { x: number; y: number } | null; movedAt: number }>();
   private ghostEls: HTMLElement[] = [];
   private selectedEls = new Set<HTMLElement>();
+  /** Edges outlined because a peer has them selected (NEC-255). */
+  private selectedEdgeEls = new Set<Element>();
+  /** Who was typing in which note card when last drawn: redrawn when it changes. */
+  private noteTypingKey = '';
   /** Cards outlined because someone is typing in them, and the name tags and bars drawn for that. */
   private typingEls = new Set<HTMLElement>();
   private caretEls: HTMLElement[] = [];
@@ -465,6 +644,10 @@ export class CanvasPresence {
     };
     this.awareness.on('change', onChange);
     this.restore.push(() => this.awareness.off('change', onChange));
+    if (this.deps.noteAwareness) {
+      const tick = window.setInterval(() => this.checkNoteTyping(), NOTE_TYPING_TICK_MS);
+      this.restore.push(() => window.clearInterval(tick));
+    }
     this.restore.push(this.binding.onChange(() => {
       this.syncFrames();
       this.schedule();
@@ -669,6 +852,11 @@ export class CanvasPresence {
       el.style.removeProperty('--nectenda-peer-color');
     }
     this.selectedEls.clear();
+    for (const el of this.selectedEdgeEls) {
+      el.classList.remove('nectenda-peer-selected-edge');
+      (el as HTMLElement).style?.removeProperty('--nectenda-peer-color');
+    }
+    this.selectedEdgeEls.clear();
     for (const el of this.caretEls) el.remove();
     this.caretEls = [];
     for (const el of this.typingEls) {
@@ -692,6 +880,32 @@ export class CanvasPresence {
     return true;
   }
 
+  /** Each note card on this canvas, with whoever has a caret in its note (NEC-255). */
+  private noteCardTypers(): { id: string; node: CanvasNodeLike; typers: NoteTyper[] }[] {
+    const deps = this.deps;
+    if (!deps.noteAwareness) return [];
+    const out: { id: string; node: CanvasNodeLike; typers: NoteTyper[] }[] = [];
+    for (const [id, node] of this.canvas.nodes) {
+      const path = noteOf(node);
+      if (!path) continue;
+      const awareness = deps.noteAwareness(path);
+      if (!awareness) continue;
+      const typers = noteTypers(awareness.getStates(), awareness.clientID);
+      if (typers.length > 0) out.push({ id, node, typers });
+    }
+    return out;
+  }
+
+  /** Redraw when who is typing in a note card changes: nothing on the canvas says. */
+  private checkNoteTyping(): void {
+    const key = this.noteCardTypers()
+      .map((c) => `${c.id}:${c.typers.map((t) => `${t.clientId}/${t.name}/${t.color}`).join(',')}`)
+      .join(';');
+    if (key === this.noteTypingKey) return;
+    this.noteTypingKey = key;
+    this.requestDraw();
+  }
+
   private cardCarets(doc: Y.Doc): CardCaretOnCanvas[] {
     const cardOfText = new Map<unknown, string>();
     for (const id of this.canvas.nodes.keys()) {
@@ -712,7 +926,7 @@ export class CanvasPresence {
     const overlay = this.ensureOverlay();
     const w = this.canvas.wrapperEl.clientWidth;
     const h = this.canvas.wrapperEl.clientHeight;
-    const peers = peersToDraw(this.awareness.getStates(), this.awareness.clientID, new Set(this.canvas.nodes.keys()));
+    const peers = peersToDraw(this.awareness.getStates(), this.awareness.clientID, new Set(this.canvas.nodes.keys()), new Set(this.canvas.edges.keys()));
     const now = Date.now();
     let moving = false;
 
@@ -785,17 +999,47 @@ export class CanvasPresence {
       }
       moving = true;
     }
+    // Edges that follow a card a peer is dragging, as their own canvas draws
+    // them: between the dragged card's outline and the card at the other end,
+    // on the sides the edge names (NEC-255).
+    const dragged = new Map<number, Map<string, Rect>>();
+    for (const [id, l] of this.lingering) {
+      const rects = new Map<string, Rect>();
+      for (const r of l.rects) if (this.canvas.nodes.has(r.id)) rects.set(r.id, { x: r.x, y: r.y, width: r.w, height: r.h });
+      if (rects.size > 0) dragged.set(id, rects);
+    }
+    for (const [clientId, rects] of dragged) {
+      const color = peers.find((p) => p.clientId === clientId)?.color ?? 'var(--text-muted)';
+      for (const edge of this.canvas.edges.values()) {
+        const data = (edge as { getData?(): Record<string, unknown> }).getData?.();
+        if (!data) continue;
+        const fromId = data.fromNode;
+        const toId = data.toNode;
+        if (typeof fromId !== 'string' || typeof toId !== 'string') continue;
+        if (!rects.has(fromId) && !rects.has(toId)) continue;
+        const from = rects.get(fromId) ?? this.canvas.nodes.get(fromId);
+        const to = rects.get(toId) ?? this.canvas.nodes.get(toId);
+        if (!from || !to) continue;
+        this.drawCurve(overlay, w, h, color, from, data.fromSide, sidePoint(to, data.toSide), data.toSide, {
+          from: data.fromEnd === 'arrow',
+          to: data.toEnd !== 'none',
+          cls: 'is-following',
+        });
+      }
+    }
     for (const peer of peers) {
       if (!peer.connect) continue;
       const from = this.canvas.nodes.get(peer.connect.from);
       if (!from) continue;
-      const a = toScreen(this.canvas, w, h, from.x + from.width / 2, from.y + from.height / 2);
-      const b = toScreen(this.canvas, w, h, peer.connect.x, peer.connect.y);
-      const el = overlay.createDiv({ cls: 'nectenda-canvas-connection' });
-      el.style.setProperty('--nectenda-peer-color', peer.color);
-      el.style.width = `${Math.hypot(b.x - a.x, b.y - a.y)}px`;
-      el.style.transform = `translate(${a.x}px, ${a.y}px) rotate(${Math.atan2(b.y - a.y, b.x - a.x)}rad)`;
-      this.ghostEls.push(el);
+      // From the side it was pulled out of, curved as Obsidian curves an edge,
+      // with its arrowhead, and onto the card it has snapped to, if any (NEC-255).
+      const target = peer.connect.to ? this.canvas.nodes.get(peer.connect.to) : undefined;
+      const end = target ? sidePoint(target, peer.connect.toSide) : { x: peer.connect.x, y: peer.connect.y };
+      this.drawCurve(overlay, w, h, peer.color, from, peer.connect.side, end, peer.connect.toSide, {
+        from: false,
+        to: true,
+        cls: target ? 'is-snapped' : null,
+      });
     }
 
     // Selections: outlined in the peer's colour.
@@ -817,9 +1061,67 @@ export class CanvasPresence {
       el.style.setProperty('--nectenda-peer-color', color);
       this.selectedEls.add(el);
     }
+    // Edges in their selection, in their colour, as nodes are (NEC-255).
+    const selectedEdges = new Map<Element, string>();
+    for (const peer of peers) {
+      for (const id of peer.edges) {
+        for (const el of edgeElsOf(this.canvas.edges.get(id))) {
+          if (!selectedEdges.has(el)) selectedEdges.set(el, peer.color);
+        }
+      }
+    }
+    for (const el of this.selectedEdgeEls) {
+      if (selectedEdges.has(el)) continue;
+      el.classList.remove('nectenda-peer-selected-edge');
+      (el as HTMLElement).style?.removeProperty('--nectenda-peer-color');
+      this.selectedEdgeEls.delete(el);
+    }
+    for (const [el, color] of selectedEdges) {
+      el.classList.add('nectenda-peer-selected-edge');
+      (el as HTMLElement).style?.setProperty('--nectenda-peer-color', color);
+      this.selectedEdgeEls.add(el);
+    }
 
     if (this.drawCardCarets(overlay, w, h)) this.retrySoon();
     if (moving) this.requestDraw();
+  }
+
+  /**
+   * One dashed curve in a peer's colour, as Obsidian draws an edge: from a
+   * card's side to `end` (another card's side, or a loose point met from the
+   * side facing back), with an arrowhead on each end that has one. The line
+   * stops short of an arrowhead, as Obsidian's does (`updatePath`).
+   */
+  private drawCurve(
+    overlay: HTMLElement,
+    w: number,
+    h: number,
+    color: string,
+    from: Rect,
+    fromSide: unknown,
+    end: Point,
+    toSide: unknown,
+    opts: { from: boolean; to: boolean; cls: string | null },
+  ): void {
+    const c = connectionCurve(from, fromSide, end, toSide, true);
+    const sp = (p: Point): Point => toScreen(this.canvas, w, h, p.x, p.y);
+    const sc = (p: Point): string => {
+      const q = sp(p);
+      return `${q.x.toFixed(1)} ${q.y.toFixed(1)}`;
+    };
+    const head = opts.from ? `M${sc(c.gap)}` : `M${sc(c.start)} L${sc(c.gap)}`;
+    const tail = opts.to ? '' : ` L${sc(c.end)}`;
+    const d = `${head} C${sc(c.c1)} ${sc(c.c2)} ${sc(c.at)}${tail}`;
+    const svg = overlay.createSvg('svg', { cls: opts.cls ? ['nectenda-canvas-connection', opts.cls] : 'nectenda-canvas-connection' });
+    svg.style.setProperty('--nectenda-peer-color', color);
+    svg.createSvg('path', { attr: { d } });
+    const arrow = (tip: Point, side: unknown): void => {
+      const points = arrowHead(tip, side).map(sp).map((q) => `${q.x.toFixed(1)},${q.y.toFixed(1)}`).join(' ');
+      svg.createSvg('polygon', { attr: { points } });
+    };
+    if (opts.to) arrow(c.end, isSide(toSide) ? toSide : looseSide(fromSide));
+    if (opts.from) arrow(c.start, isSide(fromSide) ? fromSide : 'right');
+    this.ghostEls.push(svg as unknown as HTMLElement);
   }
 
   /**
@@ -858,6 +1160,22 @@ export class CanvasPresence {
         continue;
       }
       this.caretEls.push(...this.caretMarks(c, overlay));
+    }
+    // Note cards: their text is the note's own document, so whoever has a
+    // caret in it is found in the note's awareness, not the canvas's (NEC-255).
+    // Outlined and named like a text card; no bar, the card being a rendering
+    // of a whole note that is not aligned here.
+    for (const { id, node, typers } of this.noteCardTypers()) {
+      for (const t of typers) {
+        if (!typing.has(node.nodeEl)) typing.set(node.nodeEl, t.color);
+        const nth = tagsOn.get(id) ?? 0;
+        tagsOn.set(id, nth + 1);
+        const corner = toScreen(this.canvas, w, h, node.x, node.y);
+        const tag = overlay.createDiv({ cls: 'nectenda-canvas-typing-name', text: t.name });
+        tag.style.setProperty('--nectenda-typing-color', t.color);
+        tag.style.transform = `translate(${corner.x}px, ${corner.y - nth * 20}px)`;
+        this.caretEls.push(tag);
+      }
     }
     for (const el of this.typingEls) {
       if (typing.has(el)) continue;

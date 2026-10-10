@@ -1181,20 +1181,58 @@
   opacity: 0.8;
 }
 
+/*
+ * A connection a collaborator is drawing (WIRE-094, NEC-255): the curve
+ * Obsidian would draw for it, from the side it left, dashed in their colour,
+ * onto the card it has snapped to. Drawn in the overlay's own pixels.
+ */
 .nectenda-canvas-connection {
   --nectenda-peer-color: var(--text-muted);
   position: absolute;
   left: 0;
   top: 0;
-  height: 0;
-  border-top: 2px dashed var(--nectenda-peer-color);
-  transform-origin: 0 0;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+  pointer-events: none;
+}
+
+.nectenda-canvas-connection path {
+  fill: none;
+  stroke: var(--nectenda-peer-color);
+  stroke-width: 2px;
+  stroke-dasharray: 6 5;
+  stroke-linecap: round;
+}
+
+.nectenda-canvas-connection.is-snapped path {
+  stroke-width: 2.5px;
+}
+
+/* Its arrowhead, solid, as Obsidian draws one. */
+.nectenda-canvas-connection polygon {
+  fill: var(--nectenda-peer-color);
+  stroke: none;
 }
 
 /* A node a collaborator has selected: outlined in their colour. */
 .canvas-node.nectenda-peer-selected {
   outline: 2px solid var(--nectenda-peer-color, var(--text-accent));
   outline-offset: 3px;
+}
+
+/*
+ * An edge a collaborator has selected (NEC-255): Obsidian's own line and
+ * arrowhead, in their colour and a little heavier. A filter on the line's
+ * group did not show (seen in use): the path is recoloured instead.
+ */
+.canvas-wrapper g.nectenda-peer-selected-edge path.canvas-display-path {
+  stroke: var(--nectenda-peer-color, var(--text-accent));
+  stroke-width: calc(var(--canvas-edge-width, 3px) * 1.6);
+}
+
+.canvas-wrapper g.nectenda-peer-selected-edge polygon.canvas-path-end {
+  fill: var(--nectenda-peer-color, var(--text-accent));
 }
 
 /*

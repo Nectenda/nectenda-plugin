@@ -4,6 +4,40 @@ Every release of the Nectenda plugin, newest first. Each release on GitHub also
 carries the SHA-256 of its `main.js`, so you can check that the plugin you are
 running is the source you read — see the README.
 
+## 0.5.2 — 10 October 2026
+
+### Added
+- **A note edited inside a canvas card syncs live,** with collaborators' cursors, as it does in the note's own pane.
+- On a shared canvas you now see the edge a collaborator has selected, who is typing in a note card, the connection they are drawing (curved, with its arrowhead, snapping onto the card it will join), and the edges of a card they are dragging.
+
+### Fixed
+- **Typing in a canvas card that shows a note no longer undoes a collaborator's change to that note.** Both edits are kept.
+- Canvas cards that show a note or an image now find their file in every vault, even where the shared folder has a different name.
+
+### Known
+- **Everyone sharing a canvas should update to 0.5.2.** Once a vault on 0.5.2 has synced a canvas, a collaborator on an earlier version leaves it untouched and asks them to update. Edits they made offline still arrive. Nothing is lost.
+- A canvas card pointing at a file outside the shared folder still says "could not be found" in the other vaults, which do not have that file.
+- A canvas card that shows one section of a note syncs when it is saved, not as you type, and shows no cursors.
+- **Everyone sharing a drawing should update to 0.5.0 or later.** A collaborator on an earlier version still sees it as a note and merges it as text. Their edits reach you as conflict copies beside the drawing, about one per save. Nothing is lost.
+- When two people move or resize the same shape at once, one move wins and the other is not kept.
+- Live sync of drawings is tested against Excalidraw 2.27.3 and 2.28.1. An Excalidraw release that changes what Nectenda relies on falls back, with a notice, to syncing a drawing when it is saved, a few seconds behind.
+- A shape type one vault's Excalidraw does not know, such as a sticky note in an older Excalidraw, is kept but not shown there until that vault updates Excalidraw.
+- With live sync for drawings off, nobody is shown on a drawing.
+- While a drawing is open, its file can be up to a minute behind it. Nothing is lost, but another app reading the file sees changes late.
+- A Kanban board edited in the first second or so after Obsidian starts, before it has synced, is not merged: your edit is kept in `.nectenda-backups` with a notice, and the board shows it as gone until you restore it from there.
+- Two people moving the same Kanban card, or changing the same line, at the same moment can leave both versions on the board. The extra one can be deleted.
+- In a Kanban board torn out into its own window, a collaborator's change is not held back while you are editing a card.
+- **Everyone sharing a base should be on 0.4.0 or later.** A collaborator on an earlier version still syncs bases as whole files. Their edits reach you as conflict copies beside the base, and yours do not reach them. Nothing is lost, but the base does not merge until they update.
+- A collaborator on 0.3.0 or earlier still edits properties as text. Their edits are taken in, but if they and someone on 0.4.0 set the same property at once, the 0.4.0 value wins. The note as it stood is backed up first.
+- When two people change the same presentation setting of a base at once, such as its sort or column order, one value is kept with no conflict copy. Filters, formulas and grouping still get a conflict copy.
+- Column widths in a base are each vault's own, and a base whose filters reach outside the shared folder shows different rows in each vault. Entries without the shared mark are that vault's own.
+- If a collaborator moves a card while you are dragging it, your drop wins its position.
+- Collaborators still on 0.1.5 or earlier will appear to have no cursor. Their edits sync normally.
+- iOS is untested on a device. It should work, since it is the same JavaScript as Android, but nobody has run it on an iPhone, so it is not claimed.
+- On Android, all vaults in the app share one secret store: signing one vault in signs them all in.
+- There is no read-only membership. Everyone in a shared folder can edit it.
+- Not audited. The client ships unminified and the build is reproducible, so the claim is checkable, but no third party has checked it.
+
 ## 0.5.1 — 9 October 2026
 
 ### Fixed

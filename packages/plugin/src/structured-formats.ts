@@ -133,6 +133,21 @@ export interface StructuredCodec {
    */
   readonly fromText?: boolean;
   /**
+   * This codec for a file in a shared folder this vault keeps at `localRoot`.
+   * For a format whose values hold vault paths (a canvas's file cards): the
+   * returned codec's `parse`, `read` and `apply` deal in this vault's paths,
+   * while the document holds them relative to the folder, so the same card
+   * names the same file in every vault (SAFE-A33). Absent: the codec is the
+   * same for every file.
+   */
+  forRoot?(localRoot: string): StructuredCodec;
+  /**
+   * Bring a document stamped with an older schema version (`from`) up to this
+   * codec's, inside a transaction StructuredSync owns and restamps in. Absent:
+   * an older document is read as it is.
+   */
+  upgrade?(ydoc: Y.Doc, from: number): void;
+  /**
    * Settle what concurrent edits left behind, after the document changed.
    * Called by StructuredSync, inside a transaction of its own, after a remote
    * update, after the first sync and after a disk read-in. `isOurs(root, key)` says

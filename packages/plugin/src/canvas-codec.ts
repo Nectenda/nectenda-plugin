@@ -3,6 +3,8 @@ import { CANVAS_PRESENCE_PAD_BYTES } from './presence-seal';
 import {
   applyCanvas, canonical, normaliseCanvas, readCanvas, type CanvasRecord, type CanvasValue,
 } from './canvas-model';
+import { localiseCanvasPaths, shareCanvasPaths, shareDocPaths } from './canvas-paths';
+import { log } from './logger';
 
 /**
  * `.canvas` files (JSON Canvas) as a structured format: the text boundary
@@ -152,9 +154,17 @@ function meaning(v: CanvasValue): string {
   return canonical({ nodes: v.nodes, edges, extra: v.extra });
 }
 
+/**
+ * Schema 2 (NEC-251): a file card's path, when the file is in the shared
+ * folder, is held relative to it (canvas-paths.ts). Schema 1 held each
+ * writer's own vault path, which named nothing in a vault that keeps the
+ * folder under another name.
+ */
+export const CANVAS_SCHEMA = 2;
+
 export const canvasCodec: StructuredCodec = {
   format: 'canvas',
-  version: 1,
+  version: CANVAS_SCHEMA,
   viewType: 'canvas',
   // A canvas state is larger, and a card caret larger again: sealed in one
   // bucket that holds both, so length does not say who is typing in a card
@@ -194,4 +204,34 @@ export const canvasCodec: StructuredCodec = {
   equal(a, b) {
     return meaning(a as CanvasValue) === meaning(b as CanvasValue);
   },
+
+  forRoot(localRoot) {
+    return canvasCodecFor(localRoot);
+  },
 };
+
+/**
+ * The canvas codec for one shared folder, kept at `localRoot` in this vault:
+ * values in and out are this vault's, the document's paths are the folder's
+ * (SAFE-A33). Everything else is `canvasCodec` unchanged.
+ */
+export function canvasCodecFor(localRoot: string): StructuredCodec {
+  const share = (v: unknown): CanvasValue => shareCanvasPaths(v as CanvasValue, localRoot);
+  return {
+    ...canvasCodec,
+    forRoot: undefined,
+    apply(ydoc, value, base) {
+      applyCanvas(ydoc, share(value), base === null || base === undefined ? null : share(base));
+    },
+    read(ydoc) {
+      return localiseCanvasPaths(readCanvas(ydoc), localRoot);
+    },
+    upgrade(ydoc) {
+      // Whatever the stamp: schema-1 paths under this vault's root may still be
+      // there after another vault, keeping the folder elsewhere, restamped the
+      // document (SAFE-A33). Rewrites nothing in a document already shared.
+      const n = shareDocPaths(ydoc, localRoot);
+      if (n > 0) log.info('Made a canvas\'s paths relative to its folder', { fields: n });
+    },
+  };
+}

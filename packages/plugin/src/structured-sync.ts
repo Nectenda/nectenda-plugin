@@ -527,7 +527,9 @@ export class StructuredSync {
       relativePath,
       localPath: `${folderLocalPath}/${relativePath}`,
       ydoc,
-      codec,
+      // This file's codec reads and writes the folder's paths as this vault
+      // names them, the document holding them relative to the folder (SAFE-A33).
+      codec: codec.forRoot?.(folderLocalPath) ?? codec,
       idbProvider,
       writeTimer: null,
       writeRetries: 0,
@@ -603,7 +605,7 @@ export class StructuredSync {
         this.provider.off(`synced:${docName}`, onFirstSync);
         await this.seedIfEmpty(state);
         state.hasSyncedOnce = true;
-        this.checkHandOff(state);
+        if (!this.checkHandOff(state)) this.upgradeSchema(state);
         this.scheduleDiskWrite(state);
       };
       const onFirstSync = (): void => {
@@ -982,6 +984,37 @@ export class StructuredSync {
       'It is left untouched here — update Nectenda to sync it.',
     );
     return true;
+  }
+
+  /**
+   * Bring a document an older client stamped up to this codec's schema, once
+   * the server has been heard from, and restamp it — in one transaction, so no
+   * client ever sees the new stamp over the old shape. From then on an older
+   * client hands the file off (SAFE-A16), visibly, rather than reading the new
+   * shape as the old one. A canvas at schema 1 holds this vault's own paths for
+   * files in the folder; its upgrade makes them relative to the folder
+   * (canvas-paths.ts, SAFE-A33).
+   */
+  private upgradeSchema(state: StructuredDocState): void {
+    if (!this.isStamped(state) || !state.codec.upgrade) return;
+    const meta = state.ydoc.getMap<unknown>(META_ROOT);
+    const from = meta.get('version');
+    if (typeof from !== 'number' || from > state.codec.version) return;
+    // Run at this version too, not only below it: the first vault to upgrade
+    // can only rewrite what it can recognise — for a canvas, paths under its
+    // own root — so each vault puts right its own share of what older clients
+    // wrote, whoever restamped first (found in review). An upgrade must
+    // therefore be a no-op on a document already in its shape.
+    const upgrade = state.codec.upgrade.bind(state.codec);
+    state.ydoc.transact(() => {
+      upgrade(state.ydoc, from);
+      if (from < state.codec.version) meta.set('version', state.codec.version);
+    }, LOCAL_ORIGIN);
+    if (from < state.codec.version) {
+      log.info('Upgraded a structured document to this version\'s schema', {
+        path: state.localPath, from, to: state.codec.version,
+      });
+    }
   }
 
   /** Whether the document has ever been filled — by anyone. */
@@ -1864,11 +1897,13 @@ export class StructuredSync {
    * Hand the live document to something that shows it — a view binding.
    * Null when the file is not connected. Pair with `releaseDoc`.
    */
-  acquireDoc(docName: string): { ydoc: Y.Doc; awareness: Awareness | null } | null {
+  acquireDoc(docName: string): { ydoc: Y.Doc; awareness: Awareness | null; codec?: StructuredCodec } | null {
     const state = this.docs.get(docName);
     if (!state) return null;
     state.acquired++;
-    return { ydoc: state.ydoc, awareness: this.provider.getAwareness(docName) };
+    // The file's own codec, so a view reads and writes the folder's paths as
+    // this vault names them, as the disk path does (SAFE-A33).
+    return { ydoc: state.ydoc, awareness: this.provider.getAwareness(docName), codec: state.codec };
   }
 
   /**

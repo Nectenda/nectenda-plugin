@@ -62,7 +62,11 @@ export type Selection = { surface: 'canvas' | 'excalidraw'; ids: string[] };
 export type GestureRect = { id: string; x: number; y: number; w: number; h: number };
 export type Gesture =
   | { surface: 'canvas'; kind: 'move' | 'resize'; nodes: GestureRect[] }
-  | { surface: 'canvas'; kind: 'connect'; from: string; side?: string; x: number; y: number };
+  | {
+    surface: 'canvas'; kind: 'connect'; from: string; side?: string; x: number; y: number;
+    /** The card the loose end has snapped onto, and its side, until the drop commits the edge. */
+    to?: string; toSide?: string;
+  };
 
 /**
  * Which view of a file a person is on, where a file has several (WIRE-096).
@@ -216,7 +220,14 @@ function readGesture(v: unknown): Gesture | null {
   if (v.kind === 'connect') {
     if (!isStr(v.from) || !isNum(v.x) || !isNum(v.y)) return null;
     if (v.side !== undefined && !isStr(v.side)) return null;
-    return { surface: 'canvas', kind: 'connect', from: v.from, x: v.x, y: v.y, ...(isStr(v.side) ? { side: v.side } : {}) };
+    if (v.to !== undefined && !isStr(v.to)) return null;
+    if (v.toSide !== undefined && !isStr(v.toSide)) return null;
+    return {
+      surface: 'canvas', kind: 'connect', from: v.from, x: v.x, y: v.y,
+      ...(isStr(v.side) ? { side: v.side } : {}),
+      ...(isStr(v.to) ? { to: v.to } : {}),
+      ...(isStr(v.toSide) ? { toSide: v.toSide } : {}),
+    };
   }
   return null;
 }

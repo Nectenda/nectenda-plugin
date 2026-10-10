@@ -1,7 +1,7 @@
 import { Notice, Platform, Plugin, PluginSettingTab, App, Setting, MarkdownView, SettingPage, TextFileView, TFile, TFolder, apiVersion, editorInfoField, type SettingDefinitionItem, type SettingGroupItem } from 'obsidian';
 import { DEFAULT_PORT, MAX_PUSH_BYTES, apiBaseUrl } from '@nectenda/shared';
 import type { UserInfo, InviteTokenInfo, SharedFolderInfo, KeyMaterial, KdfParams } from '@nectenda/shared';
-import { hashCredential } from '@nectenda/shared';
+import { hashCredential, PRESENCE_VERSION } from '@nectenda/shared';
 import { ProviderRouter, type ShardConnection } from './provider-router';
 import { IdentityClient, IdentityError, ShardClient, type MeResponse, type SentInvite, type ShardSession } from './identity-client';
 import { recoverSignedOutConnection } from './signed-out';
@@ -73,7 +73,8 @@ import { MultiplexedProvider } from './multiplexed-provider';
 import { ContentSync } from './content-sync';
 import { StructuredSync } from './structured-sync';
 import { STRUCTURED_FORMATS } from './structured-formats';
-import { TextViewGuard, EditProbe } from './text-view-guard';
+import { TextViewGuard, EditProbe, type TextViewLike } from './text-view-guard';
+import { canvasNoteCards, type CanvasWithNodesLike } from './canvas-note-cards';
 import { TextViewPresence, type NoteViewLike } from './text-view-presence';
 import { QuickSave } from './note-view-save';
 import { KANBAN_VIEW_TYPE } from './kanban-presence';
@@ -84,6 +85,7 @@ import type { CanvasViewInternal } from './canvas-internals';
 import { canvasCardBinding } from './canvas-card-binding';
 import { PendingEdits } from './pending-edits';
 import { EditorWiring } from './editor-wiring';
+import { CanvasNoteBindings } from './canvas-note-binding';
 import { CanvasPresence } from './canvas-presence';
 import { deleteRecordStore } from './excalidraw-delete-store';
 import { DeleteWitness, ExcalidrawLiveManager, sharedDrawingViews, type ExcalidrawLib, type ExcalidrawLiveBinding, type ExcalidrawViewLike } from './excalidraw-live';
@@ -93,7 +95,7 @@ import { OversizedNotes, describeOversizedNotes, type OversizedNote } from './ov
 import { mib } from './sync-status';
 import { EditorBridge, presenceReporter, userColor } from './editor-bridge';
 import type { FolderMapping } from './editor-bridge';
-import { basenameOf, mappingCovering } from './folder-mapping';
+import { basenameOf, mappingCovering, resolveMapping } from './folder-mapping';
 import { FolderIndicator } from './folder-indicator';
 import { FileStatusIndicator, buildEntryStatus, buildStatusIndex } from './file-status-indicator';
 import { CONNECTION_LABELS, HEADER_ICON, HeaderStatus, PROBLEM_CONNECTIONS, countOthers, mayHide, registerHeaderIcon, type ConnectionStatus, type StatusPlaces } from './header-status';
@@ -282,6 +284,9 @@ export type { VerifyOutcome } from './identity-session';
 
 
 /** The view types saved early while "Live sync for Kanban boards" is on, and while it is off. */
+/** How often to look for a canvas card's editor to bind (canvas-note-binding.ts). */
+const NOTE_CARD_TICK_MS = 400;
+
 const KANBAN_ONLY: ReadonlySet<string> = new Set([KANBAN_VIEW_TYPE]);
 const NONE: ReadonlySet<string> = new Set();
 
@@ -442,6 +447,9 @@ export default class NectendaPlugin extends Plugin {
   private lastNotePath: string | null = null;
   /** Where EditorBridge installs a note's binding, one editor at a time (SAFE-D5). Registered once. */
   private editorWiring = new EditorWiring();
+  /** The slot for a note being edited in a canvas card: one, beside the pane's (SAFE-A32). */
+  private noteCardWiring = new EditorWiring();
+  private noteCardBindings: CanvasNoteBindings | null = null;
   /** Edits made while an editor binds (NEC-159). Registered once, on its own. */
   private pendingEdits = new PendingEdits(
     (state) => (state.field(editorInfoField, false) as unknown as { file?: { path?: string } } | undefined)?.file?.path ?? null,
@@ -609,6 +617,7 @@ export default class NectendaPlugin extends Plugin {
     this.registerEvent(this.app.workspace.on('layout-change', () => {
       this.refreshStatusUi();
       this.canvasLive?.refresh();
+      this.noteCardBindings?.refresh();
       this.excalidrawLive?.refresh();
       this.basesPresence?.refresh();
       this.textViewPresence?.later();
@@ -623,6 +632,7 @@ export default class NectendaPlugin extends Plugin {
       if (leaf?.view instanceof MarkdownView && leaf.view.file) this.lastNotePath = leaf.view.file.path;
       this.refreshStatusUi();
       this.canvasLive?.refresh();
+      this.noteCardBindings?.refresh();
       this.excalidrawLive?.refresh();
       if (leaf?.view) this.canvasReporters.get(leaf.view)?.();
       this.basesPresence?.refresh();
@@ -653,6 +663,9 @@ export default class NectendaPlugin extends Plugin {
     // no workspace event is documented to report: checked on a short tick
     // instead. Only a change is sent (WIRE-091), so an idle tick costs a parse
     // of each open base and nothing on the wire.
+    // A canvas card's editor exists only while the card is being edited, and
+    // Obsidian creates it with no event: looked for on a short tick of its own.
+    this.registerInterval(window.setInterval(() => this.noteCardBindings?.refresh(), NOTE_CARD_TICK_MS));
     this.registerInterval(window.setInterval(() => {
       this.basesPresence?.refresh();
       this.textViewPresence?.later();
@@ -692,6 +705,9 @@ export default class NectendaPlugin extends Plugin {
     // Registered exactly once, empty; EditorBridge fills it in the one editor
     // it binds, and every other editor keeps it empty (SAFE-D5).
     this.registerEditorExtension(this.editorWiring.extension);
+    // A note being edited in a canvas card is bound in a slot of its own, so
+    // the note's pane keeps its binding meanwhile (canvas-note-binding.ts).
+    this.registerEditorExtension(this.noteCardWiring.extension);
     // What the user types while an editor is being bound, so the bind can
     // replay it rather than erase it (NEC-159). On its own: the wiring holds
     // only the bound editor's binding, and this must watch every editor.
@@ -2949,7 +2965,8 @@ export default class NectendaPlugin extends Plugin {
     this.noteViewGuard?.dispose();
     this.editProbe?.dispose();
     this.editProbe = new EditProbe(document);
-    this.noteViewGuard = new TextViewGuard(() => this.otherNoteViews(), this.editProbe);
+    // A note shown in a canvas card is a view of that note too (SAFE-A32).
+    this.noteViewGuard = new TextViewGuard(() => [...this.otherNoteViews(), ...this.canvasNoteCardViews()], this.editProbe);
 
     // Content sync for background file syncing
     const vaultAdapter = new ObsidianVaultAdapter(this.app.vault);
@@ -3202,6 +3219,30 @@ export default class NectendaPlugin extends Plugin {
     });
     this.editorBridge.start();
 
+    // A note being edited in a canvas card, bound live to the note (SAFE-A32).
+    this.noteCardBindings?.dispose();
+    this.noteCardBindings = new CanvasNoteBindings({
+      canvases: () => this.app.workspace.getLeavesOfType('canvas')
+        .map((leaf) => (leaf.view as unknown as { canvas?: CanvasWithNodesLike }).canvas),
+      docNameFor: (localPath) => {
+        const resolved = resolveMapping(localPath, this.settings.folderMappings);
+        return resolved ? this.docIndex.refSync(resolved.sharedFolderId, resolved.relativePath) : null;
+      },
+      docs: this.contentSync,
+      wiring: this.noteCardWiring,
+      announce: (awareness) => {
+        if (awareness.getLocalState() !== null) return;
+        const colors = userColor(presenceName);
+        awareness.setLocalState({
+          v: PRESENCE_VERSION, pointer: null, viewport: null, selection: null,
+          user: { name: presenceName, seat: colors.seat, color: colors.color, colorLight: colors.light },
+        });
+      },
+      saveCard: async (child) => {
+        await canvasNoteCards([{ nodes: new Map([['card', { child }]]) }])[0]?.save();
+      },
+    });
+
     this.propertyFocus?.dispose();
     const bridge = this.editorBridge;
     this.propertyFocus = new PropertyFocus({
@@ -3366,6 +3407,8 @@ export default class NectendaPlugin extends Plugin {
     this.propertyFocus = null;
     this.editorBridge?.stop();
     this.editorBridge = null;
+    this.noteCardBindings?.dispose();
+    this.noteCardBindings = null;
     this.provider?.destroy();
     this.provider = null;
     this.updateStatus('disconnected');
@@ -3447,6 +3490,8 @@ export default class NectendaPlugin extends Plugin {
     // opens, so they are only torn down here, before it runs.
     this.canvasLive?.reset();
     this.excalidrawLive?.reset();
+    // A card bound to a note's document goes with it; bound again to the new one.
+    this.noteCardBindings?.release();
     this.structuredSync?.disconnectAll();
     if (this.fileSync) {
       this.fileSync.disconnectAll();
@@ -3776,6 +3821,8 @@ export default class NectendaPlugin extends Plugin {
       userColor,
       sharePointer: () => this.settings.sharePointer,
       showPointers: () => this.settings.showPointers,
+      // A note card's typists are in the note's own awareness (NEC-255).
+      noteAwareness: (localPath) => this.contentSync?.awarenessFor(localPath)?.awareness ?? null,
     });
     presence.start();
     this.canvasPresences.set(binding.view, presence);
@@ -3963,6 +4010,16 @@ export default class NectendaPlugin extends Plugin {
       if (isOtherNoteView(leaf.view)) views.push(leaf.view);
     });
     return views;
+  }
+
+  /**
+   * Every note shown in a card of an open canvas, as the guard sees a view of
+   * it (canvas-note-cards.ts, SAFE-A32): the card keeps typing until its own
+   * save, as any note view does.
+   */
+  private canvasNoteCardViews(): TextViewLike[] {
+    return canvasNoteCards(this.app.workspace.getLeavesOfType('canvas')
+      .map((leaf) => (leaf.view as unknown as { canvas?: CanvasWithNodesLike }).canvas));
   }
 
   /**
