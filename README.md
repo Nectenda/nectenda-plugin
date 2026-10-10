@@ -2,12 +2,33 @@
 
 **End-to-end encrypted real-time collaborative editing for [Obsidian](https://obsidian.md).**
 
-![Two people editing one Obsidian note and one canvas at the same time: each one's named pointer, caret and selection shown to the other, with cards moved, resized, linked and typed in at once.](https://nectenda.com/assets/hero/readme.webp)
+![Two people in one Obsidian note, on one canvas and in one base at the same time: each one's named pointer, caret and selection shown to the other, cards moved, resized, linked and typed in at once, and a card moved between lanes of a base's kanban view.](https://nectenda.com/assets/hero/readme.webp)
 
 Live cursors, offline editing, shared folders and attachments — on a server that
 **cannot read your notes**. Content is encrypted on your device before it is
 sent; the server stores ciphertext it has no key for, and document paths are
 HMACs rather than filenames.
+
+What it makes live, for everyone in a shared folder:
+
+- **Notes.** Each person's caret and pointer, with their name; edits merge
+  character by character as you type.
+- **Canvases.** Cards moved, resized, linked and typed in show as they happen,
+  and changes to different cards merge.
+- **Bases.** Changes to different filters, formulas and views merge, you see
+  which row, cell or card each person is on, and cards moved between lanes of
+  the kanban view Obsidian 1.14 adds merge too.
+- **Properties.** A note's properties merge property by property.
+- **Kanban boards** made with the community Kanban plugin, and **Excalidraw
+  drawings** made with the community Excalidraw plugin, live, with each
+  person's presence on the board or the drawing. Images in a drawing are
+  attachments, so they need a plan with attachment storage.
+- **Offline.** Your notes are files on your disk; what you change offline
+  merges when you reconnect, and a version that cannot merge is kept as a
+  conflict copy rather than lost.
+
+The full list, with the version each arrived in, is the
+[roadmap](https://nectenda.com/roadmap).
 
 ## This repository
 
@@ -30,8 +51,7 @@ vault is one you can read directly.
 ## This plugin requires an account and a server
 
 Nectenda is a client for a sync server. It does nothing on its own: there is no
-offline-only or local-only mode, and with no account nothing syncs. Say so
-plainly before you install it.
+offline-only or local-only mode, and with no account nothing syncs.
 
 There are two ways to run it, and they differ in what reaches us:
 
@@ -48,9 +68,10 @@ display name you choose for a shared folder. Signing in talks to
 **A server you run.** The plugin talks to whatever address you give it, and a
 vault pointed at your own server sends us nothing at all — not the ciphertext
 and not the metadata above. **The server is not something you can obtain today**:
-it will be sold as a licensed image, and that is not yet available. Said here
-because the plugin will happily connect to a self-hosted server and you should
-know which of the two you are in.
+it will be sold as a licensed image, and that is not yet available. This is
+functional since it is the same codebase that runs our hosted service, but we
+have not yet packaged and documented it nicely for licensed usage. We will
+prioritise this and have it ready fairly quickly if demand for it is there.
 
 Both modes run the same encryption. The plugin talks to the server you point it
 at and to no third party.
@@ -62,10 +83,11 @@ Nothing about what you do. There is no analytics of any kind.
 When you are signed in to the hosted service, the plugin reports its own
 crashes to an error tracker Nectenda runs itself — not a third party. It is on
 unless you turn it off, and it sends nothing until it has shown you what a
-report contains. A report carries the exception and its message, stack frames
-as line and column numbers in the published `main.js`, the plugin and
-Obsidian versions, the platform, and the install identifier every request
-already carries. It carries no note content, no note, folder or attachment
+report contains. A report carries the exception and its message, scrubbed;
+stack frames as line and column numbers and function names, each frame's file
+reduced to the published `main.js`, Obsidian, or an unnamed frame; the
+plugin and Obsidian versions, the platform, and the install identifier every
+request already carries. It carries no note content, no note, folder or attachment
 name, no file path, not your vault's name, and no token or key.
 
 The payload is built from a fixed list of fields rather than filtered down from
@@ -73,10 +95,6 @@ a larger one — `packages/plugin/src/error-report.ts`, and there is no
 error-reporting library behind it, because a library owns the event and we
 would be subtracting from it. [docs/security-model.md](docs/security-model.md)
 states the rule and names the code.
-
-**Running your own server? None of this applies.** The address reports would go
-to is supplied by the server you sign in to; a self-hosted one supplies none,
-so none are sent.
 
 ## Installing
 
@@ -109,7 +127,8 @@ takes one seat in each.
 | **Small Business** | $18 per seat/mo | up to 25 | 6 | 100 GB + 20 GB per seat |
 
 Free is not a trial: it does not expire and it is not a reduced version of a paid
-plan. Text sync is never blocked on any plan, and nothing is deleted if you stop
+plan - the main differences being attachment storage space and user/device
+allowances. Text sync is never blocked on any plan, and nothing is deleted if you stop
 paying — an organisation that lapses returns to Free with everything it stored
 still downloadable.
 
